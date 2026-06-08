@@ -72,13 +72,14 @@ rux run "review the navigation code" --runner gemini
 rux run "update the navigation code" --runner gemini --provider-mode write --check "npm run typecheck"
 ```
 
-`rux run` keeps stdout as JSON for scripts. Provider output is mirrored to stderr while the provider runs, so questions and plans are visible in the terminal. The default provider mode is `plan`; use `--provider-mode write` when you want the wrapped provider to edit files. If a provider asks for input, Rux records the run as `blocked`. If a provider changes files while Rux asked for plan mode, Rux records the run as `failed`.
+`rux run` keeps stdout as JSON for scripts. Provider output and Rux progress are mirrored to stderr while the provider runs, so questions, start/finish state, checks, and quiet long-running work are visible in the terminal. The default provider mode is `plan`; use `--provider-mode write` when you want the wrapped provider to edit files. If a provider asks for input, Rux records the run as `blocked`. If a provider changes files while Rux asked for plan mode, Rux records the run as `failed`.
 
 Start here:
 
 - [State](docs/STATE.md)
 - [Architecture](docs/ARCHITECTURE.md)
 - [v0 Plan](docs/V0_PLAN.md)
+- [Standards](docs/STANDARDS.md)
 
 ## Naming
 

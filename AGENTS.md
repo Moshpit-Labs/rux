@@ -35,5 +35,6 @@ This repo should stay readable in minutes:
 - `docs/STATE.md` tells the creator what is true now.
 - `docs/ARCHITECTURE.md` explains the system in one sitting.
 - `docs/V0_PLAN.md` tells us what to build first and what not to build.
+- `docs/STANDARDS.md` defines coding and release standards.
 
 Do not add new docs until the existing ones cannot carry the work cleanly.

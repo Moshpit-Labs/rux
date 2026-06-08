@@ -39,6 +39,23 @@ try {
   assert(versionRun.stdout.trim() === `rux ${packageJson.version}`, "--version should print package version");
   const versionCommandRun = run("node", [cliPath, "version"]);
   assert(versionCommandRun.stdout.trim() === `rux ${packageJson.version}`, "version command should print package version");
+  const unknownFlagRun = spawnSync("node", [
+    cliPath,
+    "run",
+    "typo guard",
+    "--runner",
+    "gemini",
+    "--privoder-mode",
+    "write",
+    "--cwd",
+    tempRoot
+  ], {
+    encoding: "utf8",
+    env: { ...process.env, PATH: `${tempBin}:${process.env.PATH ?? ""}` }
+  });
+  assert(unknownFlagRun.status !== 0, "unknown flags should fail before running providers");
+  assert(unknownFlagRun.stderr.includes("Unknown option --privoder-mode"), "unknown flag error should name the bad flag");
+  assert(unknownFlagRun.stderr.includes("Did you mean --provider-mode?"), "unknown flag error should suggest provider-mode");
   const repoReleaseCheck = JSON.parse(run("node", [cliPath, "release-check"], repoRoot).stdout);
   assert(repoReleaseCheck.identity.product === "Rux", "release-check should expose current product identity");
   assert(repoReleaseCheck.identity.cli === "rux", "release-check should expose current CLI identity");
@@ -504,6 +521,8 @@ try {
     env: { ...process.env, PATH: `${tempBin}:${process.env.PATH ?? ""}` }
   });
   assert(claudeGuard.status === 0, "mocked claude runner should complete");
+  assert(claudeGuard.stderr.includes("rux: starting claude mode=plan"), "provider runs should print Rux start progress on stderr");
+  assert(claudeGuard.stderr.includes("rux: claude finished exit=0"), "provider runs should print Rux finish progress on stderr");
   const claudeSummary = JSON.parse(claudeGuard.stdout);
   assert(claudeSummary.runner === "claude", "mocked claude run should use claude runner");
   assert(claudeSummary.status === "ok", "mocked claude run should be ok");
@@ -582,7 +601,7 @@ try {
   const codexOutcome = JSON.parse(run("node", [cliPath, "outcome", codexSummary.id, "--cwd", tempRoot]).stdout);
   assert(codexOutcome.outcome.label === "unlabeled", "outcome should mark unlabeled provider runs");
   assert(codexOutcome.outcome.risks.includes("missing_verdict_or_check"), "unlabeled outcome should explain missing signal");
-  const codexPostRunCheck = JSON.parse(run("node", [
+  const codexPostRunCheckProcess = spawnSync("node", [
     cliPath,
     "check",
     codexSummary.id,
@@ -592,7 +611,13 @@ try {
     "verified after provider run",
     "--cwd",
     tempRoot
-  ]).stdout);
+  ], {
+    encoding: "utf8"
+  });
+  assert(codexPostRunCheckProcess.status === 0, "post-run check should complete through spawn path");
+  assert(codexPostRunCheckProcess.stderr.includes("rux: running check: node --version"), "post-run checks should print start progress on stderr");
+  assert(codexPostRunCheckProcess.stderr.includes("rux: check passed exit=0"), "post-run checks should print completion progress on stderr");
+  const codexPostRunCheck = JSON.parse(codexPostRunCheckProcess.stdout);
   assert(codexPostRunCheck.type === "check", "post-run check should append a check event");
   assert(codexPostRunCheck.source === "post_run_check", "post-run check should record its source");
   assert(codexPostRunCheck.exit_code === 0, "post-run check should capture exit code");
@@ -675,6 +700,7 @@ try {
     env: { ...process.env, PATH: `${tempBin}:${process.env.PATH ?? ""}` }
   });
   assert(blockedGeminiRun.status === 0, "provider approval run should still record a run");
+  assert(blockedGeminiRun.stderr.includes("rux: starting gemini mode=plan"), "provider progress should identify the runner and mode");
   assert(blockedGeminiRun.stderr.includes("Do you agree with this approach?"), "provider output should be visible on stderr while stdout stays JSON");
   const blockedGeminiSummary = JSON.parse(blockedGeminiRun.stdout);
   assert(blockedGeminiSummary.status === "blocked", "provider approval output should not be marked ok");
@@ -722,6 +748,7 @@ try {
   assert(planChangedGeminiSummary.output_signal.kind === "plan_changed_files", "plan-mode write violation should expose output signal");
   assert(planChangedGeminiSummary.changed_files.includes("plan-mode-edited.txt"), "plan-mode write violation should report changed file");
   const planChangedGeminiOutcome = JSON.parse(run("node", [cliPath, "outcome", planChangedGeminiSummary.id, "--cwd", tempRoot]).stdout);
+  assert(planChangedGeminiOutcome.outcome.label === "run_failed", "plan-mode write violation should report a failed run, not a failed check");
   assert(planChangedGeminiOutcome.outcome.risks.includes("provider_plan_changed_files"), "plan-mode write violation should be an outcome risk");
 
   const checkedGeminiRun = spawnSync("node", [
@@ -739,6 +766,8 @@ try {
     env: { ...process.env, PATH: `${tempBin}:${process.env.PATH ?? ""}` }
   });
   assert(checkedGeminiRun.status === 0, "checked gemini run should complete");
+  assert(checkedGeminiRun.stderr.includes("rux: running check: node --version"), "run checks should print start progress on stderr");
+  assert(checkedGeminiRun.stderr.includes("rux: check passed exit=0"), "run checks should print completion progress on stderr");
   const checkedGeminiSummary = JSON.parse(checkedGeminiRun.stdout);
   const checkedGeminiOutcome = JSON.parse(run("node", [cliPath, "outcome", checkedGeminiSummary.id, "--cwd", tempRoot]).stdout);
   assert(checkedGeminiOutcome.outcome.label === "checks_passed", "outcome should mark check-passing provider runs");

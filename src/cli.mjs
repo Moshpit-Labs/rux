@@ -14,6 +14,35 @@ const POLICY_FILE = "rux.policy.json";
 const SCHEMA_VERSION = 1;
 const rosterDefinitions = new Set(["solo", "pair", "repair", "plan-code-review"]);
 const lifecycleMarkDefinitions = new Set(["reverted", "replayed", "accepted-downstream"]);
+const knownOptionNames = new Set([
+  "check",
+  "coder-runner",
+  "command",
+  "cost-hint",
+  "cwd",
+  "effort",
+  "force",
+  "from",
+  "implementer-runner",
+  "include-transcripts",
+  "limit",
+  "mode",
+  "model",
+  "note",
+  "planner-runner",
+  "provider-mode",
+  "repair-runner",
+  "reviewer-runner",
+  "roster",
+  "run-id",
+  "runner",
+  "started-at",
+  "status",
+  "strict",
+  "task",
+  "task-kind",
+  "timeout-ms"
+]);
 
 const runnerDefinitions = {
   fake: {
@@ -150,6 +179,10 @@ function parseOptions(args) {
     }
 
     const key = arg.slice(2);
+    if (!knownOptionNames.has(key)) {
+      throw new Error(formatUnknownOption(key));
+    }
+
     const next = args[index + 1];
     if (next === undefined || next.startsWith("--")) {
       options[key] = true;
@@ -161,6 +194,41 @@ function parseOptions(args) {
   }
 
   return { positionals, options };
+}
+
+function formatUnknownOption(key) {
+  const suggestion = nearestKnownOption(key);
+  return suggestion
+    ? `Unknown option --${key}. Did you mean --${suggestion}?`
+    : `Unknown option --${key}. Run "${CLI_NAME} help".`;
+}
+
+function nearestKnownOption(key) {
+  let best = null;
+  for (const candidate of knownOptionNames) {
+    const distance = editDistance(key, candidate);
+    if (!best || distance < best.distance) {
+      best = { candidate, distance };
+    }
+  }
+  return best && best.distance <= 3 ? best.candidate : null;
+}
+
+function editDistance(left, right) {
+  const previous = Array.from({ length: right.length + 1 }, (_, index) => index);
+  for (let leftIndex = 1; leftIndex <= left.length; leftIndex += 1) {
+    const current = [leftIndex];
+    for (let rightIndex = 1; rightIndex <= right.length; rightIndex += 1) {
+      const cost = left[leftIndex - 1] === right[rightIndex - 1] ? 0 : 1;
+      current[rightIndex] = Math.min(
+        current[rightIndex - 1] + 1,
+        previous[rightIndex] + 1,
+        previous[rightIndex - 1] + cost
+      );
+    }
+    previous.splice(0, previous.length, ...current);
+  }
+  return previous[right.length];
 }
 
 function resolveCwd(options) {
@@ -918,7 +986,7 @@ async function captureRunAttempt({
   const beforeStatus = gitStatusMap(cwd);
   const beforeRepo = gitSnapshot(cwd, beforeStatus);
   const transcript = await executeRunner({ runner, task, cwd, options, role, purpose });
-  const check = checkCommand ? { source: "run_check", ...runCheck(checkCommand, cwd) } : null;
+  const check = checkCommand ? { source: "run_check", ...runCheckWithProgress(checkCommand, cwd) } : null;
   const afterStatus = gitStatusMap(cwd);
   const afterRepo = gitSnapshot(cwd, afterStatus);
   const changedFiles = gitChangedFilesBetween(beforeStatus, afterStatus);
@@ -988,6 +1056,7 @@ async function captureRunAttempt({
   };
 
   await appendLedger(cwd, run);
+  writeRuxProgress(`recorded run ${run.id} status=${run.status} reason=${run.status_reason ?? "unknown"}`);
   return run;
 }
 
@@ -1168,6 +1237,7 @@ async function executeRoster({ roster, task, cwd, options, runnerByRole, metadat
   };
 
   await appendLedger(cwd, run);
+  writeRuxProgress(`recorded roster ${run.id} status=${run.status} reason=${run.status_reason ?? "unknown"}`);
   return run;
 }
 
@@ -1212,7 +1282,7 @@ async function executeRunner({ runner, task, cwd, options, role, purpose }) {
   throw new Error(`${runner} runner is detected but not implemented yet. Run "rux runners" to see supported local runners.`);
 }
 
-function runProviderProcess({ command, args, cwd, timeoutMs }) {
+function runProviderProcess({ command, args, cwd, timeoutMs, providerMode }) {
   const startedAt = new Date();
   const maxBufferBytes = 20 * 1024 * 1024;
   let stdout = "";
@@ -1221,6 +1291,8 @@ function runProviderProcess({ command, args, cwd, timeoutMs }) {
   let spawnError = null;
   let settled = false;
   let killedForBuffer = false;
+
+  writeRuxProgress(`starting ${command} mode=${providerMode ?? "unknown"} timeout=${formatDuration(timeoutMs)}`);
 
   return new Promise((resolveProcess) => {
     const child = spawn(command, args, {
@@ -1233,12 +1305,20 @@ function runProviderProcess({ command, args, cwd, timeoutMs }) {
       timedOut = true;
       child.kill("SIGTERM");
     }, timeoutMs);
+    const progressTimer = setInterval(() => {
+      const dirty = gitDoctor(cwd).dirty_entries;
+      const dirtySuffix = Number.isInteger(dirty) ? ` dirty=${dirty}` : "";
+      writeRuxProgress(`${command} still running elapsed=${formatDuration(Date.now() - startedAt.getTime())}${dirtySuffix}`);
+    }, 30 * 1000);
+    progressTimer.unref?.();
 
     const finish = (exitCode) => {
       if (settled) return;
       settled = true;
       clearTimeout(timer);
+      clearInterval(progressTimer);
       const endedAt = new Date();
+      writeRuxProgress(`${command} finished exit=${exitCode ?? "unknown"} timed_out=${timedOut} elapsed=${formatDuration(endedAt.getTime() - startedAt.getTime())}`);
       resolveProcess({
         startedAt,
         endedAt,
@@ -1317,7 +1397,7 @@ async function executeClaudeRunner({ task, cwd, options, role, purpose }) {
     task
   ];
 
-  const result = await runProviderProcess({ command: "claude", args, cwd, timeoutMs });
+  const result = await runProviderProcess({ command: "claude", args, cwd, timeoutMs, providerMode });
   const timedOut = result.timedOut;
   const exitCode = result.exitCode;
   const status = timedOut ? "timeout" : exitCode === 0 ? "ok" : "failed";
@@ -1378,7 +1458,7 @@ async function executeCodexRunner({ task, cwd, options, role, purpose }) {
     task
   ];
 
-  const result = await runProviderProcess({ command: "codex", args, cwd, timeoutMs });
+  const result = await runProviderProcess({ command: "codex", args, cwd, timeoutMs, providerMode });
   const timedOut = result.timedOut;
   const exitCode = result.exitCode;
   const status = timedOut ? "timeout" : exitCode === 0 ? "ok" : "failed";
@@ -1438,7 +1518,7 @@ async function executeGeminiRunner({ task, cwd, options, role, purpose }) {
     task
   ];
 
-  const result = await runProviderProcess({ command: "gemini", args, cwd, timeoutMs });
+  const result = await runProviderProcess({ command: "gemini", args, cwd, timeoutMs, providerMode });
   const timedOut = result.timedOut;
   const exitCode = result.exitCode;
   const status = timedOut ? "timeout" : exitCode === 0 ? "ok" : "failed";
@@ -2565,7 +2645,7 @@ async function addCheck(args) {
 
   const beforeStatus = gitStatusMap(cwd);
   const beforeRepo = gitSnapshot(cwd, beforeStatus);
-  const check = runCheck(command, cwd);
+  const check = runCheckWithProgress(command, cwd);
   const afterStatus = gitStatusMap(cwd);
   const afterRepo = gitSnapshot(cwd, afterStatus);
   const changedFiles = gitChangedFilesBetween(beforeStatus, afterStatus);
@@ -2872,6 +2952,28 @@ function runCheck(command, cwd) {
     stdout: trimOutput(result.stdout),
     stderr: trimOutput(result.stderr)
   };
+}
+
+function runCheckWithProgress(command, cwd) {
+  writeRuxProgress(`running check: ${command}`);
+  const result = runCheck(command, cwd);
+  const outcome = result.exit_code === 0 ? "passed" : "failed";
+  writeRuxProgress(`check ${outcome} exit=${result.exit_code} duration=${formatDuration(result.duration_ms)}`);
+  return result;
+}
+
+function writeRuxProgress(message) {
+  process.stderr.write(`rux: ${message}\n`);
+}
+
+function formatDuration(ms) {
+  const totalSeconds = Math.max(0, Math.round(Number(ms) / 1000));
+  if (totalSeconds < 60) {
+    return `${totalSeconds}s`;
+  }
+  const minutes = Math.floor(totalSeconds / 60);
+  const seconds = totalSeconds % 60;
+  return `${minutes}m${String(seconds).padStart(2, "0")}s`;
 }
 
 function trimOutput(value) {
@@ -3252,8 +3354,8 @@ function summarizeOutcome(run, children, verdict, marks = []) {
   const childFailures = children.filter((child) => child.status !== "ok");
   const providerSmokeEvidence = isProviderSmokeEvidence(run);
   const changedFiles = Array.isArray(run.changed_files) ? run.changed_files : [];
-  const checkLabel = checks.length > 0
-    ? failedChecks.length === 0 && run.status === "ok" ? "checks_passed" : "checks_failed"
+  const checkLabel = checks.length > 0 && (run.status === "ok" || failedChecks.length > 0)
+    ? failedChecks.length === 0 ? "checks_passed" : "checks_failed"
     : null;
 
   if (hasLifecycleMark(marks, "reverted")) {
@@ -3320,7 +3422,7 @@ function summarizeOutcome(run, children, verdict, marks = []) {
       confidence: passed ? "medium" : "high",
       source: "check_result",
       score: passed ? 0.75 : 0,
-      reason: passed ? "All captured checks passed." : "At least one captured check failed or the run failed.",
+      reason: passed ? "All captured checks passed." : "At least one captured check failed.",
       verdict: null,
       marks: marks.map(formatLifecycleMark),
       checks: outcomeCheckSummary(checks, failedChecks, childChecks, failedChildChecks),
