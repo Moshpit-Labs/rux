@@ -47,6 +47,8 @@ mustInclude("README.md", readme, "[Standards](docs/STANDARDS.md)");
 mustInclude("AGENTS.md", agents, "`docs/VISION.md` tells us the product arc and guardrails.");
 mustInclude("AGENTS.md", agents, "`docs/DECISIONS.md` records sticky decisions.");
 mustInclude("docs/STATE.md", state, "Swami-lite docs system");
+mustInclude("docs/VISION.md", vision, "The frontier is not starting agents.");
+mustInclude("docs/VISION.md", vision, "Rux exists to become the memory and decision layer");
 mustInclude("docs/VISION.md", vision, "Capture before routing.");
 mustInclude("docs/VISION.md", vision, "Beyond Coding");
 mustInclude("docs/STANDARDS.md", standards, "weekly patch train");
