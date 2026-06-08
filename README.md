@@ -76,10 +76,12 @@ rux run "update the navigation code" --runner gemini --provider-mode write --che
 
 Start here:
 
+- [Vision](docs/VISION.md)
 - [State](docs/STATE.md)
 - [Architecture](docs/ARCHITECTURE.md)
 - [v0 Plan](docs/V0_PLAN.md)
 - [Standards](docs/STANDARDS.md)
+- [Decisions](docs/DECISIONS.md)
 
 ## Naming
 

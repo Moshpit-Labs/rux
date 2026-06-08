@@ -32,9 +32,11 @@ Runtime naming lives in `src/identity.mjs`; package publishing stays gated by lo
 This repo should stay readable in minutes:
 
 - `README.md` tells a new user what this is.
+- `docs/VISION.md` tells us the product arc and guardrails.
 - `docs/STATE.md` tells the creator what is true now.
 - `docs/ARCHITECTURE.md` explains the system in one sitting.
 - `docs/V0_PLAN.md` tells us what to build first and what not to build.
 - `docs/STANDARDS.md` defines coding and release standards.
+- `docs/DECISIONS.md` records sticky decisions.
 
 Do not add new docs until the existing ones cannot carry the work cleanly.
