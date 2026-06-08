@@ -1,6 +1,6 @@
 # Rux
 
-Rux is a test-first run ledger for AI coding agents. It is intended to become open source: test it locally first, then publish once the spine, real provider smoke tests, at least one routing-eligible checked or human-reviewed provider task, and the release checklist are solid.
+Rux is an open-source, test-first run ledger for AI coding agents. It records real local agent sessions first, then uses that evidence to recommend better runner and roster choices over time.
 
 It helps a developer or team answer one practical question:
 
@@ -71,4 +71,4 @@ Start here:
 
 ## Naming
 
-Rux is the selected release name. Runtime identity is centralized in `src/identity.mjs` so future pre-release adjustments stay small. The release posture is test first, then publish. Avoid "AI gateway" unless discussing the market, because gateway implies proxying model calls and credentials.
+Rux is the selected release name. Runtime identity is centralized in `src/identity.mjs` so future naming adjustments stay small. The release posture is test first, then publish. Avoid "AI gateway" unless discussing the market, because gateway implies proxying model calls and credentials.

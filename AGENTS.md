@@ -12,7 +12,7 @@ plan -> run -> record -> review -> improve
 
 Keep the product agent-first, creator-friendly, and boring in the right places. Do not turn it into a generic LLM gateway, SaaS admin panel, benchmark website, or workflow-theory project.
 
-Runtime naming lives in `src/identity.mjs`; package publishing stays private until local smoke tests, real provider smoke tests, checked provider task evidence, and the release checklist are ready.
+Runtime naming lives in `src/identity.mjs`; package publishing stays gated by local smoke tests, real provider smoke tests, checked provider task evidence, and the release checklist.
 
 ## Working Rules
 

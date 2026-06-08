@@ -1,10 +1,10 @@
 # Current State
 
-Last updated: 2026-06-07
+Last updated: 2026-06-08
 
 ## One-Line Summary
 
-Rux is a new coding-agent run ledger that records real outcomes first, then uses that evidence to recommend agent rosters. It is being built test-first: verify locally, then publish when the release gates pass.
+Rux is a public coding-agent run ledger that records real outcomes first, then uses that evidence to recommend agent rosters. The first public package is live, and the release posture is still test first: local verification before every publish.
 
 ## Decisions
 
@@ -12,7 +12,7 @@ Rux is a new coding-agent run ledger that records real outcomes first, then uses
 - Keep the current folder name for now; the selected product name is Rux.
 - Do not use Vane as the release name; it conflicts with the popular [ItzCrazyKns/Vane](https://github.com/ItzCrazyKns/Vane) AI answering-engine project.
 - Keep runtime naming centralized in `src/identity.mjs`.
-- NPM org created: `moshpits` (`https://www.npmjs.com/org/moshpits`). Publish package metadata under `@moshpits/rux`. The unscoped `rux` npm package is already occupied by an old, unrelated React/observable package; use the scoped package plus `rux` bin. Chrome is logged in for later manual npm checks, but publishing remains gated.
+- NPM org created: `moshpits` (`https://www.npmjs.com/org/moshpits`). Public package metadata lives under `@moshpits/rux`. The unscoped `rux` npm package is already occupied by an old, unrelated React/observable package; use the scoped package plus `rux` bin.
 - Package privacy has been deliberately removed for public release after local smoke, real provider smoke, and first routing-eligible provider task evidence passed.
 - Keep the npm package lean. The package allowlist includes runtime source and the default policy file; internal docs, tests, and agent instructions stay repo-only.
 - Local smoke now verifies the npm tarball contents, installs the packed tarball into a temporary prefix, and runs the installed `rux` bin.
@@ -46,7 +46,7 @@ Rux is a new coding-agent run ledger that records real outcomes first, then uses
 - `rux.policy.json` is the committed team policy file. `rux policy` reads it, `rux status` surfaces it, `rux plan` uses its cold-start runner order/default roster, and `release-check` requires it before publishing.
 - `rux propose` now writes local markdown improvement proposals under `.rux/proposals/` and appends proposal events to the ledger. Proposals cite run IDs, distinguish adapter-smoke evidence from task-quality evidence, include release-check blockers grouped by lifecycle, and never apply changes.
 - `rux doctor` is a read-only local readiness check for Node, git, ledger state, and runner CLI availability.
-- `rux release-check` is a read-only publish gate. It checks package scope, package file shape, privacy, docs, scripts, committed release state, provider-smoke evidence, at least one routing-eligible live provider task, and name readiness. Mutating post-run checks are recorded but do not satisfy task-evidence release readiness. Gates now declare lifecycle: `one_time`, `release`, or `permanent`. `release-check --strict` exits non-zero while blockers remain, and npm `prepublishOnly` runs `npm run release:verify` so publish attempts use the strict gate. It currently blocks release only because the release state is uncommitted.
+- `rux release-check` is a read-only publish gate. It checks package scope, package file shape, privacy, docs, scripts, committed release state, provider-smoke evidence, at least one routing-eligible live provider task, and name readiness. Mutating post-run checks are recorded but do not satisfy task-evidence release readiness. Gates declare lifecycle: `one_time`, `release`, or `permanent`. `release-check --strict` exits non-zero while blockers remain, and npm `prepublishOnly` runs `npm run release:verify` so publish attempts use the strict gate.
 - Treat team support as explicit export/import and committed repo policy first, not RBAC or SaaS.
 - Support local CLI adapters first. Remote job adapters such as GitHub-hosted coding agents are later release-track concerns, after the local runner contract is trustworthy.
 - Refuse parallel-N over one subscription CLI account by default. Users can opt in only when their provider terms and account setup allow it.
@@ -97,4 +97,4 @@ Local Moshpit learnings:
 
 ## Next Action
 
-Continue the v0.1 CLI spine until it earns release. Next useful work is staging the initial repo state, package release decisions, and broader evidence from real implementation, repair, and review tasks.
+The v0.1 package is public. Next useful work is broader evidence from real implementation, repair, and review tasks, then richer routing and roster selection only where the ledger supports it.
