@@ -1,0 +1,100 @@
+# Current State
+
+Last updated: 2026-06-07
+
+## One-Line Summary
+
+Rux is a new coding-agent run ledger that records real outcomes first, then uses that evidence to recommend agent rosters. It is being built test-first: verify locally, then publish when the release gates pass.
+
+## Decisions
+
+- Build from scratch in `/Users/mihir/Documents/code/moshpit-india/rux`.
+- Keep the current folder name for now; the selected product name is Rux.
+- Do not use Vane as the release name; it conflicts with the popular [ItzCrazyKns/Vane](https://github.com/ItzCrazyKns/Vane) AI answering-engine project.
+- Keep runtime naming centralized in `src/identity.mjs`.
+- NPM org created: `moshpits` (`https://www.npmjs.com/org/moshpits`). Publish package metadata under `@moshpits/rux`. The unscoped `rux` npm package is already occupied by an old, unrelated React/observable package; use the scoped package plus `rux` bin. Chrome is logged in for later manual npm checks, but publishing remains gated.
+- Package privacy has been deliberately removed for public release after local smoke, real provider smoke, and first routing-eligible provider task evidence passed.
+- Keep the npm package lean. The package allowlist includes runtime source and the default policy file; internal docs, tests, and agent instructions stay repo-only.
+- Local smoke now verifies the npm tarball contents, installs the packed tarball into a temporary prefix, and runs the installed `rux` bin.
+- Start with docs, then a CLI focused on runner + capture.
+- Treat v0.1 as the capture spine. Routing, roster planning, and self-improvement are product direction, not day-one implementation.
+- Use repo-local files in v0. No daemon, server, or database until the capture loop proves useful.
+- `rux init` creates a repo policy file and ensures `.rux/` is ignored without creating the ledger store or calling providers.
+- Keep provider auth outside Rux.
+- Claude runner capture is implemented conservatively: non-interactive `claude -p`, text output, and `--permission-mode plan`.
+- Codex runner capture is implemented conservatively against the installed CLI: non-interactive `codex exec`, read-only sandbox, and color off.
+- Gemini runner capture is implemented conservatively against the installed CLI: non-interactive `gemini -p`, text output, `--approval-mode plan`, and `--skip-trust`.
+- `--model`, `--effort`, and `--cost-hint` are recorded as run metadata. They are not passed to provider CLIs until adapter-specific flag mapping is verified.
+- `rux provider-smoke --runner claude|codex|gemini` records explicit release evidence and fails the smoke run if files change. Provider-smoke runs are not routing evidence and cannot receive checks, verdicts, or lifecycle marks.
+- Real provider-smoke evidence is now recorded in the Rux store for Claude (`20260607T180537Z-a133edf2`), Codex (`20260607T180353Z-747ebaa4`), and Gemini (`20260607T180507Z-5955c823`). Older Runbook-named evidence was migrated into `.rux/` as historical continuity data, and the legacy `.runbook/` directory has been removed.
+- Fixed rosters are implemented sequentially: `solo`, `pair`, `repair`, and `plan-code-review`. Parent runs summarize the roster; child runs are visible through `show`.
+- New run records capture git repo snapshots before and after execution: branch, HEAD, dirty count, and dirty files. Roster parent records capture the whole roster's before/after repo state, while child runs keep their own snapshots. Imports capture repo context at import time.
+- New run records include replay metadata. Run summaries, `show`, and `export` expose a `replay` object; old records derive it where possible, while imports and roster children explain why they are not directly replayable. Derived replay uses original inline checks only, not checks appended later with `rux check`.
+- New live run records also include `status_reason` and `adapter` metadata: observed command argv, exit code, timeout state, stdout/stderr byte counts, stderr signal classification, and whether model/effort/cost metadata came from user options or was not observed. Imports carry an explicit adapter-uncertainty note instead of pretending the original invocation was observed.
+- Retrospective import is explicit-file only: `rux import --from PATH`. Imported runs are `source: imported`, `confidence: low`, and should not drive recommendations until labels are attached.
+- `rux check <run-id> --command "COMMAND"` appends a `post_run_check` result without rerunning providers or rewriting the original run. Post-run checks capture their own repo snapshot and changed-file list. Inline checks captured during `rux run --check` are marked `run_check`. Passing checks can turn an unlabeled live provider run into recommendation evidence, but checks that modify files are blocked from routing evidence with `check_modified_files`; failing checks become negative evidence.
+- `rux outcome <run-id>` explains the outcome signal for a run: human verdict, check result, provider-smoke readiness, imported-unverified history, failed run, or unlabeled run.
+- `rux mark <run-id> reverted|replayed|accepted-downstream` appends downstream lifecycle evidence without rerunning providers. Reverted marks block routing; accepted-downstream marks can count as positive proof; replayed marks stay as risk/context.
+- `rux ls` shows the latest lifecycle mark for each top-level run, and `rux doctor` includes check/verdict/mark counts in the local store summary.
+- `rux eval <run-id>` explains routing eligibility, blockers, score basis, release evidence, outcome, status reason, adapter signals, stderr interpretation, checks, verdicts, lifecycle marks, and child-run signals. `show` includes the same evaluation object.
+- `rux rank [--task-kind KIND]` shows current runner/model/effort/roster rankings from eligible local evidence.
+- `rux suggest "<task>"` now provides the first routing signal. It classifies the task, considers only live high-confidence non-fake runs with checks or verdicts, ignores imported/unlabeled history, reports evidence counts, and labels recommendation maturity as `none`, `thin`, `directional`, `strong`, or `mixed`.
+- `rux plan "<task>"` is the first roster-design surface. It is dry-run only: it reuses `suggest` evidence and maturity, falls back to policy-preferred successful provider-smoke evidence before raw CLI availability, applies fixed roster rules for cold start, explains why extra agents are needed when it proposes them, resolves role runners, prints a runnable command, and does not call providers or write the ledger.
+- `rux status` is the clean overview surface. It is read-only and summarizes ledger health, outcome labels, recommendation maturity, real provider task evidence, provider-smoke readiness, runner availability, release blockers, recent runs, next-capture command guidance, and next actions. Next-capture guidance now explicitly flags provider calls, ledger writes, and human review.
+- `rux status` and `rux release-check` expose an `identity` block that names the current product, CLI, package, policy file, store directory, and rename surfaces. This keeps any future pre-release rename small.
+- `rux export` is the first team-review surface. It is read-only, emits shareable JSON summaries, omits transcript text by default, and includes transcripts only with `--include-transcripts`.
+- `rux.policy.json` is the committed team policy file. `rux policy` reads it, `rux status` surfaces it, `rux plan` uses its cold-start runner order/default roster, and `release-check` requires it before publishing.
+- `rux propose` now writes local markdown improvement proposals under `.rux/proposals/` and appends proposal events to the ledger. Proposals cite run IDs, distinguish adapter-smoke evidence from task-quality evidence, include release-check blockers grouped by lifecycle, and never apply changes.
+- `rux doctor` is a read-only local readiness check for Node, git, ledger state, and runner CLI availability.
+- `rux release-check` is a read-only publish gate. It checks package scope, package file shape, privacy, docs, scripts, committed release state, provider-smoke evidence, at least one routing-eligible live provider task, and name readiness. Mutating post-run checks are recorded but do not satisfy task-evidence release readiness. Gates now declare lifecycle: `one_time`, `release`, or `permanent`. `release-check --strict` exits non-zero while blockers remain, and npm `prepublishOnly` runs `npm run release:verify` so publish attempts use the strict gate. It currently blocks release only because the release state is uncommitted.
+- Treat team support as explicit export/import and committed repo policy first, not RBAC or SaaS.
+- Support local CLI adapters first. Remote job adapters such as GitHub-hosted coding agents are later release-track concerns, after the local runner contract is trustworthy.
+- Refuse parallel-N over one subscription CLI account by default. Users can opt in only when their provider terms and account setup allow it.
+- Use "agent runner" and "roster" in the product. Avoid "AI gateway" in user-facing language.
+- Self-improvement is proposal-only: no silent self-modification.
+
+## Research Takeaways
+
+This is not fully solved, but many pieces are solved:
+
+- [Claude dynamic workflows](https://claude.com/blog/introducing-dynamic-workflows-in-claude-code) prove that parallel subagents are now a first-party coding-agent primitive, but they are provider-specific and token-heavy.
+- [AWS CLI Agent Orchestrator](https://github.com/awslabs/cli-agent-orchestrator) proves that multi-CLI orchestration is already real: tmux sessions, supervisor-worker patterns, MCP, and cross-provider workers.
+- [Microsoft Conductor](https://opensource.microsoft.com/blog/2026/05/14/conductor-deterministic-orchestration-for-multi-agent-ai-workflows/) proves deterministic, YAML-defined multi-agent workflows are now credible infrastructure.
+- [amux](https://amux.io/) and similar tools show that "agent control plane" and multi-session dashboards are already contested territory.
+- [OpenHands Enterprise](https://www.openhands.dev/blog/openhands-enterprise-agent-control-plane) shows the enterprise control-plane language is already being claimed around governance, cost, visibility, and scale.
+- [Zed Agent Client Protocol](https://zed.dev/acp) is the strongest current signal for editor interoperability. Do not claim the `ACP` acronym.
+- [OpenAI Codex CLI](https://github.com/openai/codex) and [Google Gemini CLI](https://github.com/google-gemini/gemini-cli) are local coding agents with their own auth, config, and tool behavior. Wrap them; do not flatten them into a generic model API.
+- [Model Context Protocol](https://github.com/modelcontextprotocol/modelcontextprotocol) is now table stakes for tool/context integration. Use it where it helps; do not make it the whole product.
+- Unified headless wrappers such as [headless-coder-sdk](https://github.com/OhadAssulin/headless-coder-sdk) are a warning: the wrapper layer alone is not enough of a wedge.
+
+Local Moshpit learnings:
+
+- Work OS Bench shows the useful shape of eval-backed routing: score by model and work kind, keep outcomes source-backed, and do not replace the underlying run lifecycle.
+- Moshpit Labs shows the value of explicit run/review/evidence loops and blocked closeouts with recovery paths.
+- Swami/Labs workflow feedback shows the right self-improvement shape: raw observations first, curated lessons second.
+
+## Pushback
+
+- Do not pretend eval exists before labels exist. v0.1 must capture test results and explicit human verdicts.
+- Do not make the runner the wedge. The wedge is trustworthy outcome memory and later recommendation.
+- Do not ship fanout first. Start with fixed useful rosters, then earn dynamic agent-count selection from evidence.
+- Do not build IDE automation first. Surface results through files, branches, comments, and protocol adapters later.
+- Do not build a full benchmark platform. Public benchmarks are useful references; the valuable signal is each user's own repos.
+- Do not build subscription arbitrage. Provider terms and user trust matter.
+- Do not create a heavy swarm vocabulary. Users need rosters, not a theory class.
+
+## Open Decisions
+
+- Implementation language: TypeScript is likely the best fit for CLI distribution and provider ecosystem; Python is viable if speed of authoring matters more.
+- License: Apache-2.0 is the conservative open-source default for broad adoption.
+- CLI name: `rux`.
+- Package scope and slug: `@moshpits/rux`.
+- Ledger location: `.rux/ledger/` inside the target repo, with optional global index later.
+- First real runners: Claude Code plan-mode capture, Codex CLI read-only capture, and Gemini CLI plan-mode capture.
+- First routing-eligible provider task evidence is recorded with Codex (`20260607T180641Z-f46c1b70`) and `npm run check`; next runner work is to broaden that evidence across real implementation, repair, and review tasks.
+- Next eval work: improve reviewer semantics and adapter-specific metadata detection so provider output can enrich model/cost fields only when the provider exposes trustworthy structured data.
+- First dynamic roster work: `rux plan` chooses between fixed rosters using evidence plus simple rules; do not invent new swarm shapes until the ledger earns it.
+
+## Next Action
+
+Continue the v0.1 CLI spine until it earns release. Next useful work is staging the initial repo state, package release decisions, and broader evidence from real implementation, repair, and review tasks.

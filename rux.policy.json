@@ -1,0 +1,15 @@
+{
+  "schema_version": 1,
+  "preferred_runner_order": ["codex", "gemini", "claude"],
+  "default_roster": "solo",
+  "parallel_provider_cli_runs": false,
+  "provider_auth": "inherit_cli_environment",
+  "transcript_export_default": "omit",
+  "self_modification": "proposal_only",
+  "notes": [
+    "Provider CLIs use the user's installed auth and config.",
+    "Do not fan out parallel runs over one subscription-backed CLI account by default.",
+    "Export summaries omit transcript text unless explicitly requested.",
+    "Improvement loops may propose changes, but must not apply them silently."
+  ]
+}

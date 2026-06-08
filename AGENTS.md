@@ -1,0 +1,39 @@
+# Agent Instructions
+
+Read this file before work in this repo.
+
+## Product Shape
+
+Rux is the selected product name for a test-first tool that records AI coding runs through one simple loop:
+
+```
+plan -> run -> record -> review -> improve
+```
+
+Keep the product agent-first, creator-friendly, and boring in the right places. Do not turn it into a generic LLM gateway, SaaS admin panel, benchmark website, or workflow-theory project.
+
+Runtime naming lives in `src/identity.mjs`; package publishing stays private until local smoke tests, real provider smoke tests, checked provider task evidence, and the release checklist are ready.
+
+## Working Rules
+
+- Keep the current state in `docs/STATE.md` accurate after meaningful work.
+- Prefer small docs and runnable examples over long strategy notes.
+- Re-implement from scratch. Borrow concepts from other projects, never code or project-specific machinery.
+- Treat adapter behavior as volatile. Verify provider CLI commands against the installed tool before documenting exact flags.
+- Do not store provider credentials. Inherit auth from the wrapped CLI or the user's environment.
+- Do not add telemetry by default.
+- Refuse parallel runs over one subscription CLI account by default. Let users opt in only when they confirm their provider terms and account setup allow it.
+- Do not let the tool silently change its own source code. Improvement loops may propose changes with evidence; a human decides.
+- If a task needs multiple agents, state why one agent is not enough.
+- If a feature adds new nouns, push back unless it clearly reduces user effort.
+
+## Documentation Contract
+
+This repo should stay readable in minutes:
+
+- `README.md` tells a new user what this is.
+- `docs/STATE.md` tells the creator what is true now.
+- `docs/ARCHITECTURE.md` explains the system in one sitting.
+- `docs/V0_PLAN.md` tells us what to build first and what not to build.
+
+Do not add new docs until the existing ones cannot carry the work cleanly.

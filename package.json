@@ -1,0 +1,35 @@
+{
+  "name": "@moshpits/rux",
+  "version": "0.1.0",
+  "private": false,
+  "license": "Apache-2.0",
+  "description": "Test-first run ledger for AI coding agents.",
+  "type": "module",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/moshpit-india/rux.git"
+  },
+  "bugs": {
+    "url": "https://github.com/moshpit-india/rux/issues"
+  },
+  "homepage": "https://github.com/moshpit-india/rux#readme",
+  "publishConfig": {
+    "access": "public"
+  },
+  "bin": {
+    "rux": "src/cli.mjs"
+  },
+  "files": [
+    "src/",
+    "rux.policy.json"
+  ],
+  "scripts": {
+    "check": "node --check src/cli.mjs",
+    "smoke": "node tests/smoke.mjs",
+    "release:verify": "npm run check && npm run smoke && node src/cli.mjs release-check --strict",
+    "prepublishOnly": "npm run release:verify"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}

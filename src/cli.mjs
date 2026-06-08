@@ -1,0 +1,3591 @@
+#!/usr/bin/env node
+
+import { appendFile, mkdir, readFile, readdir, stat, writeFile } from "node:fs/promises";
+import { existsSync } from "node:fs";
+import { basename, join, relative, resolve } from "node:path";
+import { spawnSync } from "node:child_process";
+import { randomUUID } from "node:crypto";
+import { CLI_NAME, NPM_ORG, PRODUCT_NAME, STORE_DIR } from "./identity.mjs";
+
+const LEDGER_DIR = "ledger";
+const TRANSCRIPT_DIR = "transcripts";
+const PROPOSAL_DIR = "proposals";
+const POLICY_FILE = "rux.policy.json";
+const SCHEMA_VERSION = 1;
+const rosterDefinitions = new Set(["solo", "pair", "repair", "plan-code-review"]);
+const lifecycleMarkDefinitions = new Set(["reverted", "replayed", "accepted-downstream"]);
+
+const runnerDefinitions = {
+  fake: {
+    label: "Fake runner",
+    command: null,
+    available: true,
+    notes: "Built-in runner for smoke tests and ledger development."
+  },
+  claude: {
+    label: "Claude Code",
+    command: "claude",
+    notes: "Uses the installed Claude Code CLI and its existing auth. Runs in plan mode by default."
+  },
+  codex: {
+    label: "Codex CLI",
+    command: "codex",
+    notes: "Uses the installed Codex CLI and its existing auth. Runs with read-only sandbox by default."
+  },
+  gemini: {
+    label: "Gemini CLI",
+    command: "gemini",
+    notes: "Uses the installed Gemini CLI and its existing auth. Runs in plan approval mode by default."
+  }
+};
+
+main().catch((error) => {
+  console.error(error instanceof Error ? error.message : String(error));
+  process.exitCode = 1;
+});
+
+async function main() {
+  const [command, ...args] = process.argv.slice(2);
+
+  switch (command) {
+    case "runners":
+      return printRunners();
+    case "init":
+      return initRepo(args);
+    case "run":
+      return runCommand(args);
+    case "provider-smoke":
+      return providerSmoke(args);
+    case "ls":
+      return listRuns(args);
+    case "show":
+      return showRun(args);
+    case "eval":
+      return evaluateRunCommand(args);
+    case "outcome":
+      return outcomeRun(args);
+    case "import":
+      return importRun(args);
+    case "plan":
+      return planRun(args);
+    case "suggest":
+      return suggestRun(args);
+    case "rank":
+      return rankRuns(args);
+    case "status":
+      return status(args);
+    case "export":
+      return exportRuns(args);
+    case "policy":
+      return showPolicy(args);
+    case "doctor":
+      return doctor(args);
+    case "release-check":
+      return releaseCheck(args);
+    case "propose":
+      return proposeImprovements(args);
+    case "check":
+      return addCheck(args);
+    case "verdict":
+      return addVerdict(args);
+    case "mark":
+      return addLifecycleMark(args);
+    case "help":
+    case "--help":
+    case "-h":
+    case undefined:
+      return printHelp();
+    case "version":
+    case "--version":
+    case "-v":
+      return printVersion();
+    default:
+      throw new Error(`Unknown command: ${command}\nRun "rux help".`);
+  }
+}
+
+function printHelp() {
+  console.log(`${PRODUCT_NAME}
+
+Usage:
+  ${CLI_NAME} runners
+  ${CLI_NAME} init [--cwd PATH] [--force]
+  ${CLI_NAME} run "<task>" [--runner fake|claude|codex|gemini] [--roster solo|pair|repair|plan-code-review] [--model NAME] [--effort LEVEL] [--cost-hint USD] [--cwd PATH] [--check "COMMAND"] [--timeout-ms N]
+  ${CLI_NAME} provider-smoke --runner claude|codex|gemini [--model NAME] [--effort LEVEL] [--cwd PATH] [--timeout-ms N]
+  ${CLI_NAME} import --from PATH [--runner claude|codex|gemini|unknown] [--task "TEXT"] [--model NAME] [--effort LEVEL] [--cost-hint USD] [--cwd PATH]
+  ${CLI_NAME} plan "<task>" [--runner fake|claude|codex|gemini] [--roster solo|pair|repair|plan-code-review] [--model NAME] [--effort LEVEL] [--cost-hint USD] [--cwd PATH] [--check "COMMAND"]
+  ${CLI_NAME} suggest "<task>" [--cwd PATH]
+  ${CLI_NAME} rank [--task-kind KIND] [--cwd PATH]
+  ${CLI_NAME} status [--cwd PATH]
+  ${CLI_NAME} export [--cwd PATH] [--limit N] [--run-id ID] [--include-transcripts]
+  ${CLI_NAME} policy [--cwd PATH]
+  ${CLI_NAME} doctor [--cwd PATH]
+  ${CLI_NAME} release-check [--cwd PATH] [--strict]
+  ${CLI_NAME} propose [--cwd PATH]
+  ${CLI_NAME} --version
+  ${CLI_NAME} ls [--cwd PATH]
+  ${CLI_NAME} show <run-id> [--cwd PATH]
+  ${CLI_NAME} eval <run-id> [--cwd PATH]
+  ${CLI_NAME} outcome <run-id> [--cwd PATH]
+  ${CLI_NAME} check <run-id> --command "COMMAND" [--note "TEXT"] [--cwd PATH]
+  ${CLI_NAME} verdict <run-id> accepted|rejected|partial|unknown [--note "TEXT"] [--cwd PATH]
+  ${CLI_NAME} mark <run-id> reverted|replayed|accepted-downstream [--note "TEXT"] [--cwd PATH]
+`);
+}
+
+async function printVersion() {
+  const packageJson = await readJsonIfExists(new URL("../package.json", import.meta.url));
+  console.log(`${CLI_NAME} ${packageJson?.version ?? "unknown"}`);
+}
+
+function parseOptions(args) {
+  const positionals = [];
+  const options = {};
+
+  for (let index = 0; index < args.length; index += 1) {
+    const arg = args[index];
+    if (!arg.startsWith("--")) {
+      positionals.push(arg);
+      continue;
+    }
+
+    const key = arg.slice(2);
+    const next = args[index + 1];
+    if (next === undefined || next.startsWith("--")) {
+      options[key] = true;
+      continue;
+    }
+
+    options[key] = next;
+    index += 1;
+  }
+
+  return { positionals, options };
+}
+
+function resolveCwd(options) {
+  return resolve(String(options.cwd ?? process.cwd()));
+}
+
+function metadataFromOptions(options) {
+  return {
+    model: normalizeOptionalString(options.model),
+    effort: normalizeOptionalString(options.effort),
+    cost_hint: parseCostHint(options["cost-hint"])
+  };
+}
+
+function normalizeOptionalString(value) {
+  if (value === undefined || value === true) return null;
+  const text = String(value).trim();
+  return text ? text : null;
+}
+
+function parseCostHint(value) {
+  if (value === undefined || value === true) return null;
+  const raw = String(value).trim();
+  if (!raw) return null;
+  const amount = Number(raw);
+  if (Number.isFinite(amount) && amount >= 0) {
+    return {
+      amount,
+      currency: "USD",
+      source: "user"
+    };
+  }
+  return {
+    raw,
+    source: "user"
+  };
+}
+
+function parsePositiveInteger(value, fallback, flagName) {
+  if (value === undefined || value === true) return fallback;
+  const number = Number(value);
+  if (!Number.isInteger(number) || number <= 0) {
+    throw new Error(`${flagName} must be a positive integer`);
+  }
+  return number;
+}
+
+function defaultPolicy() {
+  return {
+    schema_version: SCHEMA_VERSION,
+    preferred_runner_order: ["claude", "codex", "gemini"],
+    default_roster: "solo",
+    parallel_provider_cli_runs: false,
+    provider_auth: "inherit_cli_environment",
+    transcript_export_default: "omit",
+    self_modification: "proposal_only",
+    notes: [
+      "Default runtime policy used because no committed policy file exists."
+    ]
+  };
+}
+
+async function loadPolicy(cwd) {
+  const path = join(cwd, POLICY_FILE);
+  const fromFile = await readJsonIfExists(path);
+  const policy = fromFile ? normalizePolicy(fromFile) : defaultPolicy();
+  return {
+    path,
+    exists: Boolean(fromFile),
+    source: fromFile ? "file" : "default",
+    policy
+  };
+}
+
+function normalizePolicy(policy) {
+  const defaults = defaultPolicy();
+  const preferredRunnerOrder = Array.isArray(policy.preferred_runner_order)
+    ? policy.preferred_runner_order.filter((runner) => typeof runner === "string" && runnerDefinitions[runner])
+    : defaults.preferred_runner_order;
+  return {
+    ...defaults,
+    ...policy,
+    schema_version: Number(policy.schema_version ?? defaults.schema_version),
+    preferred_runner_order: preferredRunnerOrder.length > 0 ? preferredRunnerOrder : defaults.preferred_runner_order,
+    default_roster: rosterDefinitions.has(policy.default_roster) ? policy.default_roster : defaults.default_roster,
+    parallel_provider_cli_runs: Boolean(policy.parallel_provider_cli_runs),
+    notes: Array.isArray(policy.notes) ? policy.notes.map(String) : defaults.notes
+  };
+}
+
+async function initRepo(args) {
+  const { options } = parseOptions(args);
+  const cwd = resolveCwd(options);
+  const force = options.force === true;
+  const policyPath = join(cwd, POLICY_FILE);
+  const gitignorePath = join(cwd, ".gitignore");
+  const policyExists = existsSync(policyPath);
+  const policyWritten = !policyExists || force;
+  const actions = [];
+
+  if (policyWritten) {
+    await writeFile(policyPath, `${JSON.stringify(defaultPolicy(), null, 2)}\n`, "utf8");
+    actions.push(policyExists ? `${POLICY_FILE} overwritten` : `${POLICY_FILE} created`);
+  } else {
+    actions.push(`${POLICY_FILE} already exists`);
+  }
+
+  const gitignoreBefore = await readTextIfExists(gitignorePath);
+  const gitignoreHasStore = gitignoreBefore.split(/\r?\n/).some((line) => line.trim() === `${STORE_DIR}/`);
+  let gitignoreWritten = false;
+  if (!gitignoreHasStore) {
+    const prefix = gitignoreBefore && !gitignoreBefore.endsWith("\n") ? "\n" : "";
+    await writeFile(gitignorePath, `${gitignoreBefore}${prefix}${STORE_DIR}/\n`, "utf8");
+    gitignoreWritten = true;
+    actions.push(".gitignore updated");
+  } else {
+    actions.push(".gitignore already ignores store");
+  }
+
+  console.log(JSON.stringify({
+    product: PRODUCT_NAME,
+    cwd,
+    policy: {
+      path: relative(cwd, policyPath),
+      created: !policyExists,
+      overwritten: policyExists && force,
+      written: policyWritten
+    },
+    gitignore: {
+      path: relative(cwd, gitignorePath),
+      written: gitignoreWritten,
+      ignores_store: true
+    },
+    actions,
+    notes: [
+      "init does not call providers.",
+      `${STORE_DIR}/ stores local run transcripts and ledger files and should stay out of git.`
+    ]
+  }, null, 2));
+}
+
+function normalizeRunner(runner) {
+  if (!runnerDefinitions[runner]) {
+    throw new Error(`Unknown runner: ${runner}`);
+  }
+  return runner;
+}
+
+function normalizeRoster(roster) {
+  if (!rosterDefinitions.has(roster)) {
+    throw new Error(`Unknown roster: ${roster}. Use solo, pair, repair, or plan-code-review.`);
+  }
+  return roster;
+}
+
+function resolveRosterRunners(roster, primaryRunner, options) {
+  if (roster === "solo") {
+    return { primary: primaryRunner, implementer: primaryRunner };
+  }
+
+  if (roster === "pair") {
+    return {
+      primary: primaryRunner,
+      implementer: normalizeRunner(String(options["implementer-runner"] ?? options["coder-runner"] ?? primaryRunner)),
+      reviewer: normalizeRunner(String(options["reviewer-runner"] ?? primaryRunner))
+    };
+  }
+
+  if (roster === "repair") {
+    return {
+      primary: primaryRunner,
+      implementer: normalizeRunner(String(options["implementer-runner"] ?? options["coder-runner"] ?? primaryRunner)),
+      repairer: normalizeRunner(String(options["repair-runner"] ?? primaryRunner))
+    };
+  }
+
+  if (roster === "plan-code-review") {
+    return {
+      primary: primaryRunner,
+      planner: normalizeRunner(String(options["planner-runner"] ?? primaryRunner)),
+      coder: normalizeRunner(String(options["coder-runner"] ?? options["implementer-runner"] ?? primaryRunner)),
+      reviewer: normalizeRunner(String(options["reviewer-runner"] ?? primaryRunner))
+    };
+  }
+
+  throw new Error(`Unsupported roster: ${roster}`);
+}
+
+function ensureRunnersAvailable(runners) {
+  for (const runner of unique(runners)) {
+    if (runner !== "fake" && !commandExists(runnerDefinitions[runner].command)) {
+      throw new Error(`${runner} runner is not available. Run "rux runners" for details.`);
+    }
+  }
+}
+
+async function printRunners() {
+  const rows = Object.entries(runnerDefinitions).map(([name, definition]) => {
+    const available = definition.available === true || commandExists(definition.command);
+    return {
+      name,
+      available,
+      command: definition.command ?? "(built-in)",
+      notes: definition.notes
+    };
+  });
+
+  console.log(JSON.stringify(rows, null, 2));
+}
+
+async function doctor(args) {
+  const { options } = parseOptions(args);
+  const cwd = resolveCwd(options);
+  const events = await readLedger(cwd);
+  const runs = events.filter((event) => event.type === "run");
+  const proposals = events.filter((event) => event.type === "proposal");
+  const checks = events.filter((event) => event.type === "check");
+  const verdicts = events.filter((event) => event.type === "verdict");
+  const marks = events.filter((event) => event.type === "mark");
+  const runners = Object.entries(runnerDefinitions).map(([name, definition]) => ({
+    name,
+    label: definition.label,
+    command: definition.command ?? "(built-in)",
+    available: definition.available === true || commandExists(definition.command),
+    notes: definition.notes
+  }));
+
+  console.log(JSON.stringify({
+    product: PRODUCT_NAME,
+    cli: CLI_NAME,
+    schema_version: SCHEMA_VERSION,
+    cwd,
+    node: {
+      version: process.version,
+      ok: Number(process.versions.node.split(".")[0]) >= 20
+    },
+    git: gitDoctor(cwd),
+    store: {
+      path: join(cwd, STORE_DIR),
+      exists: existsSync(join(cwd, STORE_DIR)),
+      ledger_events: events.length,
+      runs: runs.length,
+      checks: checks.length,
+      verdicts: verdicts.length,
+      marks: marks.length,
+      proposals: proposals.length
+    },
+    runners,
+    notes: [
+      "doctor is read-only and does not call provider services.",
+      "Provider availability only means the CLI binary is on PATH; auth and live behavior still require provider-smoke."
+    ]
+  }, null, 2));
+}
+
+async function releaseCheck(args) {
+  const { options } = parseOptions(args);
+  const cwd = resolveCwd(options);
+  const result = await buildReleaseCheck(cwd);
+  console.log(JSON.stringify(result, null, 2));
+  if (options.strict === true && !result.ready) {
+    process.exitCode = 1;
+  }
+}
+
+async function buildReleaseCheck(cwd) {
+  const packageJson = await readJsonIfExists(join(cwd, "package.json"));
+  const policy = await loadPolicy(cwd);
+  const identity = await buildIdentitySummary(cwd, packageJson);
+  const events = await readLedger(cwd);
+  const topRuns = topLevelRuns(runsWithAppendedChecks(events));
+  const verdicts = latestVerdictByRun(events);
+  const marks = lifecycleMarksByRun(events);
+  const eligibility = partitionRecommendationEvidence(topRuns, verdicts, marks);
+  const git = gitDoctor(cwd);
+  const packageFilesScoped = packageFilesAreReleaseScoped(packageJson);
+  const gates = [
+    releaseGate("package_json", Boolean(packageJson), "package.json exists.", { lifecycle: "permanent", category: "package" }),
+    releaseGate("package_scope_matches_npm_org", packageNameUsesNpmOrg(packageJson), `package name uses the @${NPM_ORG}/ npm org scope.`, { lifecycle: "permanent", category: "package" }),
+    releaseGate("package_private_removed", packageJson?.private === false, "`private: true` must be deliberately removed before publish.", { lifecycle: "one_time", category: "publish_decision" }),
+    releaseGate("package_files_allowlist", packageFilesScoped, "package.json files allowlist excludes internal docs, tests, and agent instructions.", { lifecycle: "permanent", category: "package" }),
+    releaseGate("license", existsSync(join(cwd, "LICENSE")), "LICENSE exists.", { lifecycle: "permanent", category: "docs" }),
+    releaseGate("readme", existsSync(join(cwd, "README.md")), "README.md exists.", { lifecycle: "permanent", category: "docs" }),
+    releaseGate("policy_file", policy.exists, `${POLICY_FILE} exists.`, { lifecycle: "permanent", category: "policy" }),
+    releaseGate("state_doc", existsSync(join(cwd, "docs", "STATE.md")), "docs/STATE.md exists.", { lifecycle: "release", category: "docs" }),
+    releaseGate("architecture_doc", existsSync(join(cwd, "docs", "ARCHITECTURE.md")), "docs/ARCHITECTURE.md exists.", { lifecycle: "release", category: "docs" }),
+    releaseGate("v0_plan", existsSync(join(cwd, "docs", "V0_PLAN.md")), "docs/V0_PLAN.md exists.", { lifecycle: "one_time", category: "docs" }),
+    releaseGate("name_release_decision", identity.release_name_locked, "Docs no longer describe the name as undecided.", { lifecycle: "one_time", category: "naming" }),
+    releaseGate("local_smoke_script", Boolean(packageJson?.scripts?.smoke), "Local smoke script exists.", { lifecycle: "permanent", category: "verification" }),
+    releaseGate("check_script", Boolean(packageJson?.scripts?.check), "Syntax/check script exists.", { lifecycle: "permanent", category: "verification" }),
+    releaseGate("prepublish_release_guard", packageScriptsHaveReleaseGuard(packageJson), "npm prepublishOnly runs release verification with strict release-check.", { lifecycle: "permanent", category: "verification" }),
+    releaseGate("worktree_clean", git.available && git.inside_work_tree && git.dirty_entries === 0, "Git worktree has no uncommitted changes outside .rux/.", { lifecycle: "permanent", category: "repo_hygiene" }),
+    releaseGate("claude_smoke_evidence", hasProviderSmoke(topRuns, "claude"), "Ledger contains a successful Claude provider-smoke run with no file changes.", { lifecycle: "release", category: "provider_evidence" }),
+    releaseGate("codex_smoke_evidence", hasProviderSmoke(topRuns, "codex"), "Ledger contains a successful Codex provider-smoke run with no file changes.", { lifecycle: "release", category: "provider_evidence" }),
+    releaseGate("gemini_smoke_evidence", hasProviderSmoke(topRuns, "gemini"), "Ledger contains a successful Gemini provider-smoke run with no file changes.", { lifecycle: "release", category: "provider_evidence" }),
+    releaseGate("real_provider_task_evidence", eligibility.eligible.length > 0, "Ledger contains at least one routing-eligible live provider task with a check or human verdict.", { lifecycle: "one_time", category: "provider_evidence" }),
+    releaseGate("no_local_only_language", !(await hasLocalOnlyLanguage(cwd)), "Docs do not describe the product as local-only.", { lifecycle: "one_time", category: "docs" })
+  ];
+
+  const ready = gates.every((gate) => gate.ok);
+  const blockers = gates.filter((gate) => !gate.ok);
+  return {
+    product: PRODUCT_NAME,
+    cwd,
+    ready,
+    package: packageJson ? {
+      name: packageJson.name,
+      version: packageJson.version,
+      private: packageJson.private,
+      license: packageJson.license
+    } : null,
+    identity,
+    gates,
+    blocker_summary: summarizeReleaseBlockers(blockers),
+    next_actions: blockers.map((gate) => gate.action)
+  };
+}
+
+async function buildIdentitySummary(cwd, packageJson) {
+  const releaseNameLocked = !(await hasWorkingNameLanguage(cwd));
+  const packageBin = packageJson?.bin && typeof packageJson.bin === "object"
+    ? Object.keys(packageJson.bin).sort()
+    : [];
+  const packageFiles = Array.isArray(packageJson?.files)
+    ? packageJson.files.map(normalizePackageFileEntry)
+    : [];
+
+  return {
+    product: PRODUCT_NAME,
+    cli: CLI_NAME,
+    npm_org: NPM_ORG,
+    package_name: packageJson?.name ?? null,
+    package_bin: packageBin,
+    package_files: packageFiles,
+    store_dir: STORE_DIR,
+    policy_file: POLICY_FILE,
+    release_name_locked: releaseNameLocked,
+    name_status: releaseNameLocked ? "release_name_selected" : "working_name",
+    release_gate: "name_release_decision",
+    rename_surfaces: [
+      "src/identity.mjs: PRODUCT_NAME, CLI_NAME, STORE_DIR",
+      "package.json: name, bin, files",
+      "policy file name and src/cli.mjs POLICY_FILE",
+      ".gitignore store rule",
+      "README.md, AGENTS.md, docs/STATE.md, docs/ARCHITECTURE.md, docs/V0_PLAN.md",
+      "tests/smoke.mjs package, bin, store, and policy expectations"
+    ]
+  };
+}
+
+function packageFilesAreReleaseScoped(packageJson) {
+  if (!Array.isArray(packageJson?.files)) return false;
+
+  const files = packageJson.files.map(normalizePackageFileEntry);
+  const required = ["src/", "rux.policy.json"];
+  const allowed = new Set(required);
+
+  return required.every((entry) => files.includes(entry)) &&
+    files.every((entry) => allowed.has(entry));
+}
+
+function normalizePackageFileEntry(entry) {
+  const value = String(entry).replace(/^\.\//, "");
+  if (value === "src") return "src/";
+  return value;
+}
+
+function packageNameUsesNpmOrg(packageJson) {
+  return typeof packageJson?.name === "string" && packageJson.name.startsWith(`@${NPM_ORG}/`);
+}
+
+function packageScriptsHaveReleaseGuard(packageJson) {
+  const scripts = packageJson?.scripts ?? {};
+  return typeof scripts["prepublishOnly"] === "string" &&
+    scripts["prepublishOnly"].includes("release:verify") &&
+    typeof scripts["release:verify"] === "string" &&
+    scripts["release:verify"].includes("npm run check") &&
+    scripts["release:verify"].includes("npm run smoke") &&
+    scripts["release:verify"].includes("release-check --strict");
+}
+
+async function status(args) {
+  const { options } = parseOptions(args);
+  const cwd = resolveCwd(options);
+  const events = await readLedger(cwd);
+  const policy = await loadPolicy(cwd);
+  const packageJson = await readJsonIfExists(join(cwd, "package.json"));
+  const runs = runsWithAppendedChecks(events);
+  const topRuns = topLevelRuns(runs);
+  const proposals = events.filter((event) => event.type === "proposal");
+  const verdicts = latestVerdictByRun(events);
+  const marks = lifecycleMarksByRun(events);
+  const release = await buildReleaseCheck(cwd);
+  const eligibility = partitionRecommendationEvidence(topRuns, verdicts, marks);
+  const liveProviderTaskRuns = topRuns.filter(isLiveProviderTaskRun);
+  const providerSmokeRuns = topRuns.filter((run) => run.purpose === "provider_smoke");
+  const outcomes = topRuns.map((run) => summarizeOutcome(
+    run,
+    runs.filter((candidate) => candidate.parent_id === run.id),
+    verdicts.get(run.id) ?? null,
+    marks.get(run.id) ?? []
+  ));
+  const eligibleTaskKinds = unique(eligibility.eligible.map((run) => run.task_kind ?? classifyTask(run.task ?? ""))).sort();
+  const rankings = eligibleTaskKinds.map((taskKind) => ({
+    task_kind: taskKind,
+    top: summarizeEvidenceGroups(
+      eligibility.eligible.filter((run) => (run.task_kind ?? classifyTask(run.task ?? "")) === taskKind),
+      verdicts,
+      marks
+    ).slice(0, 3)
+  }));
+  const nextActions = statusNextActions({ topRuns, liveProviderTaskRuns, eligibility, release, proposals });
+  const nextCapture = buildNextCapture({
+    events,
+    liveProviderTaskRuns,
+    eligibility,
+    policy: policy.policy,
+    packageJson
+  });
+
+  console.log(JSON.stringify({
+    product: PRODUCT_NAME,
+    cli: CLI_NAME,
+    identity: release.identity,
+    schema_version: SCHEMA_VERSION,
+    generated_at: new Date().toISOString(),
+    cwd,
+    repo: gitDoctor(cwd),
+    policy: {
+      path: relative(cwd, policy.path),
+      exists: policy.exists,
+      source: policy.source,
+      preferred_runner_order: policy.policy.preferred_runner_order,
+      default_roster: policy.policy.default_roster,
+      parallel_provider_cli_runs: policy.policy.parallel_provider_cli_runs,
+      provider_auth: policy.policy.provider_auth,
+      transcript_export_default: policy.policy.transcript_export_default,
+      self_modification: policy.policy.self_modification
+    },
+    ledger: {
+      path: join(cwd, STORE_DIR),
+      exists: existsSync(join(cwd, STORE_DIR)),
+      events: events.length,
+      runs: runs.length,
+      top_level_runs: topRuns.length,
+      child_runs: runs.length - topRuns.length,
+      checks: events.filter((event) => event.type === "check").length,
+      verdicts: events.filter((event) => event.type === "verdict").length,
+      marks: events.filter((event) => event.type === "mark").length,
+      proposals: proposals.length
+    },
+    outcomes: {
+      labels: countBy(outcomes.map((outcome) => outcome.label)),
+      positive: outcomes.filter((outcome) => outcome.score > 0).length,
+      missing_signal: outcomes.filter((outcome) => outcome.label === "unlabeled").length,
+      release_only: outcomes.filter((outcome) => outcome.confidence === "release_only").length
+    },
+    evidence: {
+      eligible_runs: eligibility.eligible.length,
+      live_provider_task_runs: liveProviderTaskRuns.length,
+      provider_smoke_runs: providerSmokeRuns.length,
+      ignored_runs: eligibility.ignored.length,
+      ignored_reasons: countBy(eligibility.ignored.map((item) => item.reason)),
+      maturity: summarizeEvidenceMaturity(eligibility.eligible, verdicts, marks),
+      rankings
+    },
+    provider_smoke: ["claude", "codex", "gemini"].map((runner) => ({
+      runner,
+      ok: hasProviderSmoke(topRuns, runner)
+    })),
+    runners: Object.entries(runnerDefinitions).map(([name, definition]) => ({
+      name,
+      available: definition.available === true || commandExists(definition.command),
+      command: definition.command ?? "(built-in)"
+    })),
+    release: {
+      ready: release.ready,
+      blockers: release.gates.filter((gate) => !gate.ok).map((gate) => gate.name),
+      blocker_summary: release.blocker_summary,
+      next_actions: release.next_actions
+    },
+    latest_runs: newestRuns(topRuns).slice(0, 5).map((run) => {
+      const outcome = summarizeOutcome(
+        run,
+        runs.filter((candidate) => candidate.parent_id === run.id),
+        verdicts.get(run.id) ?? null,
+        marks.get(run.id) ?? []
+      );
+      return {
+        id: run.id,
+        runner: run.runner,
+        roster: run.roster,
+        status: run.status,
+        outcome: outcome.label,
+        task_kind: run.task_kind ?? classifyTask(run.task ?? ""),
+        task_summary: formatListTask(run.task),
+        task: run.task
+      };
+    }),
+    next_capture: nextCapture,
+    next_actions: nextActions,
+    notes: [
+      "status is read-only and does not call providers.",
+      "Provider-smoke evidence proves adapter readiness, not task quality."
+    ]
+  }, null, 2));
+}
+
+async function showPolicy(args) {
+  const { options } = parseOptions(args);
+  const cwd = resolveCwd(options);
+  const policy = await loadPolicy(cwd);
+  console.log(JSON.stringify({
+    product: PRODUCT_NAME,
+    cwd,
+    path: relative(cwd, policy.path),
+    exists: policy.exists,
+    source: policy.source,
+    policy: policy.policy,
+    notes: [
+      "policy is read-only and does not call providers.",
+      "A committed policy file lets teams review local runner safety defaults before a hosted layer exists."
+    ]
+  }, null, 2));
+}
+
+async function exportRuns(args) {
+  const { options } = parseOptions(args);
+  const cwd = resolveCwd(options);
+  const events = await readLedger(cwd);
+  const allRuns = runsWithAppendedChecks(events);
+  const topRuns = topLevelRuns(allRuns);
+  const verdicts = latestVerdictByRun(events);
+  const marks = lifecycleMarksByRun(events);
+  const runId = normalizeOptionalString(options["run-id"]);
+  const limit = parsePositiveInteger(options.limit, 20, "--limit");
+  const includeTranscripts = options["include-transcripts"] === true;
+  const candidates = runId
+    ? allRuns.filter((run) => run.id === runId)
+    : topRuns.slice(-limit).reverse();
+  if (runId && candidates.length === 0) {
+    throw new Error(`Run not found: ${runId}`);
+  }
+
+  const exportedRuns = [];
+  for (const run of candidates) {
+    const children = allRuns.filter((candidate) => candidate.parent_id === run.id);
+    exportedRuns.push(await exportRunRecord({
+      cwd,
+      run,
+      children,
+      verdicts,
+      marks,
+      includeTranscripts
+    }));
+  }
+
+  console.log(JSON.stringify({
+    product: PRODUCT_NAME,
+    cli: CLI_NAME,
+    schema_version: SCHEMA_VERSION,
+    export_version: 1,
+    exported_at: new Date().toISOString(),
+    cwd,
+    scope: runId ? "single_run" : "recent_runs",
+    include_transcripts: includeTranscripts,
+    runs: exportedRuns,
+    counts: {
+      ledger_events: events.length,
+      total_runs: allRuns.length,
+      exported_runs: exportedRuns.length,
+      truncated: !runId && topRuns.length > exportedRuns.length
+    },
+    notes: [
+      "export is read-only and does not call providers.",
+      includeTranscripts
+        ? "Transcript text is included because --include-transcripts was provided. Review before sharing."
+        : "Transcript text is omitted by default. Use --include-transcripts only after reviewing sensitivity."
+    ]
+  }, null, 2));
+}
+
+async function exportRunRecord({ cwd, run, children, verdicts, marks, includeTranscripts }) {
+  const verdict = verdicts.get(run.id) ?? null;
+  const runMarks = marks.get(run.id) ?? [];
+  const evaluation = evaluateRunRecord(run, children, verdicts, marks);
+  const record = {
+    id: run.id,
+    purpose: run.purpose ?? "task_run",
+    source: run.source ?? "live",
+    confidence: run.confidence ?? "unknown",
+    task: run.task,
+    task_kind: run.task_kind ?? classifyTask(run.task ?? ""),
+    runner: run.runner,
+    model: run.model ?? null,
+    effort: run.effort ?? null,
+    roster: run.roster,
+    role: run.role ?? null,
+    replay: replayMetadataForRun(run),
+    status: run.status,
+    status_reason: run.status_reason ?? null,
+    started_at: run.started_at,
+    ended_at: run.ended_at,
+    duration_ms: run.duration_ms,
+    adapter: run.adapter ?? null,
+    repo: run.repo ?? null,
+    changed_files: Array.isArray(run.changed_files) ? run.changed_files : [],
+    checks: Array.isArray(run.checks) ? run.checks.map((check) => ({
+      id: check.id ?? null,
+      source: check.source ?? "run_check",
+      command: check.command,
+      exit_code: check.exit_code,
+      duration_ms: check.duration_ms ?? null,
+      repo: check.repo ?? null,
+      changed_files: Array.isArray(check.changed_files) ? check.changed_files : []
+    })) : [],
+    verdict: verdict ? {
+      verdict: verdict.verdict,
+      note: verdict.note,
+      created_at: verdict.created_at
+    } : null,
+    marks: runMarks.map(formatLifecycleMark),
+    outcome: evaluation.outcome,
+    routing: evaluation.routing,
+    release: evaluation.release,
+    child_runs: children.map((child) => ({
+      id: child.id,
+      role: child.role,
+      runner: child.runner,
+      status: child.status,
+      replay: replayMetadataForRun(child),
+      transcript_path: child.transcript_path
+    })),
+    transcript_path: run.transcript_path
+  };
+
+  if (includeTranscripts) {
+    record.transcript = await readTextIfExists(join(cwd, run.transcript_path ?? ""));
+    record.child_runs = await Promise.all(record.child_runs.map(async (child) => ({
+      ...child,
+      transcript: await readTextIfExists(join(cwd, child.transcript_path ?? ""))
+    })));
+  }
+
+  return record;
+}
+
+async function runCommand(args) {
+  const { positionals, options } = parseOptions(args);
+  const task = positionals.join(" ").trim();
+  if (!task) {
+    throw new Error(`Missing task. Example: ${CLI_NAME} run "update the README" --runner fake`);
+  }
+
+  const cwd = resolveCwd(options);
+  const runner = normalizeRunner(String(options.runner ?? "fake"));
+  const roster = normalizeRoster(String(options.roster ?? "solo"));
+  const runnerByRole = resolveRosterRunners(roster, runner, options);
+  const metadata = metadataFromOptions(options);
+  ensureRunnersAvailable(Object.values(runnerByRole));
+
+  await ensureStore(cwd);
+
+  if (roster !== "solo") {
+    const run = await executeRoster({ roster, task, cwd, options, runnerByRole, metadata });
+    console.log(JSON.stringify(summarizeRun(run), null, 2));
+    return;
+  }
+
+  const run = await captureRunAttempt({
+    runner,
+    roster,
+    task,
+    cwd,
+    options,
+    checkCommand: options.check ? String(options.check) : null,
+    purpose: "task_run",
+    metadata,
+    replay: recordedReplayMetadata(buildRunCommand({
+      task,
+      runner,
+      roster,
+      options,
+      model: metadata.model,
+      effort: metadata.effort
+    }), {
+      runner,
+      humanReviewRequired: true,
+      reason: "Recorded from the original run command."
+    })
+  });
+
+  console.log(JSON.stringify(summarizeRun(run), null, 2));
+}
+
+async function providerSmoke(args) {
+  const { options } = parseOptions(args);
+  const cwd = resolveCwd(options);
+  if (!options.runner) {
+    throw new Error("provider-smoke requires --runner claude, --runner codex, or --runner gemini");
+  }
+  const runner = normalizeRunner(String(options.runner));
+  const metadata = metadataFromOptions(options);
+  if (runner === "fake") {
+    throw new Error("provider-smoke requires a real provider runner: claude, codex, or gemini");
+  }
+  ensureRunnersAvailable([runner]);
+  await ensureStore(cwd);
+
+  const run = await captureRunAttempt({
+    runner,
+    roster: "solo",
+    task: providerSmokeTask(runner),
+    cwd,
+    options,
+    checkCommand: null,
+    purpose: "provider_smoke",
+    metadata,
+    failOnChangedFiles: true,
+    replay: recordedReplayMetadata(buildProviderSmokeCommand({
+      runner,
+      options,
+      model: metadata.model,
+      effort: metadata.effort
+    }), {
+      runner,
+      humanReviewRequired: false,
+      reason: "Recorded from the original provider-smoke command."
+    }),
+    notes: [
+      "Provider smoke run. Release-check uses this as explicit provider evidence.",
+      "This run should not change files."
+    ]
+  });
+
+  console.log(JSON.stringify(summarizeRun(run), null, 2));
+}
+
+async function captureRunAttempt({
+  runner,
+  roster,
+  task,
+  cwd,
+  options,
+  checkCommand,
+  parentId = null,
+  role = null,
+  purpose = "task_run",
+  failOnChangedFiles = false,
+  notes = [],
+  metadata = {},
+  replay = null
+}) {
+  const startedAt = new Date();
+  const beforeStatus = gitStatusMap(cwd);
+  const beforeRepo = gitSnapshot(cwd, beforeStatus);
+  const transcript = await executeRunner({ runner, task, cwd, options });
+  const check = checkCommand ? { source: "run_check", ...runCheck(checkCommand, cwd) } : null;
+  const afterStatus = gitStatusMap(cwd);
+  const afterRepo = gitSnapshot(cwd, afterStatus);
+  const changedFiles = gitChangedFilesBetween(beforeStatus, afterStatus);
+  const endedAt = new Date();
+  let status = check && check.exit_code !== 0 ? "failed" : transcript.status;
+  let statusReason = classifyRunStatus({ transcript, check, failOnChangedFiles, changedFiles });
+  const runNotes = [...notes];
+  if (failOnChangedFiles && changedFiles.length > 0) {
+    status = "failed";
+    statusReason = "provider_smoke_changed_files";
+    runNotes.push("Provider smoke failed because files changed during the run.");
+  }
+  const id = createRunId(startedAt);
+  const transcriptPath = await writeTranscript(cwd, id, transcript.text);
+
+  const run = {
+    schema_version: SCHEMA_VERSION,
+    type: "run",
+    id,
+    purpose,
+    source: "live",
+    confidence: "high",
+    task,
+    task_kind: classifyTask(task),
+    runner,
+    model: metadata.model ?? null,
+    effort: metadata.effort ?? null,
+    roster,
+    parent_id: parentId,
+    role,
+    cwd,
+    status,
+    status_reason: statusReason,
+    started_at: startedAt.toISOString(),
+    ended_at: endedAt.toISOString(),
+    duration_ms: endedAt.getTime() - startedAt.getTime(),
+    repo: {
+      before: beforeRepo,
+      after: afterRepo
+    },
+    transcript_path: relative(cwd, transcriptPath),
+    changed_files: changedFiles,
+    checks: check ? [check] : [],
+    human_verdict: null,
+    cost_hint: metadata.cost_hint ?? null,
+    adapter: buildAdapterRecord(transcript.adapter, metadata),
+    replay,
+    notes: runNotes
+  };
+
+  await appendLedger(cwd, run);
+  return run;
+}
+
+async function executeRoster({ roster, task, cwd, options, runnerByRole, metadata }) {
+  const parentStartedAt = new Date();
+  const parentBeforeStatus = gitStatusMap(cwd);
+  const parentBeforeRepo = gitSnapshot(cwd, parentBeforeStatus);
+  const parentId = createRunId(parentStartedAt);
+  const parentReplayCommand = buildRunCommand({
+    task,
+    runner: runnerByRole.primary,
+    roster,
+    options,
+    model: metadata.model,
+    effort: metadata.effort
+  });
+  const children = [];
+
+  if (roster === "pair") {
+    children.push(await captureRunAttempt({
+      runner: runnerByRole.implementer,
+      roster,
+      task: roleTask(task, "implementer"),
+      cwd,
+      options,
+      checkCommand: options.check ? String(options.check) : null,
+      parentId,
+      role: "implementer",
+      metadata,
+      replay: childReplayMetadata(parentId, parentReplayCommand)
+    }));
+    children.push(await captureRunAttempt({
+      runner: runnerByRole.reviewer,
+      roster,
+      task: roleTask(task, "reviewer"),
+      cwd,
+      options,
+      checkCommand: null,
+      parentId,
+      role: "reviewer",
+      metadata,
+      replay: childReplayMetadata(parentId, parentReplayCommand)
+    }));
+  } else if (roster === "repair") {
+    const attempt = await captureRunAttempt({
+      runner: runnerByRole.implementer,
+      roster,
+      task: roleTask(task, "attempt"),
+      cwd,
+      options,
+      checkCommand: options.check ? String(options.check) : null,
+      parentId,
+      role: "attempt",
+      metadata,
+      replay: childReplayMetadata(parentId, parentReplayCommand)
+    });
+    children.push(attempt);
+
+    if (attempt.status === "failed") {
+      children.push(await captureRunAttempt({
+        runner: runnerByRole.repairer,
+        roster,
+        task: roleTask(task, "repairer"),
+        cwd,
+        options,
+        checkCommand: options.check ? String(options.check) : null,
+        parentId,
+        role: "repairer",
+        metadata,
+        replay: childReplayMetadata(parentId, parentReplayCommand)
+      }));
+    }
+  } else if (roster === "plan-code-review") {
+    children.push(await captureRunAttempt({
+      runner: runnerByRole.planner,
+      roster,
+      task: roleTask(task, "planner"),
+      cwd,
+      options,
+      checkCommand: null,
+      parentId,
+      role: "planner",
+      metadata,
+      replay: childReplayMetadata(parentId, parentReplayCommand)
+    }));
+    children.push(await captureRunAttempt({
+      runner: runnerByRole.coder,
+      roster,
+      task: roleTask(task, "coder"),
+      cwd,
+      options,
+      checkCommand: options.check ? String(options.check) : null,
+      parentId,
+      role: "coder",
+      metadata,
+      replay: childReplayMetadata(parentId, parentReplayCommand)
+    }));
+    children.push(await captureRunAttempt({
+      runner: runnerByRole.reviewer,
+      roster,
+      task: roleTask(task, "reviewer"),
+      cwd,
+      options,
+      checkCommand: null,
+      parentId,
+      role: "reviewer",
+      metadata,
+      replay: childReplayMetadata(parentId, parentReplayCommand)
+    }));
+  } else {
+    throw new Error(`Unsupported roster: ${roster}`);
+  }
+
+  const parentAfterStatus = gitStatusMap(cwd);
+  const parentAfterRepo = gitSnapshot(cwd, parentAfterStatus);
+  const parentEndedAt = new Date();
+  const parentStatus = aggregateRosterStatus(roster, children);
+  const transcriptPath = await writeTranscript(cwd, parentId, formatRosterTranscript({
+    roster,
+    task,
+    cwd,
+    startedAt: parentStartedAt,
+    endedAt: parentEndedAt,
+    status: parentStatus,
+    children
+  }));
+
+  const run = {
+    schema_version: SCHEMA_VERSION,
+    type: "run",
+    id: parentId,
+    purpose: "roster_run",
+    source: "live",
+    confidence: "high",
+    task,
+    task_kind: classifyTask(task),
+    runner: runnerByRole.primary,
+    model: metadata.model ?? null,
+    effort: metadata.effort ?? null,
+    roster,
+    parent_id: null,
+    role: "roster",
+    cwd,
+    status: parentStatus,
+    status_reason: classifyRosterStatus(children),
+    started_at: parentStartedAt.toISOString(),
+    ended_at: parentEndedAt.toISOString(),
+    duration_ms: parentEndedAt.getTime() - parentStartedAt.getTime(),
+    repo: {
+      before: parentBeforeRepo,
+      after: parentAfterRepo
+    },
+    transcript_path: relative(cwd, transcriptPath),
+    changed_files: unique(children.flatMap((child) => child.changed_files)),
+    checks: children.flatMap((child) => child.checks),
+    human_verdict: null,
+    cost_hint: metadata.cost_hint ?? null,
+    adapter: {
+      runner: runnerByRole.primary,
+      command: null,
+      argv: [],
+      exit_code: null,
+      timed_out: false,
+      stdout_bytes: null,
+      stderr_bytes: null,
+      stderr_signal: null,
+      error: null,
+      metadata_sources: metadataSources(metadata),
+      notes: ["Roster parent. See child runs for adapter invocations."]
+    },
+    replay: recordedReplayMetadata(parentReplayCommand, {
+      runner: runnerByRole.primary,
+      humanReviewRequired: true,
+      reason: "Recorded from the original roster run command."
+    }),
+    child_run_ids: children.map((child) => child.id),
+    notes: rosterNotes(roster, children)
+  };
+
+  await appendLedger(cwd, run);
+  return run;
+}
+
+async function executeRunner({ runner, task, cwd, options }) {
+  if (runner === "fake") {
+    return {
+      status: "ok",
+      adapter: buildAdapterInvocation({
+        runner: "fake",
+        command: "(built-in)",
+        args: [],
+        exitCode: 0,
+        timedOut: false,
+        stdout: "",
+        stderr: "",
+        error: null
+      }),
+      text: [
+        `runner: fake`,
+        `cwd: ${cwd}`,
+        `task: ${task}`,
+        "",
+        "This is a fake run. It records the ledger path without changing files."
+      ].join("\n")
+    };
+  }
+
+  if (runner === "claude") {
+    return executeClaudeRunner({ task, cwd, options });
+  }
+
+  if (runner === "codex") {
+    return executeCodexRunner({ task, cwd, options });
+  }
+
+  if (runner === "gemini") {
+    return executeGeminiRunner({ task, cwd, options });
+  }
+
+  throw new Error(`${runner} runner is detected but not implemented yet. Run "rux runners" to see supported local runners.`);
+}
+
+function executeClaudeRunner({ task, cwd, options }) {
+  const timeoutMs = Number(options["timeout-ms"] ?? 10 * 60 * 1000);
+  if (!Number.isFinite(timeoutMs) || timeoutMs <= 0) {
+    throw new Error("--timeout-ms must be a positive number");
+  }
+
+  const args = [
+    "--permission-mode",
+    "plan",
+    "--output-format",
+    "text",
+    "-p",
+    task
+  ];
+
+  const startedAt = new Date();
+  const result = spawnSync("claude", args, {
+    cwd,
+    encoding: "utf8",
+    timeout: timeoutMs,
+    maxBuffer: 20 * 1024 * 1024,
+    env: process.env
+  });
+  const endedAt = new Date();
+
+  const timedOut = Boolean(result.error && result.error.code === "ETIMEDOUT");
+  const exitCode = typeof result.status === "number" ? result.status : null;
+  const status = timedOut ? "timeout" : exitCode === 0 ? "ok" : "failed";
+  const stdout = result.stdout ?? "";
+  const stderr = result.stderr ?? "";
+  const error = result.error ? `${result.error.name}: ${result.error.message}` : "";
+
+  return {
+    status,
+    adapter: buildAdapterInvocation({
+      runner: "claude",
+      command: "claude",
+      args,
+      exitCode,
+      timedOut,
+      stdout,
+      stderr,
+      error
+    }),
+    text: [
+      `runner: claude`,
+      `cwd: ${cwd}`,
+      `command: claude ${args.map(shellQuote).join(" ")}`,
+      `started_at: ${startedAt.toISOString()}`,
+      `ended_at: ${endedAt.toISOString()}`,
+      `exit_code: ${exitCode ?? ""}`,
+      `status: ${status}`,
+      "",
+      "## stdout",
+      stdout.trimEnd(),
+      "",
+      "## stderr",
+      stderr.trimEnd(),
+      "",
+      error ? `## error\n${error}` : ""
+    ].join("\n")
+  };
+}
+
+function executeCodexRunner({ task, cwd, options }) {
+  const timeoutMs = Number(options["timeout-ms"] ?? 10 * 60 * 1000);
+  if (!Number.isFinite(timeoutMs) || timeoutMs <= 0) {
+    throw new Error("--timeout-ms must be a positive number");
+  }
+
+  const args = [
+    "exec",
+    "--sandbox",
+    "read-only",
+    "--color",
+    "never",
+    "-C",
+    cwd,
+    task
+  ];
+
+  const startedAt = new Date();
+  const result = spawnSync("codex", args, {
+    cwd,
+    encoding: "utf8",
+    timeout: timeoutMs,
+    maxBuffer: 20 * 1024 * 1024,
+    env: process.env
+  });
+  const endedAt = new Date();
+
+  const timedOut = Boolean(result.error && result.error.code === "ETIMEDOUT");
+  const exitCode = typeof result.status === "number" ? result.status : null;
+  const status = timedOut ? "timeout" : exitCode === 0 ? "ok" : "failed";
+  const stdout = result.stdout ?? "";
+  const stderr = result.stderr ?? "";
+  const error = result.error ? `${result.error.name}: ${result.error.message}` : "";
+
+  return {
+    status,
+    adapter: buildAdapterInvocation({
+      runner: "codex",
+      command: "codex",
+      args,
+      exitCode,
+      timedOut,
+      stdout,
+      stderr,
+      error
+    }),
+    text: [
+      `runner: codex`,
+      `cwd: ${cwd}`,
+      `command: codex ${args.map(shellQuote).join(" ")}`,
+      `started_at: ${startedAt.toISOString()}`,
+      `ended_at: ${endedAt.toISOString()}`,
+      `exit_code: ${exitCode ?? ""}`,
+      `status: ${status}`,
+      "",
+      "## stdout",
+      stdout.trimEnd(),
+      "",
+      "## stderr",
+      stderr.trimEnd(),
+      "",
+      error ? `## error\n${error}` : ""
+    ].join("\n")
+  };
+}
+
+function executeGeminiRunner({ task, cwd, options }) {
+  const timeoutMs = Number(options["timeout-ms"] ?? 10 * 60 * 1000);
+  if (!Number.isFinite(timeoutMs) || timeoutMs <= 0) {
+    throw new Error("--timeout-ms must be a positive number");
+  }
+
+  const args = [
+    "--approval-mode",
+    "plan",
+    "--output-format",
+    "text",
+    "--skip-trust",
+    "-p",
+    task
+  ];
+
+  const startedAt = new Date();
+  const result = spawnSync("gemini", args, {
+    cwd,
+    encoding: "utf8",
+    timeout: timeoutMs,
+    maxBuffer: 20 * 1024 * 1024,
+    env: process.env
+  });
+  const endedAt = new Date();
+
+  const timedOut = Boolean(result.error && result.error.code === "ETIMEDOUT");
+  const exitCode = typeof result.status === "number" ? result.status : null;
+  const status = timedOut ? "timeout" : exitCode === 0 ? "ok" : "failed";
+  const stdout = result.stdout ?? "";
+  const stderr = result.stderr ?? "";
+  const error = result.error ? `${result.error.name}: ${result.error.message}` : "";
+
+  return {
+    status,
+    adapter: buildAdapterInvocation({
+      runner: "gemini",
+      command: "gemini",
+      args,
+      exitCode,
+      timedOut,
+      stdout,
+      stderr,
+      error
+    }),
+    text: [
+      `runner: gemini`,
+      `cwd: ${cwd}`,
+      `command: gemini ${args.map(shellQuote).join(" ")}`,
+      `started_at: ${startedAt.toISOString()}`,
+      `ended_at: ${endedAt.toISOString()}`,
+      `exit_code: ${exitCode ?? ""}`,
+      `status: ${status}`,
+      "",
+      "## stdout",
+      stdout.trimEnd(),
+      "",
+      "## stderr",
+      stderr.trimEnd(),
+      "",
+      error ? `## error\n${error}` : ""
+    ].join("\n")
+  };
+}
+
+function classifyRunStatus({ transcript, check, failOnChangedFiles, changedFiles }) {
+  if (failOnChangedFiles && changedFiles.length > 0) return "provider_smoke_changed_files";
+  if (check && check.exit_code !== 0) return "check_failed";
+  if (transcript.status === "timeout") return "provider_timeout";
+  if (transcript.status === "failed") return "provider_failed";
+  if (transcript.status === "ok") return "completed";
+  return "unknown";
+}
+
+function classifyRosterStatus(children) {
+  if (children.some((child) => child.status_reason === "check_failed")) return "child_check_failed";
+  if (children.some((child) => child.status_reason === "provider_timeout")) return "child_provider_timeout";
+  if (children.some((child) => child.status_reason === "provider_failed")) return "child_provider_failed";
+  if (children.some((child) => child.status !== "ok")) return "child_failed";
+  return "completed";
+}
+
+function importedStatusReason(status) {
+  if (status === "ok") return "imported_reported_ok";
+  if (status === "failed") return "imported_reported_failed";
+  return "imported_unverified";
+}
+
+function buildAdapterInvocation({ runner, command, args, exitCode, timedOut, stdout, stderr, error }) {
+  return {
+    runner,
+    command,
+    argv: Array.isArray(args) ? [command, ...args].filter(Boolean) : command ? [command] : [],
+    exit_code: exitCode,
+    timed_out: Boolean(timedOut),
+    stdout_bytes: byteLength(stdout),
+    stderr_bytes: byteLength(stderr),
+    stderr_signal: classifyAdapterStderr({ exitCode, timedOut, stderr, error }),
+    error: error || null
+  };
+}
+
+function buildAdapterRecord(adapter, metadata) {
+  return {
+    ...(adapter ?? {
+      runner: null,
+      command: null,
+      argv: [],
+      exit_code: null,
+      timed_out: false,
+      stdout_bytes: null,
+      stderr_bytes: null,
+      stderr_signal: null,
+      error: null
+    }),
+    metadata_sources: metadataSources(metadata)
+  };
+}
+
+function classifyAdapterStderr({ exitCode, timedOut, stderr, stderrBytes, error }) {
+  const parsedBytes = Number(stderrBytes);
+  const bytes = Number.isFinite(parsedBytes) ? parsedBytes : byteLength(stderr);
+  if (error) {
+    return {
+      level: "error",
+      reason: "Adapter reported an execution error."
+    };
+  }
+  if (timedOut) {
+    return {
+      level: "error",
+      reason: "Adapter timed out; stderr may contain failure details."
+    };
+  }
+  if (exitCode !== null && exitCode !== undefined && exitCode !== 0) {
+    return {
+      level: "error",
+      reason: "Adapter exited non-zero; stderr may contain failure details."
+    };
+  }
+  if (bytes > 0) {
+    return {
+      level: "diagnostic",
+      reason: "Adapter wrote to stderr while exiting successfully; treat as diagnostic output unless provider-specific parsing says otherwise."
+    };
+  }
+  return {
+    level: "none",
+    reason: "Adapter produced no stderr output."
+  };
+}
+
+function adapterStderrSignal(adapter) {
+  if (!adapter) return null;
+  if (adapter.stderr_signal) return adapter.stderr_signal;
+  return classifyAdapterStderr({
+    exitCode: adapter.exit_code,
+    timedOut: adapter.timed_out,
+    stderrBytes: adapter.stderr_bytes,
+    error: adapter.error
+  });
+}
+
+function metadataSources(metadata) {
+  return {
+    model: metadata.model ? "user_option" : "not_observed",
+    effort: metadata.effort ? "user_option" : "not_observed",
+    cost_hint: metadata.cost_hint ? "user_option" : "not_observed"
+  };
+}
+
+function byteLength(value) {
+  return Buffer.byteLength(value ?? "", "utf8");
+}
+
+async function listRuns(args) {
+  const { options } = parseOptions(args);
+  const cwd = resolveCwd(options);
+  const events = await readLedger(cwd);
+  const runs = topLevelRuns(runsWithAppendedChecks(events));
+  const verdicts = events.filter((event) => event.type === "verdict");
+  const verdictByRun = new Map(verdicts.map((event) => [event.run_id, event.verdict]));
+  const marks = lifecycleMarksByRun(events);
+
+  for (const run of runs) {
+    const verdict = verdictByRun.get(run.id) ?? "-";
+    const mark = latestLifecycleMark(marks.get(run.id) ?? [])?.mark ?? "-";
+    const source = `${run.source ?? "live"}:${run.confidence ?? "unknown"}`;
+    console.log(`${run.id}  ${run.status.padEnd(7)}  ${run.runner.padEnd(7)}  ${source.padEnd(13)}  verdict=${verdict}  mark=${mark}  ${formatListTask(run.task)}`);
+  }
+}
+
+function formatListTask(task) {
+  const singleLine = String(task ?? "").replace(/\s+/g, " ").trim();
+  if (singleLine.length <= 96) return singleLine;
+  return `${singleLine.slice(0, 93)}...`;
+}
+
+async function importRun(args) {
+  const { options } = parseOptions(args);
+  const from = options.from ? resolve(String(options.from)) : null;
+  if (!from) {
+    throw new Error(`Missing import source. Example: ${CLI_NAME} import --from ./old-session.txt --runner claude`);
+  }
+
+  const sourceStat = await stat(from).catch(() => null);
+  if (!sourceStat || !sourceStat.isFile()) {
+    throw new Error(`Import source must be a file: ${from}`);
+  }
+
+  const cwd = resolveCwd(options);
+  await ensureStore(cwd);
+
+  const importedText = await readFile(from, "utf8");
+  const runner = normalizeImportedRunner(options.runner ? String(options.runner) : inferRunnerFromImport(from, importedText));
+  const metadata = metadataFromOptions(options);
+  const task = options.task ? String(options.task).trim() : `Imported session: ${basename(from)}`;
+  if (!task) {
+    throw new Error("--task cannot be empty");
+  }
+
+  const startedAt = parseDateOption(options["started-at"], new Date());
+  const endedAt = parseDateOption(options["ended-at"], startedAt);
+  const status = normalizeImportedStatus(options.status ? String(options.status) : "unknown");
+  const id = createRunId(startedAt);
+  const transcriptPath = await writeTranscript(cwd, id, formatImportedTranscript({
+    from,
+    runner,
+    task,
+    status,
+    startedAt,
+    endedAt,
+    importedText
+  }));
+
+  const run = {
+    schema_version: SCHEMA_VERSION,
+    type: "run",
+    id,
+    purpose: "imported_session",
+    source: "imported",
+    confidence: "low",
+    task,
+    task_kind: classifyTask(task),
+    runner,
+    model: metadata.model ?? null,
+    effort: metadata.effort ?? null,
+    roster: "solo",
+    cwd,
+    status,
+    status_reason: importedStatusReason(status),
+    started_at: startedAt.toISOString(),
+    ended_at: endedAt.toISOString(),
+    duration_ms: Math.max(0, endedAt.getTime() - startedAt.getTime()),
+    repo: {
+      imported_at: gitSnapshot(cwd)
+    },
+    transcript_path: relative(cwd, transcriptPath),
+    changed_files: [],
+    checks: [],
+    human_verdict: null,
+    cost_hint: metadata.cost_hint ?? null,
+    adapter: {
+      runner,
+      command: null,
+      argv: [],
+      exit_code: null,
+      timed_out: false,
+      stdout_bytes: byteLength(importedText),
+      stderr_bytes: null,
+      stderr_signal: null,
+      error: null,
+      metadata_sources: metadataSources(metadata),
+      notes: ["Imported session. Original provider invocation was not observed."]
+    },
+    imported_from: from,
+    replay: unavailableReplayMetadata("Imported sessions are continuity records; Rux did not execute the original provider command."),
+    notes: [
+      "Imported from a user-selected local file. Treat as low confidence until a check or human verdict is attached."
+    ]
+  };
+
+  await appendLedger(cwd, run);
+  console.log(JSON.stringify(summarizeRun(run), null, 2));
+}
+
+async function showRun(args) {
+  const { positionals, options } = parseOptions(args);
+  const id = positionals[0];
+  if (!id) {
+    throw new Error("Missing run id. Example: rux show 20260607-abc123");
+  }
+
+  const cwd = resolveCwd(options);
+  const events = await readLedger(cwd);
+  const runs = runsWithAppendedChecks(events);
+  const run = runs.find((event) => event.type === "run" && event.id === id);
+  if (!run) {
+    throw new Error(`Run not found: ${id}`);
+  }
+
+  const verdicts = events.filter((event) => event.type === "verdict" && event.run_id === id);
+  const marks = events.filter((event) => event.type === "mark" && event.run_id === id);
+  const children = runs.filter((event) => event.type === "run" && event.parent_id === id);
+  const latestVerdicts = latestVerdictByRun(events);
+  const lifecycleMarks = lifecycleMarksByRun(events);
+  console.log(JSON.stringify({
+    run: withReplayMetadata(run),
+    children: children.map(withReplayMetadata),
+    verdicts,
+    marks,
+    evaluation: evaluateRunRecord(run, children, latestVerdicts, lifecycleMarks)
+  }, null, 2));
+}
+
+async function planRun(args) {
+  const { positionals, options } = parseOptions(args);
+  const task = positionals.join(" ").trim();
+  if (!task) {
+    throw new Error(`Missing task. Example: ${CLI_NAME} plan "fix the failing auth test"`);
+  }
+
+  const cwd = resolveCwd(options);
+  const events = await readLedger(cwd);
+  const policy = await loadPolicy(cwd);
+  const recommendation = buildRecommendation(task, events);
+  const metadata = metadataFromOptions(options);
+  const taskKind = recommendation.task_kind;
+  const explicitRunner = options.runner ? normalizeRunner(String(options.runner)) : null;
+  const runnerChoice = choosePlanRunner({ explicitRunner, recommendation, events, policy: policy.policy });
+  const selectedRunner = runnerChoice.runner;
+  const selectedModel = metadata.model ?? recommendation.recommendation.model ?? null;
+  const selectedEffort = metadata.effort ?? recommendation.recommendation.effort ?? null;
+  const explicitRoster = options.roster ? normalizeRoster(String(options.roster)) : null;
+  const rosterChoice = choosePlanRoster({
+    explicitRoster,
+    suggestedRoster: recommendation.recommendation.roster,
+    suggestedConfidence: recommendation.recommendation.confidence,
+    task,
+    taskKind,
+    hasCheck: Boolean(options.check),
+    policy: policy.policy
+  });
+  const runnerByRole = resolveRosterRunners(rosterChoice.roster, selectedRunner, options);
+  const rolePlan = buildRolePlan(rosterChoice.roster, runnerByRole, Boolean(options.check));
+  const availability = runnerAvailability(Object.values(runnerByRole));
+  const runCommand = buildRunCommand({
+    task,
+    runner: selectedRunner,
+    roster: rosterChoice.roster,
+    options,
+    model: selectedModel,
+    effort: selectedEffort
+  });
+  const repo = gitDoctor(cwd);
+
+  console.log(JSON.stringify({
+    product: PRODUCT_NAME,
+    dry_run: true,
+    would_execute: false,
+    task,
+    task_kind: taskKind,
+    cwd,
+    recommendation: {
+      runner: selectedRunner,
+      model: selectedModel,
+      effort: selectedEffort,
+      roster: rosterChoice.roster,
+      agents: rolePlan.length,
+      execution: "sequential",
+      confidence: recommendation.recommendation.confidence,
+      maturity: recommendation.recommendation.maturity,
+      reason: rosterChoice.reason,
+      one_agent_not_enough: rosterChoice.one_agent_not_enough,
+      roles: rolePlan
+    },
+    runner_by_role: runnerByRole,
+    runner_source: runnerChoice.source,
+    policy: {
+      source: policy.source,
+      preferred_runner_order: policy.policy.preferred_runner_order,
+      default_roster: policy.policy.default_roster,
+      parallel_provider_cli_runs: policy.policy.parallel_provider_cli_runs
+    },
+    evidence: recommendation.evidence,
+    repo: {
+      inside_work_tree: repo.inside_work_tree,
+      dirty_entries: repo.dirty_entries
+    },
+    availability,
+    command: runCommand,
+    next_actions: [
+      `Run: ${runCommand}`,
+      "Attach a human verdict after review so future planning can use the result."
+    ],
+    safety_notes: [
+      "plan is dry-run only; it does not call providers and does not write the ledger.",
+      "Generated rosters are sequential. Parallel provider fanout is not enabled in v0."
+    ]
+  }, null, 2));
+}
+
+async function evaluateRunCommand(args) {
+  const { positionals, options } = parseOptions(args);
+  const id = positionals[0];
+  if (!id) {
+    throw new Error("Missing run id. Example: rux eval 20260607-abc123");
+  }
+
+  const cwd = resolveCwd(options);
+  const events = await readLedger(cwd);
+  const runs = runsWithAppendedChecks(events);
+  const run = runs.find((event) => event.type === "run" && event.id === id);
+  if (!run) {
+    throw new Error(`Run not found: ${id}`);
+  }
+
+  const children = runs.filter((event) => event.type === "run" && event.parent_id === id);
+  const latestVerdicts = latestVerdictByRun(events);
+  const lifecycleMarks = lifecycleMarksByRun(events);
+  console.log(JSON.stringify(evaluateRunRecord(run, children, latestVerdicts, lifecycleMarks), null, 2));
+}
+
+async function outcomeRun(args) {
+  const { positionals, options } = parseOptions(args);
+  const id = positionals[0];
+  if (!id) {
+    throw new Error("Missing run id. Example: rux outcome 20260607-abc123");
+  }
+
+  const cwd = resolveCwd(options);
+  const events = await readLedger(cwd);
+  const runs = runsWithAppendedChecks(events);
+  const run = runs.find((event) => event.type === "run" && event.id === id);
+  if (!run) {
+    throw new Error(`Run not found: ${id}`);
+  }
+
+  const children = runs.filter((event) => event.type === "run" && event.parent_id === id);
+  const latestVerdicts = latestVerdictByRun(events);
+  const lifecycleMarks = lifecycleMarksByRun(events);
+  console.log(JSON.stringify({
+    run_id: run.id,
+    task_kind: run.task_kind ?? classifyTask(run.task ?? ""),
+    runner: run.runner,
+    model: run.model ?? null,
+    effort: run.effort ?? null,
+    roster: run.roster,
+    purpose: run.purpose ?? "task_run",
+    marks: (lifecycleMarks.get(run.id) ?? []).map(formatLifecycleMark),
+    outcome: summarizeOutcome(run, children, latestVerdicts.get(run.id) ?? null, lifecycleMarks.get(run.id) ?? [])
+  }, null, 2));
+}
+
+async function suggestRun(args) {
+  const { positionals, options } = parseOptions(args);
+  const task = positionals.join(" ").trim();
+  if (!task) {
+    throw new Error(`Missing task. Example: ${CLI_NAME} suggest "fix the failing auth test"`);
+  }
+
+  const cwd = resolveCwd(options);
+  const events = await readLedger(cwd);
+  console.log(JSON.stringify(buildRecommendation(task, events), null, 2));
+}
+
+function buildRecommendation(task, events) {
+  const runs = topLevelRuns(runsWithAppendedChecks(events));
+  const verdicts = latestVerdictByRun(events);
+  const marks = lifecycleMarksByRun(events);
+  const taskKind = classifyTask(task);
+  const eligibility = partitionRecommendationEvidence(runs, verdicts, marks);
+  const sameKind = eligibility.eligible.filter((run) => (run.task_kind ?? classifyTask(run.task)) === taskKind);
+  const evidencePool = sameKind.length > 0 ? sameKind : eligibility.eligible;
+  const groups = summarizeEvidenceGroups(evidencePool, verdicts, marks);
+  const best = groups.find((group) => group.score > 0) ?? null;
+
+  const suggestion = best
+    ? {
+        runner: best.runner,
+        roster: best.roster,
+        model: best.model,
+      effort: best.effort,
+      confidence: best.total >= 3 ? "local_evidence" : "thin_local_evidence",
+      maturity: evidenceMaturityForGroup(best),
+      reason: sameKind.length > 0
+        ? `Best labeled live history for ${taskKind} tasks.`
+        : `No labeled live history for ${taskKind} tasks yet; using all eligible local history.`,
+        evidence_runs: best.evidence_runs,
+        stats: {
+          labeled_runs: best.total,
+          accepted_runs: best.accepted,
+          partial_runs: best.partial,
+          rejected_runs: best.rejected,
+          score: best.score
+        }
+      }
+    : {
+        runner: null,
+        roster: "solo",
+        confidence: "cold_start",
+        maturity: evidenceMaturityForGroup(null),
+        reason: eligibility.eligible.length > 0
+          ? "Eligible local runs exist, but none have a positive outcome yet."
+          : "No recommendation-eligible live runs yet. Run a task, capture checks, then attach a human verdict.",
+        evidence_runs: [],
+        stats: {
+          labeled_runs: 0,
+          accepted_runs: 0,
+          partial_runs: 0,
+          rejected_runs: 0,
+          score: null
+        }
+      };
+
+  return {
+    task,
+    task_kind: taskKind,
+    recommendation: suggestion,
+    evidence: {
+      eligible_runs: eligibility.eligible.length,
+      same_kind_runs: sameKind.length,
+      ignored_runs: eligibility.ignored.length,
+      ignored_reasons: countBy(eligibility.ignored.map((item) => item.reason)),
+      maturity: summarizeEvidenceMaturity(eligibility.eligible, verdicts, marks)
+    }
+  };
+}
+
+function choosePlanRunner({ explicitRunner, recommendation, events, policy }) {
+  if (explicitRunner) {
+    return { runner: explicitRunner, source: "explicit" };
+  }
+  if (recommendation.recommendation.runner) {
+    return { runner: recommendation.recommendation.runner, source: "evidence" };
+  }
+
+  const smokeRunner = preferredProviderSmokeRunner(events, policy.preferred_runner_order);
+  if (smokeRunner) {
+    return { runner: smokeRunner, source: "provider_smoke_fallback" };
+  }
+
+  for (const runner of policy.preferred_runner_order) {
+    if (commandExists(runnerDefinitions[runner].command)) {
+      return { runner, source: "availability_fallback" };
+    }
+  }
+
+  return { runner: "fake", source: "availability_fallback" };
+}
+
+function preferredProviderSmokeRunner(events, preferredRunnerOrder) {
+  const candidates = events
+    .filter((event) => (
+      event.type === "run" &&
+      event.purpose === "provider_smoke" &&
+      event.source === "live" &&
+      event.confidence === "high" &&
+      event.status === "ok" &&
+      event.runner !== "fake" &&
+      Array.isArray(event.changed_files) &&
+      event.changed_files.length === 0
+    ))
+    .sort((left, right) => String(right.ended_at ?? "").localeCompare(String(left.ended_at ?? "")));
+
+  for (const runner of preferredRunnerOrder) {
+    if (candidates.some((candidate) => candidate.runner === runner)) {
+      return runner;
+    }
+  }
+
+  return candidates[0]?.runner ?? null;
+}
+
+function statusNextActions({ topRuns, liveProviderTaskRuns, eligibility, release, proposals }) {
+  const actions = [];
+  if (topRuns.length === 0) {
+    actions.push("Run the first live provider task with a check command.");
+  }
+  if (topRuns.length > 0 && liveProviderTaskRuns.length === 0) {
+    actions.push("Run the first routing-eligible real provider task with --check, then review it with a verdict.");
+  }
+  if (eligibility.eligible.length === 0 && liveProviderTaskRuns.length > 0) {
+    actions.push(`Attach a human verdict or run ${CLI_NAME} check on a live provider task run.`);
+  }
+  if (proposals.length === 0 && topRuns.length > 0) {
+    actions.push(`Run ${CLI_NAME} propose to generate the first evidence-cited improvement note.`);
+  }
+  for (const action of release.next_actions) {
+    if (!actions.includes(action)) actions.push(action);
+  }
+  return actions.slice(0, 6);
+}
+
+function isLiveProviderTaskRun(run) {
+  return run.source === "live" && run.runner !== "fake" && run.purpose !== "provider_smoke";
+}
+
+function buildNextCapture({ events, liveProviderTaskRuns, eligibility, policy, packageJson }) {
+  if (eligibility.eligible.length > 0) {
+    return {
+      needed: false,
+      reason: "Recommendation-eligible provider task evidence exists.",
+      provider_call_required: false,
+      writes_ledger: false,
+      human_review_required: false,
+      command: null
+    };
+  }
+
+  const runnerChoice = chooseNextCaptureRunner({ events, policy });
+  const checkCommand = packageJson?.scripts?.check ? "npm run check" : "<check command>";
+  const command = runnerChoice.runner
+    ? buildRunCommand({
+        task: "<task>",
+        runner: runnerChoice.runner,
+        roster: policy.default_roster,
+        options: { check: checkCommand }
+      })
+    : null;
+
+  return {
+    needed: true,
+    reason: liveProviderTaskRuns.length === 0
+      ? "Provider adapters are ready; the missing proof is one routing-eligible real provider task with a check."
+      : "Live provider task runs exist, but none have a verdict or captured check evidence yet.",
+    runner: runnerChoice.runner,
+    runner_source: runnerChoice.source,
+    check_command: checkCommand,
+    provider_call_required: Boolean(runnerChoice.runner && runnerChoice.runner !== "fake"),
+    writes_ledger: Boolean(runnerChoice.runner),
+    human_review_required: true,
+    note: "Rux status is read-only; this command is a suggested next capture and will call the selected provider CLI if you run it.",
+    command,
+    after_run: [
+      `${CLI_NAME} verdict <run-id> accepted --note "reviewed"`
+    ]
+  };
+}
+
+function chooseNextCaptureRunner({ events, policy }) {
+  const smokeRunner = preferredProviderSmokeRunner(events, policy.preferred_runner_order);
+  if (smokeRunner) {
+    return { runner: smokeRunner, source: "provider_smoke_fallback" };
+  }
+
+  for (const runner of policy.preferred_runner_order) {
+    if (commandExists(runnerDefinitions[runner].command)) {
+      return { runner, source: "availability_fallback" };
+    }
+  }
+
+  return { runner: null, source: "no_provider_runner_available" };
+}
+
+function choosePlanRoster({ explicitRoster, suggestedRoster, suggestedConfidence, task, taskKind, hasCheck, policy }) {
+  if (explicitRoster) {
+    return {
+      roster: explicitRoster,
+      reason: `Using explicitly requested ${explicitRoster} roster.`,
+      one_agent_not_enough: oneAgentNotEnoughReason(explicitRoster, { taskKind, hasCheck, explicit: true })
+    };
+  }
+
+  if (hasCheck && suggestedConfidence !== "local_evidence") {
+    return {
+      roster: "repair",
+      reason: "A check command was supplied, so the safest default is one attempt plus one bounded repair if the check fails.",
+      one_agent_not_enough: oneAgentNotEnoughReason("repair", { taskKind, hasCheck })
+    };
+  }
+
+  if (suggestedConfidence === "local_evidence" || suggestedConfidence === "thin_local_evidence") {
+    return {
+      roster: suggestedRoster,
+      reason: `Using ${suggestedConfidence.replaceAll("_", " ")} for the selected roster.`,
+      one_agent_not_enough: oneAgentNotEnoughReason(suggestedRoster, { taskKind, hasCheck })
+    };
+  }
+
+  if (taskKind === "bugfix" || taskKind === "test") {
+    const roster = hasCheck ? "repair" : "pair";
+    return {
+      roster,
+      reason: hasCheck
+        ? "Bug/test work with a check gets a bounded repair roster."
+        : "Bug/test work without a check gets an implementer plus reviewer by default.",
+      one_agent_not_enough: oneAgentNotEnoughReason(roster, { taskKind, hasCheck })
+    };
+  }
+
+  if (taskKind === "feature" && isComplexTask(task)) {
+    return {
+      roster: "plan-code-review",
+      reason: "Feature work that looks broad gets planner, coder, and reviewer roles.",
+      one_agent_not_enough: oneAgentNotEnoughReason("plan-code-review", { taskKind, hasCheck })
+    };
+  }
+
+  if (taskKind === "feature" || taskKind === "refactor") {
+    return {
+      roster: "pair",
+      reason: `${taskKind} work gets an implementer plus reviewer until stronger local evidence exists.`,
+      one_agent_not_enough: oneAgentNotEnoughReason("pair", { taskKind, hasCheck })
+    };
+  }
+
+  return {
+    roster: policy.default_roster,
+    reason: `Cold-start default from policy: ${policy.default_roster}. Keep the roster small until the ledger has better evidence.`,
+    one_agent_not_enough: oneAgentNotEnoughReason(policy.default_roster, { taskKind, hasCheck })
+  };
+}
+
+function isComplexTask(task) {
+  const words = task.trim().split(/\s+/).filter(Boolean).length;
+  return words >= 14 || /\b(architecture|orchestrator|workflow|migration|database|auth|billing|release|cross-file|system|integration)\b/i.test(task);
+}
+
+function oneAgentNotEnoughReason(roster, { taskKind, hasCheck, explicit = false } = {}) {
+  switch (roster) {
+    case "solo":
+      return null;
+    case "pair":
+      return taskKind === "bugfix" || taskKind === "test"
+        ? "A reviewer is added because there is no captured check yet; one agent would both change and judge the fix."
+        : "A reviewer is added because this work can affect design or multiple files; one agent would both implement and judge the change.";
+    case "repair":
+      return hasCheck
+        ? "A repair step is added because the check can verify the first attempt and guide one bounded retry."
+        : "A repair roster was selected explicitly; Rux keeps the retry bounded and sequential.";
+    case "plan-code-review":
+      return explicit
+        ? "Separate planner, coder, and reviewer roles were requested, so Rux keeps scoping, implementation, and review distinct."
+        : "Separate planner, coder, and reviewer roles are used because the task looks broad enough that one agent would mix scoping, implementation, and review.";
+    default:
+      return null;
+  }
+}
+
+function buildRolePlan(roster, runnerByRole, hasCheck) {
+  if (roster === "solo") {
+    return [{
+      role: "runner",
+      runner: runnerByRole.implementer ?? runnerByRole.primary,
+      purpose: "Do the task directly."
+    }];
+  }
+
+  if (roster === "pair") {
+    return [
+      {
+        role: "implementer",
+        runner: runnerByRole.implementer,
+        purpose: hasCheck ? "Implement the change and run the requested check." : "Implement the change."
+      },
+      {
+        role: "reviewer",
+        runner: runnerByRole.reviewer,
+        purpose: "Review correctness, missing checks, and risks."
+      }
+    ];
+  }
+
+  if (roster === "repair") {
+    return [
+      {
+        role: "attempt",
+        runner: runnerByRole.implementer,
+        purpose: hasCheck ? "Make the first attempt and run the requested check." : "Make the first attempt."
+      },
+      {
+        role: "repairer",
+        runner: runnerByRole.repairer,
+        purpose: "Run only if the first attempt fails."
+      }
+    ];
+  }
+
+  return [
+    {
+      role: "planner",
+      runner: runnerByRole.planner,
+      purpose: "Scope the work and risks before code changes."
+    },
+    {
+      role: "coder",
+      runner: runnerByRole.coder,
+      purpose: hasCheck ? "Implement the planned change and run the requested check." : "Implement the planned change."
+    },
+    {
+      role: "reviewer",
+      runner: runnerByRole.reviewer,
+      purpose: "Review the final state and call out remaining risk."
+    }
+  ];
+}
+
+function runnerAvailability(runners) {
+  return unique(runners).map((runner) => {
+    const definition = runnerDefinitions[runner];
+    return {
+      runner,
+      command: definition.command ?? "(built-in)",
+      available: definition.available === true || commandExists(definition.command)
+    };
+  });
+}
+
+function buildRunCommand({ task, runner, roster, options, model = null, effort = null }) {
+  const parts = [
+    CLI_NAME,
+    "run",
+    task,
+    "--runner",
+    runner,
+    "--roster",
+    roster,
+    "--cwd",
+    resolveCwd(options)
+  ];
+
+  if (model) {
+    parts.push("--model", model);
+  }
+  if (effort) {
+    parts.push("--effort", effort);
+  }
+
+  for (const key of ["cost-hint", "check", "planner-runner", "coder-runner", "implementer-runner", "reviewer-runner", "repair-runner", "timeout-ms"]) {
+    const value = options[key];
+    if (value !== undefined && value !== true) {
+      parts.push(`--${key}`, String(value));
+    }
+  }
+
+  return parts.map(shellQuote).join(" ");
+}
+
+function buildProviderSmokeCommand({ runner, options, model = null, effort = null }) {
+  const parts = [
+    CLI_NAME,
+    "provider-smoke",
+    "--runner",
+    runner,
+    "--cwd",
+    resolveCwd(options)
+  ];
+
+  if (model) {
+    parts.push("--model", model);
+  }
+  if (effort) {
+    parts.push("--effort", effort);
+  }
+  if (options["timeout-ms"] !== undefined && options["timeout-ms"] !== true) {
+    parts.push("--timeout-ms", String(options["timeout-ms"]));
+  }
+
+  return parts.map(shellQuote).join(" ");
+}
+
+function recordedReplayMetadata(command, { runner, humanReviewRequired, reason }) {
+  return {
+    available: true,
+    source: "recorded",
+    command,
+    provider_call_required: runner !== "fake",
+    writes_ledger: true,
+    human_review_required: humanReviewRequired,
+    reason
+  };
+}
+
+function childReplayMetadata(parentId, parentCommand) {
+  return {
+    available: false,
+    source: "recorded",
+    command: null,
+    parent_run_id: parentId,
+    parent_command: parentCommand,
+    provider_call_required: true,
+    writes_ledger: true,
+    human_review_required: true,
+    reason: "This is a child run produced by a sequential roster. Replay the parent roster command instead."
+  };
+}
+
+function unavailableReplayMetadata(reason) {
+  return {
+    available: false,
+    source: "unavailable",
+    command: null,
+    provider_call_required: false,
+    writes_ledger: false,
+    human_review_required: true,
+    reason
+  };
+}
+
+function withReplayMetadata(run) {
+  return {
+    ...run,
+    replay: replayMetadataForRun(run)
+  };
+}
+
+function replayMetadataForRun(run) {
+  if (run?.replay && typeof run.replay === "object") {
+    return run.replay;
+  }
+
+  if (!run || run.source === "imported") {
+    return unavailableReplayMetadata("Imported sessions are continuity records; Rux did not execute the original provider command.");
+  }
+
+  if (run.parent_id) {
+    return {
+      available: false,
+      source: "derived",
+      command: null,
+      parent_run_id: run.parent_id,
+      provider_call_required: true,
+      writes_ledger: true,
+      human_review_required: true,
+      reason: "This is a child run produced by a sequential roster. Show or export the parent run to replay the roster."
+    };
+  }
+
+  if (run.purpose === "provider_smoke") {
+    return {
+      available: true,
+      source: "derived",
+      command: buildProviderSmokeCommand({
+        runner: run.runner,
+        options: { cwd: run.cwd },
+        model: run.model,
+        effort: run.effort
+      }),
+      provider_call_required: run.runner !== "fake",
+      writes_ledger: true,
+      human_review_required: false,
+      reason: "Derived from run metadata; newer records store this directly."
+    };
+  }
+
+  if (run.source === "live") {
+    const options = replayOptionsFromRun(run);
+    return {
+      available: true,
+      source: "derived",
+      command: buildRunCommand({
+        task: run.task,
+        runner: run.runner,
+        roster: run.roster,
+        options,
+        model: run.model,
+        effort: run.effort
+      }),
+      provider_call_required: run.runner !== "fake",
+      writes_ledger: true,
+      human_review_required: true,
+      reason: "Derived from run metadata; newer records store the original replay command directly."
+    };
+  }
+
+  return unavailableReplayMetadata("Replay is unavailable for this run source.");
+}
+
+function replayOptionsFromRun(run) {
+  const options = { cwd: run.cwd };
+  const firstCheck = Array.isArray(run.checks)
+    ? run.checks.find((check) => check.command && check.source !== "post_run_check")
+    : null;
+  if (firstCheck) {
+    options.check = firstCheck.command;
+  }
+  if (run.cost_hint?.amount !== undefined) {
+    options["cost-hint"] = String(run.cost_hint.amount);
+  } else if (run.cost_hint?.raw) {
+    options["cost-hint"] = String(run.cost_hint.raw);
+  }
+  return options;
+}
+
+async function rankRuns(args) {
+  const { options } = parseOptions(args);
+  const cwd = resolveCwd(options);
+  const taskKindFilter = options["task-kind"] ? String(options["task-kind"]) : null;
+  const events = await readLedger(cwd);
+  const runs = topLevelRuns(runsWithAppendedChecks(events));
+  const verdicts = latestVerdictByRun(events);
+  const marks = lifecycleMarksByRun(events);
+  const eligibility = partitionRecommendationEvidence(runs, verdicts, marks);
+  const eligible = taskKindFilter
+    ? eligibility.eligible.filter((run) => (run.task_kind ?? classifyTask(run.task)) === taskKindFilter)
+    : eligibility.eligible;
+  const taskKinds = unique(eligible.map((run) => run.task_kind ?? classifyTask(run.task))).sort();
+  const rankings = taskKinds.map((taskKind) => ({
+    task_kind: taskKind,
+    candidates: summarizeEvidenceGroups(
+      eligible.filter((run) => (run.task_kind ?? classifyTask(run.task)) === taskKind),
+      verdicts,
+      marks
+    )
+  }));
+
+  console.log(JSON.stringify({
+    generated_at: new Date().toISOString(),
+    task_kind: taskKindFilter,
+    evidence: {
+      eligible_runs: eligible.length,
+      ignored_runs: eligibility.ignored.length,
+      ignored_reasons: countBy(eligibility.ignored.map((item) => item.reason)),
+      maturity: summarizeEvidenceMaturity(eligible, verdicts, marks)
+    },
+    rankings,
+    notes: eligible.length === 0
+      ? ["No recommendation-eligible live runs for this scope yet."]
+      : []
+  }, null, 2));
+}
+
+async function proposeImprovements(args) {
+  const { options } = parseOptions(args);
+  const cwd = resolveCwd(options);
+  const events = await readLedger(cwd);
+  const runs = topLevelRuns(runsWithAppendedChecks(events));
+  const verdicts = latestVerdictByRun(events);
+  const marks = lifecycleMarksByRun(events);
+  const release = await buildReleaseCheck(cwd);
+  const findings = buildProposalFindings(runs, verdicts, marks, release);
+  const createdAt = new Date();
+  const id = `proposal-${createRunId(createdAt)}`;
+  const proposalPath = await writeProposal(cwd, id, formatProposal({
+    id,
+    cwd,
+    createdAt,
+    runs,
+    verdicts,
+    release,
+    findings
+  }));
+  const citedRunIds = unique(findings.flatMap((finding) => finding.run_ids));
+
+  const event = {
+    schema_version: SCHEMA_VERSION,
+    type: "proposal",
+    id,
+    created_at: createdAt.toISOString(),
+    proposal_path: relative(cwd, proposalPath),
+    cited_run_ids: citedRunIds,
+    categories: findings.map((finding) => finding.category)
+  };
+
+  await appendLedger(cwd, event);
+  console.log(JSON.stringify({
+    id,
+    proposal_path: relative(cwd, proposalPath),
+    release: {
+      ready: release.ready,
+      blockers: release.gates.filter((gate) => !gate.ok).map((gate) => gate.name),
+      blocker_summary: release.blocker_summary
+    },
+    findings: findings.map((finding) => ({
+      category: finding.category,
+      title: finding.title,
+      run_ids: finding.run_ids
+    })),
+    cited_run_ids: citedRunIds
+  }, null, 2));
+}
+
+async function addCheck(args) {
+  const { positionals, options } = parseOptions(args);
+  const runId = positionals[0];
+  const command = options.command && options.command !== true
+    ? String(options.command).trim()
+    : positionals.slice(1).join(" ").trim();
+  if (!runId || !command) {
+    throw new Error(`Usage: ${CLI_NAME} check <run-id> --command "COMMAND" [--note TEXT]`);
+  }
+
+  const cwd = resolveCwd(options);
+  const events = await readLedger(cwd);
+  const run = events.find((event) => event.type === "run" && event.id === runId);
+  if (!run) {
+    throw new Error(`Run not found: ${runId}`);
+  }
+  if (run.purpose === "provider_smoke") {
+    throw new Error("Provider-smoke runs prove adapter readiness only; do not attach check results to them.");
+  }
+
+  const beforeStatus = gitStatusMap(cwd);
+  const beforeRepo = gitSnapshot(cwd, beforeStatus);
+  const check = runCheck(command, cwd);
+  const afterStatus = gitStatusMap(cwd);
+  const afterRepo = gitSnapshot(cwd, afterStatus);
+  const changedFiles = gitChangedFilesBetween(beforeStatus, afterStatus);
+  const event = {
+    schema_version: SCHEMA_VERSION,
+    type: "check",
+    id: randomUUID(),
+    run_id: runId,
+    source: "post_run_check",
+    note: options.note ? String(options.note) : "",
+    created_at: new Date().toISOString(),
+    repo: {
+      before: beforeRepo,
+      after: afterRepo
+    },
+    changed_files: changedFiles,
+    ...check
+  };
+
+  await appendLedger(cwd, event);
+  console.log(JSON.stringify(event, null, 2));
+}
+
+async function addVerdict(args) {
+  const { positionals, options } = parseOptions(args);
+  const [runId, verdict] = positionals;
+  const allowed = new Set(["accepted", "rejected", "partial", "unknown"]);
+  if (!runId || !allowed.has(verdict)) {
+    throw new Error("Usage: rux verdict <run-id> accepted|rejected|partial|unknown [--note TEXT]");
+  }
+
+  const cwd = resolveCwd(options);
+  const events = await readLedger(cwd);
+  const run = events.find((event) => event.type === "run" && event.id === runId);
+  if (!run) {
+    throw new Error(`Run not found: ${runId}`);
+  }
+  if (run.purpose === "provider_smoke") {
+    throw new Error("Provider-smoke runs prove adapter readiness only; do not attach human verdicts to them.");
+  }
+
+  const event = {
+    schema_version: SCHEMA_VERSION,
+    type: "verdict",
+    id: randomUUID(),
+    run_id: runId,
+    verdict,
+    note: options.note ? String(options.note) : "",
+    created_at: new Date().toISOString()
+  };
+
+  await appendLedger(cwd, event);
+  console.log(JSON.stringify(event, null, 2));
+}
+
+async function addLifecycleMark(args) {
+  const { positionals, options } = parseOptions(args);
+  const [runId, mark] = positionals;
+  if (!runId || !lifecycleMarkDefinitions.has(mark)) {
+    throw new Error("Usage: rux mark <run-id> reverted|replayed|accepted-downstream [--note TEXT]");
+  }
+
+  const cwd = resolveCwd(options);
+  const events = await readLedger(cwd);
+  const run = events.find((event) => event.type === "run" && event.id === runId);
+  if (!run) {
+    throw new Error(`Run not found: ${runId}`);
+  }
+  if (run.purpose === "provider_smoke") {
+    throw new Error("Provider-smoke runs prove adapter readiness only; do not attach lifecycle marks to them.");
+  }
+
+  const event = {
+    schema_version: SCHEMA_VERSION,
+    type: "mark",
+    id: randomUUID(),
+    run_id: runId,
+    mark,
+    note: options.note ? String(options.note) : "",
+    created_at: new Date().toISOString()
+  };
+
+  await appendLedger(cwd, event);
+  console.log(JSON.stringify(event, null, 2));
+}
+
+async function ensureStore(cwd) {
+  await mkdir(join(cwd, STORE_DIR, LEDGER_DIR), { recursive: true });
+  await mkdir(join(cwd, STORE_DIR, TRANSCRIPT_DIR), { recursive: true });
+}
+
+async function appendLedger(cwd, event) {
+  await ensureStore(cwd);
+  const date = new Date().toISOString().slice(0, 10);
+  const path = join(cwd, STORE_DIR, LEDGER_DIR, `${date}.jsonl`);
+  await appendFile(path, `${JSON.stringify(event)}\n`, "utf8");
+}
+
+async function readLedger(cwd) {
+  const ledgerPath = join(cwd, STORE_DIR, LEDGER_DIR);
+  if (!existsSync(ledgerPath)) {
+    return [];
+  }
+
+  const files = (await readdir(ledgerPath)).filter((file) => file.endsWith(".jsonl")).sort();
+  const events = [];
+  for (const file of files) {
+    const content = await readFile(join(ledgerPath, file), "utf8");
+    for (const line of content.split("\n")) {
+      if (!line.trim()) continue;
+      events.push(JSON.parse(line));
+    }
+  }
+  return events;
+}
+
+async function writeTranscript(cwd, runId, text) {
+  const path = join(cwd, STORE_DIR, TRANSCRIPT_DIR, `${runId}.txt`);
+  await writeFile(path, text, "utf8");
+  return path;
+}
+
+async function writeProposal(cwd, proposalId, text) {
+  const path = join(cwd, STORE_DIR, PROPOSAL_DIR, `${proposalId}.md`);
+  await mkdir(join(cwd, STORE_DIR, PROPOSAL_DIR), { recursive: true });
+  await writeFile(path, text, "utf8");
+  return path;
+}
+
+function createRunId(date) {
+  const stamp = date.toISOString().replace(/[-:]/g, "").replace(/\..+$/, "Z");
+  return `${stamp}-${randomUUID().slice(0, 8)}`;
+}
+
+function commandExists(command) {
+  if (!command) return false;
+  const result = spawnSync("command", ["-v", command], {
+    shell: true,
+    stdio: "ignore"
+  });
+  return result.status === 0;
+}
+
+function gitDoctor(cwd) {
+  const inside = spawnSync("git", ["rev-parse", "--is-inside-work-tree"], {
+    cwd,
+    encoding: "utf8"
+  });
+  const status = spawnSync("git", ["status", "--short"], {
+    cwd,
+    encoding: "utf8"
+  });
+
+  return {
+    available: commandExists("git"),
+    inside_work_tree: inside.status === 0 && inside.stdout.trim() === "true",
+    dirty_entries: status.status === 0
+      ? status.stdout.split("\n").filter((line) => line.trim() && !line.slice(3).startsWith(`${STORE_DIR}/`)).length
+      : null
+  };
+}
+
+function gitSnapshot(cwd, statusMap = gitStatusMap(cwd)) {
+  const inside = spawnSync("git", ["rev-parse", "--is-inside-work-tree"], {
+    cwd,
+    encoding: "utf8"
+  });
+  const head = spawnSync("git", ["rev-parse", "--verify", "HEAD"], {
+    cwd,
+    encoding: "utf8"
+  });
+  const branch = spawnSync("git", ["branch", "--show-current"], {
+    cwd,
+    encoding: "utf8"
+  });
+
+  const insideWorkTree = inside.status === 0 && inside.stdout.trim() === "true";
+  return {
+    available: commandExists("git"),
+    inside_work_tree: insideWorkTree,
+    branch: insideWorkTree && branch.status === 0 ? branch.stdout.trim() || null : null,
+    head: insideWorkTree && head.status === 0 ? head.stdout.trim() : null,
+    dirty_entries: statusMap.size,
+    dirty_files: [...statusMap.keys()].sort()
+  };
+}
+
+function releaseGate(name, ok, action, metadata = {}) {
+  return {
+    name,
+    ok: Boolean(ok),
+    lifecycle: metadata.lifecycle ?? "release",
+    category: metadata.category ?? "general",
+    action
+  };
+}
+
+function summarizeReleaseBlockers(blockers) {
+  return {
+    total: blockers.length,
+    by_lifecycle: countBy(blockers.map((gate) => gate.lifecycle)),
+    by_category: countBy(blockers.map((gate) => gate.category)),
+    one_time: blockers.filter((gate) => gate.lifecycle === "one_time").map((gate) => gate.name),
+    release: blockers.filter((gate) => gate.lifecycle === "release").map((gate) => gate.name),
+    permanent: blockers.filter((gate) => gate.lifecycle === "permanent").map((gate) => gate.name)
+  };
+}
+
+async function readJsonIfExists(path) {
+  if (!existsSync(path)) return null;
+  try {
+    return JSON.parse(await readFile(path, "utf8"));
+  } catch {
+    return null;
+  }
+}
+
+async function readTextIfExists(path) {
+  if (!existsSync(path)) return "";
+  try {
+    return await readFile(path, "utf8");
+  } catch {
+    return "";
+  }
+}
+
+function hasProviderSmoke(runs, runner) {
+  return runs.some((run) => (
+    run.purpose === "provider_smoke" &&
+    run.source === "live" &&
+    run.confidence === "high" &&
+    run.runner === runner &&
+    run.status === "ok" &&
+    Array.isArray(run.changed_files) &&
+    run.changed_files.length === 0
+  ));
+}
+
+async function hasLocalOnlyLanguage(cwd) {
+  const text = await releaseDocText(cwd);
+  return /(?:is|as|for|name for)\s+(?:a\s+)?local-only|local-only\s+(?:tool|run ledger|product|project)/i.test(text);
+}
+
+async function hasWorkingNameLanguage(cwd) {
+  const text = await releaseDocText(cwd);
+  return /working name|name is not locked|may change before public release|release name is not locked/i.test(text);
+}
+
+async function releaseDocText(cwd) {
+  const paths = [
+    join(cwd, "README.md"),
+    join(cwd, "AGENTS.md"),
+    join(cwd, "docs", "STATE.md"),
+    join(cwd, "docs", "V0_PLAN.md")
+  ];
+  const parts = [];
+  for (const path of paths) {
+    parts.push(await readTextIfExists(path));
+  }
+  return parts.join("\n");
+}
+
+function gitStatusMap(cwd) {
+  const result = spawnSync("git", ["status", "--short"], {
+    cwd,
+    encoding: "utf8"
+  });
+
+  if (result.status !== 0) {
+    return new Map();
+  }
+
+  const entries = new Map();
+  for (const line of result.stdout.split("\n")) {
+    if (!line.trim()) continue;
+    const status = line.slice(0, 2);
+    const file = line.slice(3).trim();
+    if (!file || file.startsWith(`${STORE_DIR}/`)) continue;
+    entries.set(file, status);
+  }
+  return entries;
+}
+
+function gitChangedFilesBetween(beforeStatus, afterStatus) {
+  const files = unique([...beforeStatus.keys(), ...afterStatus.keys()]);
+  return files.filter((file) => beforeStatus.get(file) !== afterStatus.get(file));
+}
+
+function runCheck(command, cwd) {
+  const startedAt = new Date();
+  const result = spawnSync(command, {
+    cwd,
+    shell: true,
+    encoding: "utf8"
+  });
+  const endedAt = new Date();
+
+  return {
+    command,
+    exit_code: result.status ?? 1,
+    started_at: startedAt.toISOString(),
+    ended_at: endedAt.toISOString(),
+    duration_ms: endedAt.getTime() - startedAt.getTime(),
+    stdout: trimOutput(result.stdout),
+    stderr: trimOutput(result.stderr)
+  };
+}
+
+function trimOutput(value) {
+  if (!value) return "";
+  return value.length > 4000 ? `${value.slice(0, 4000)}\n[truncated]` : value;
+}
+
+function summarizeRun(run) {
+  return {
+    id: run.id,
+    purpose: run.purpose,
+    status: run.status,
+    status_reason: run.status_reason ?? null,
+    source: run.source,
+    confidence: run.confidence,
+    task_kind: run.task_kind,
+    runner: run.runner,
+    model: run.model ?? null,
+    effort: run.effort ?? null,
+    roster: run.roster,
+    role: run.role,
+    parent_id: run.parent_id,
+    child_run_ids: run.child_run_ids ?? [],
+    transcript_path: run.transcript_path,
+    replay: replayMetadataForRun(run),
+    adapter: run.adapter ?? null,
+    repo: run.repo ?? null,
+    changed_files: run.changed_files,
+    checks: run.checks.map((check) => ({
+      source: check.source ?? "run_check",
+      command: check.command,
+      exit_code: check.exit_code
+    })),
+    cost_hint: run.cost_hint ?? null
+  };
+}
+
+function unique(values) {
+  return [...new Set(values)];
+}
+
+function shellQuote(value) {
+  if (/^[A-Za-z0-9_./:=@-]+$/.test(value)) {
+    return value;
+  }
+  return `'${value.replaceAll("'", "'\\''")}'`;
+}
+
+function topLevelRuns(runs) {
+  return runs.filter((run) => !run.parent_id);
+}
+
+function newestRuns(runs) {
+  return [...runs].sort((a, b) => runTimestamp(b) - runTimestamp(a));
+}
+
+function runTimestamp(run) {
+  const parsed = Date.parse(run.ended_at ?? run.started_at ?? run.created_at ?? "");
+  return Number.isFinite(parsed) ? parsed : 0;
+}
+
+function runsWithAppendedChecks(events) {
+  const checks = checksByRun(events);
+  return events
+    .filter((event) => event.type === "run")
+    .map((run) => {
+      const appendedChecks = checks.get(run.id) ?? [];
+      if (appendedChecks.length === 0) return run;
+      return {
+        ...run,
+        checks: [...(Array.isArray(run.checks) ? run.checks : []), ...appendedChecks]
+      };
+    });
+}
+
+function checksByRun(events) {
+  const checks = new Map();
+  for (const event of events) {
+    if (event.type !== "check") continue;
+    const current = checks.get(event.run_id) ?? [];
+    current.push(formatCheckEvent(event));
+    checks.set(event.run_id, current);
+  }
+  return checks;
+}
+
+function formatCheckEvent(event) {
+  return {
+    id: event.id,
+    source: event.source ?? "post_run_check",
+    command: event.command,
+    exit_code: event.exit_code,
+    started_at: event.started_at,
+    ended_at: event.ended_at,
+    duration_ms: event.duration_ms ?? null,
+    stdout: event.stdout ?? "",
+    stderr: event.stderr ?? "",
+    repo: event.repo ?? null,
+    changed_files: Array.isArray(event.changed_files) ? event.changed_files : [],
+    note: event.note ?? ""
+  };
+}
+
+function roleTask(task, role) {
+  const instructions = {
+    implementer: "Role: implementer. Do the task directly. Keep the change scoped and record any caveats in the final response.",
+    reviewer: "Role: reviewer. Review the current repo state and prior attempt. Do not make broad changes. Focus on correctness, missing checks, and risks.",
+    attempt: "Role: first attempt. Do the task directly. Keep the change scoped and let checks decide whether repair is needed.",
+    repairer: "Role: repairer. Inspect the failed attempt and make the smallest correction needed to pass the requested check.",
+    planner: "Role: planner. Produce a concise implementation plan and risks. Do not edit files unless the wrapped runner's normal mode requires it.",
+    coder: "Role: coder. Implement the planned task. Keep changes scoped and prepare the work for review."
+  };
+
+  return [task, "", instructions[role] ?? `Role: ${role}.`].join("\n");
+}
+
+function providerSmokeTask(runner) {
+  return [
+    `Rux provider smoke for ${runner}.`,
+    "Do not edit files.",
+    "Reply with a short confirmation that the runner can execute non-interactively in this repository."
+  ].join("\n");
+}
+
+function aggregateRosterStatus(roster, children) {
+  if (children.some((child) => child.status === "timeout")) return "timeout";
+  if (roster === "repair") {
+    return children[children.length - 1]?.status ?? "failed";
+  }
+  return children.every((child) => child.status === "ok") ? "ok" : "failed";
+}
+
+function rosterNotes(roster, children) {
+  const notes = [
+    `Executed ${roster} roster sequentially. No parallel provider calls were made.`
+  ];
+
+  if (roster === "repair" && children.length === 1 && children[0]?.status !== "failed") {
+    notes.push("Repair step skipped because the first attempt did not fail.");
+  }
+
+  if (roster === "repair" && children.length === 1 && children[0]?.status === "failed") {
+    notes.push("Repair step was not run because the roster could not create a repair child.");
+  }
+
+  return notes;
+}
+
+function formatRosterTranscript({ roster, task, cwd, startedAt, endedAt, status, children }) {
+  return [
+    `runner: ${children[0]?.runner ?? "unknown"}`,
+    `roster: ${roster}`,
+    `role: roster`,
+    `cwd: ${cwd}`,
+    `task: ${task}`,
+    `started_at: ${startedAt.toISOString()}`,
+    `ended_at: ${endedAt.toISOString()}`,
+    `status: ${status}`,
+    "",
+    "## child runs",
+    ...children.flatMap((child) => [
+      `- ${child.role}: ${child.id} (${child.runner}, ${child.status})`,
+      `  transcript: ${child.transcript_path}`
+    ])
+  ].join("\n");
+}
+
+function classifyTask(task) {
+  const lower = task.toLowerCase();
+  if (/\b(readme|docs?|documentation|mdx?|copy|text)\b/.test(lower)) return "docs";
+  if (/\b(test|spec|failing|failure|ci|smoke|regression)\b/.test(lower)) return "test";
+  if (/\b(bug|fix|repair|broken|error|exception|crash)\b/.test(lower)) return "bugfix";
+  if (/\b(refactor|cleanup|simplify|rename|restructure)\b/.test(lower)) return "refactor";
+  if (/\b(review|audit|critique|inspect)\b/.test(lower)) return "review";
+  if (/\b(add|build|implement|create|feature|support)\b/.test(lower)) return "feature";
+  return "general";
+}
+
+function latestVerdictByRun(events) {
+  const verdicts = new Map();
+  for (const event of events) {
+    if (event.type === "verdict") {
+      verdicts.set(event.run_id, event);
+    }
+  }
+  return verdicts;
+}
+
+function lifecycleMarksByRun(events) {
+  const marks = new Map();
+  for (const event of events) {
+    if (event.type === "mark") {
+      const current = marks.get(event.run_id) ?? [];
+      current.push(event);
+      marks.set(event.run_id, current);
+    }
+  }
+  return marks;
+}
+
+function partitionRecommendationEvidence(runs, verdicts, marks) {
+  const eligible = [];
+  const ignored = [];
+
+  for (const run of runs) {
+    const verdict = verdicts.get(run.id);
+    const reason = recommendationBlocker(run, verdict, marks.get(run.id) ?? []);
+    if (reason) {
+      ignored.push({ id: run.id, reason });
+    } else {
+      eligible.push(run);
+    }
+  }
+
+  return { eligible, ignored };
+}
+
+function recommendationBlocker(run, verdict, marks = []) {
+  return recommendationBlockers(run, verdict, marks)[0] ?? null;
+}
+
+function recommendationBlockers(run, verdict, marks = []) {
+  const blockers = [];
+  if (run.parent_id) blockers.push("child_run");
+  if (run.purpose === "provider_smoke") blockers.push("provider_smoke");
+  if (run.source !== "live") blockers.push("not_live");
+  if (run.confidence !== "high") blockers.push("not_high_confidence");
+  if (run.runner === "fake") blockers.push("fake_runner");
+  if (hasLifecycleMark(marks, "reverted")) blockers.push("reverted_downstream");
+  if (checkChangedFiles(run).length > 0) blockers.push("check_modified_files");
+  if (run.purpose !== "provider_smoke" && !verdict && (!Array.isArray(run.checks) || run.checks.length === 0)) blockers.push("unlabeled");
+  return blockers;
+}
+
+function checkChangedFiles(run) {
+  const checks = Array.isArray(run.checks) ? run.checks : [];
+  return unique(checks.flatMap((check) => Array.isArray(check.changed_files) ? check.changed_files : []));
+}
+
+function summarizeEvidenceGroups(runs, verdicts, marks) {
+  const groups = new Map();
+  for (const run of runs) {
+    const key = JSON.stringify({
+      runner: run.runner,
+      roster: run.roster,
+      model: run.model ?? null,
+      effort: run.effort ?? null
+    });
+    const group = groups.get(key) ?? {
+      runner: run.runner,
+      roster: run.roster,
+      model: run.model ?? null,
+      effort: run.effort ?? null,
+      total: 0,
+      accepted: 0,
+      partial: 0,
+      rejected: 0,
+      score_total: 0,
+      evidence_runs: []
+    };
+    const verdict = verdicts.get(run.id);
+    const runMarks = marks.get(run.id) ?? [];
+    const weight = outcomeWeight(run, verdict, runMarks);
+    group.total += 1;
+    group.score_total += weight;
+    if (verdict?.verdict === "accepted" || hasLifecycleMark(runMarks, "accepted-downstream")) group.accepted += 1;
+    if (verdict?.verdict === "partial") group.partial += 1;
+    if (verdict?.verdict === "rejected" || hasLifecycleMark(runMarks, "reverted")) group.rejected += 1;
+    group.evidence_runs.push(run.id);
+    groups.set(key, group);
+  }
+
+  return [...groups.values()]
+    .map((group) => ({
+      ...group,
+      score: Number((group.score_total / group.total).toFixed(3)),
+      evidence_runs: group.evidence_runs.slice(-5).reverse()
+    }))
+    .map((group) => ({
+      ...group,
+      maturity: evidenceMaturityForGroup(group)
+    }))
+    .sort((left, right) => right.score - left.score || right.total - left.total || left.runner.localeCompare(right.runner));
+}
+
+function summarizeEvidenceMaturity(runs, verdicts, marks) {
+  const groups = summarizeEvidenceGroups(runs, verdicts, marks);
+  const byLevel = countBy(groups.map((group) => group.maturity.level));
+  const strongest = groups
+    .map((group) => group.maturity)
+    .sort((left, right) => maturityRank(right.level) - maturityRank(left.level))[0] ?? evidenceMaturityForGroup(null);
+
+  return {
+    eligible_runs: runs.length,
+    groups: groups.length,
+    strongest_level: strongest.level,
+    by_level: byLevel,
+    guidance: strongest.guidance
+  };
+}
+
+function evidenceMaturityForGroup(group) {
+  if (!group || group.total === 0) {
+    return {
+      level: "none",
+      runs: 0,
+      guidance: "No eligible local task evidence yet. Capture a checked or reviewed provider run before trusting recommendations.",
+      next: "Capture one live provider task with a check or human verdict."
+    };
+  }
+
+  if (group.total < 3) {
+    return {
+      level: "thin",
+      runs: group.total,
+      guidance: "One or two labeled runs can guide the next attempt, but should not become a team standard.",
+      next: `Capture ${3 - group.total} more labeled run(s) for this runner/model/effort/roster before treating it as directional evidence.`
+    };
+  }
+
+  if (group.total < 6) {
+    return {
+      level: "directional",
+      runs: group.total,
+      guidance: "Several labeled runs support a preference, but keep human review on important work.",
+      next: `Capture ${6 - group.total} more labeled run(s) before treating this setup as strong local evidence.`
+    };
+  }
+
+  if (group.score >= 0.75 && group.rejected === 0) {
+    return {
+      level: "strong",
+      runs: group.total,
+      guidance: "Repeated positive local evidence is strong enough to standardize cautiously.",
+      next: "Keep recording checks, verdicts, and downstream marks so the recommendation can decay if outcomes change."
+    };
+  }
+
+  return {
+    level: "mixed",
+    runs: group.total,
+    guidance: "There is enough history, but outcomes are mixed. Prefer review or repair rosters until the failure pattern is understood.",
+    next: "Inspect rejected, failed, or reverted runs before increasing automation."
+  };
+}
+
+function maturityRank(level) {
+  return {
+    none: 0,
+    thin: 1,
+    mixed: 2,
+    directional: 3,
+    strong: 4
+  }[level] ?? 0;
+}
+
+function outcomeWeight(run, verdict, marks = []) {
+  if (hasLifecycleMark(marks, "reverted")) return 0;
+  if (hasLifecycleMark(marks, "accepted-downstream")) return 1;
+  if (verdict?.verdict === "accepted") return 1;
+  if (verdict?.verdict === "partial") return 0.5;
+  if (verdict?.verdict === "rejected") return 0;
+  if (Array.isArray(run.checks) && run.checks.length > 0 && run.checks.every((check) => check.exit_code === 0) && run.status === "ok") {
+    return 0.75;
+  }
+  return 0;
+}
+
+function summarizeOutcome(run, children, verdict, marks = []) {
+  const checks = Array.isArray(run.checks) ? run.checks : [];
+  const failedChecks = checks.filter((check) => check.exit_code !== 0);
+  const childChecks = children.flatMap((child) => Array.isArray(child.checks) ? child.checks : []);
+  const failedChildChecks = childChecks.filter((check) => check.exit_code !== 0);
+  const childFailures = children.filter((child) => child.status !== "ok");
+  const providerSmokeEvidence = isProviderSmokeEvidence(run);
+  const changedFiles = Array.isArray(run.changed_files) ? run.changed_files : [];
+  const checkLabel = checks.length > 0
+    ? failedChecks.length === 0 && run.status === "ok" ? "checks_passed" : "checks_failed"
+    : null;
+
+  if (hasLifecycleMark(marks, "reverted")) {
+    return {
+      label: "reverted_downstream",
+      confidence: "high",
+      source: "lifecycle_mark",
+      score: 0,
+      reason: "This run was later marked as reverted.",
+      verdict: verdict ? {
+        verdict: verdict.verdict,
+        note: verdict.note,
+        created_at: verdict.created_at
+      } : null,
+      marks: marks.map(formatLifecycleMark),
+      checks: outcomeCheckSummary(checks, failedChecks, childChecks, failedChildChecks),
+      release: { provider_smoke_evidence: providerSmokeEvidence },
+      risks: outcomeRisks(run, children, verdict, marks)
+    };
+  }
+
+  if (hasLifecycleMark(marks, "accepted-downstream")) {
+    return {
+      label: "accepted_downstream",
+      confidence: run.source === "live" && run.confidence === "high" ? "high" : "medium",
+      source: "lifecycle_mark",
+      score: 1,
+      reason: "This run was later marked as accepted downstream.",
+      verdict: verdict ? {
+        verdict: verdict.verdict,
+        note: verdict.note,
+        created_at: verdict.created_at
+      } : null,
+      marks: marks.map(formatLifecycleMark),
+      checks: outcomeCheckSummary(checks, failedChecks, childChecks, failedChildChecks),
+      release: { provider_smoke_evidence: providerSmokeEvidence },
+      risks: outcomeRisks(run, children, verdict, marks)
+    };
+  }
+
+  if (verdict?.verdict) {
+    return {
+      label: `human_${verdict.verdict}`,
+      confidence: run.source === "live" && run.confidence === "high" ? "high" : "medium",
+      source: "human_verdict",
+      score: outcomeWeight(run, verdict, marks),
+      reason: `Latest human verdict is ${verdict.verdict}.`,
+      verdict: {
+        verdict: verdict.verdict,
+        note: verdict.note,
+        created_at: verdict.created_at
+      },
+      marks: marks.map(formatLifecycleMark),
+      checks: outcomeCheckSummary(checks, failedChecks, childChecks, failedChildChecks),
+      release: { provider_smoke_evidence: providerSmokeEvidence },
+      risks: outcomeRisks(run, children, verdict, marks)
+    };
+  }
+
+  if (checkLabel) {
+    const passed = checkLabel === "checks_passed";
+    return {
+      label: checkLabel,
+      confidence: passed ? "medium" : "high",
+      source: "check_result",
+      score: passed ? 0.75 : 0,
+      reason: passed ? "All captured checks passed." : "At least one captured check failed or the run failed.",
+      verdict: null,
+      marks: marks.map(formatLifecycleMark),
+      checks: outcomeCheckSummary(checks, failedChecks, childChecks, failedChildChecks),
+      release: { provider_smoke_evidence: providerSmokeEvidence },
+      risks: outcomeRisks(run, children, verdict, marks)
+    };
+  }
+
+  if (providerSmokeEvidence) {
+    return {
+      label: "provider_smoke_passed",
+      confidence: "release_only",
+      source: "provider_smoke",
+      score: 0,
+      reason: "Provider smoke succeeded with no file changes. This proves adapter readiness, not task quality.",
+      verdict: null,
+      marks: marks.map(formatLifecycleMark),
+      checks: outcomeCheckSummary(checks, failedChecks, childChecks, failedChildChecks),
+      release: { provider_smoke_evidence: true },
+      risks: outcomeRisks(run, children, verdict, marks)
+    };
+  }
+
+  if (run.source === "imported" || run.confidence === "low") {
+    return {
+      label: "imported_unverified",
+      confidence: "low",
+      source: "imported_session",
+      score: 0,
+      reason: "Imported history is preserved for continuity, but it has no captured checks or live execution proof.",
+      verdict: null,
+      marks: marks.map(formatLifecycleMark),
+      checks: outcomeCheckSummary(checks, failedChecks, childChecks, failedChildChecks),
+      release: { provider_smoke_evidence: false },
+      risks: outcomeRisks(run, children, verdict, marks)
+    };
+  }
+
+  if (run.status !== "ok") {
+    return {
+      label: "run_failed",
+      confidence: "high",
+      source: "run_status",
+      score: 0,
+      reason: `Run status is ${run.status}.`,
+      verdict: null,
+      marks: marks.map(formatLifecycleMark),
+      checks: outcomeCheckSummary(checks, failedChecks, childChecks, failedChildChecks),
+      release: { provider_smoke_evidence: false },
+      risks: outcomeRisks(run, children, verdict, marks)
+    };
+  }
+
+  return {
+    label: "unlabeled",
+    confidence: "none",
+    source: "missing_label",
+    score: 0,
+    reason: "No human verdict or check result has been captured for this run.",
+    verdict: null,
+    marks: marks.map(formatLifecycleMark),
+    checks: outcomeCheckSummary(checks, failedChecks, childChecks, failedChildChecks),
+    release: { provider_smoke_evidence: false },
+    risks: outcomeRisks(run, children, verdict, marks)
+  };
+}
+
+function outcomeCheckSummary(checks, failedChecks, childChecks, failedChildChecks) {
+  return {
+    total: checks.length,
+    failed: failedChecks.length,
+    child_total: childChecks.length,
+    child_failed: failedChildChecks.length,
+    commands: checks.map((check) => ({
+      command: check.command,
+      exit_code: check.exit_code
+    }))
+  };
+}
+
+function outcomeRisks(run, children, verdict, marks = []) {
+  const risks = [];
+  if (!verdict && (!Array.isArray(run.checks) || run.checks.length === 0) && run.purpose !== "provider_smoke") {
+    risks.push("missing_verdict_or_check");
+  }
+  if (hasLifecycleMark(marks, "reverted")) risks.push("reverted_downstream");
+  if (hasLifecycleMark(marks, "replayed")) risks.push("replayed_downstream");
+  if (run.source !== "live") risks.push("not_live");
+  if (run.confidence !== "high") risks.push("not_high_confidence");
+  if (run.runner === "fake") risks.push("fake_runner");
+  if (checkChangedFiles(run).length > 0) risks.push("check_modified_files");
+  if (Array.isArray(run.changed_files) && run.changed_files.length > 10) risks.push("large_change_surface");
+  if (children.some((child) => child.status !== "ok")) risks.push("child_run_failed");
+  return risks;
+}
+
+function hasLifecycleMark(marks, mark) {
+  return marks.some((event) => event.mark === mark);
+}
+
+function latestLifecycleMark(marks) {
+  return marks.at(-1) ?? null;
+}
+
+function formatLifecycleMark(mark) {
+  return {
+    mark: mark.mark,
+    note: mark.note,
+    created_at: mark.created_at
+  };
+}
+
+function isProviderSmokeEvidence(run) {
+  return (
+    run.purpose === "provider_smoke" &&
+    run.source === "live" &&
+    run.confidence === "high" &&
+    run.status === "ok" &&
+    Array.isArray(run.changed_files) &&
+    run.changed_files.length === 0
+  );
+}
+
+function evaluateRunRecord(run, children, verdicts, marksByRun = new Map()) {
+  const verdict = verdicts.get(run.id) ?? null;
+  const marks = marksByRun.get(run.id) ?? [];
+  const latestMark = latestLifecycleMark(marks);
+  const blockers = recommendationBlockers(run, verdict, marks);
+  const checks = Array.isArray(run.checks) ? run.checks : [];
+  const failedChecks = checks.filter((check) => check.exit_code !== 0);
+  const changedByChecks = checkChangedFiles(run);
+  const childChecks = children.flatMap((child) => Array.isArray(child.checks) ? child.checks : []);
+  const childFailures = children.filter((child) => child.status !== "ok");
+  const score = blockers.length === 0 ? outcomeWeight(run, verdict, marks) : 0;
+  const providerSmokeReleaseEvidence = isProviderSmokeEvidence(run);
+  const stderrSignal = adapterStderrSignal(run.adapter);
+
+  return {
+    run_id: run.id,
+    purpose: run.purpose ?? "task_run",
+    runner: run.runner,
+    model: run.model ?? null,
+    effort: run.effort ?? null,
+    roster: run.roster,
+    role: run.role ?? null,
+    task_kind: run.task_kind ?? classifyTask(run.task ?? ""),
+    status: run.status,
+    status_reason: run.status_reason ?? null,
+    latest_verdict: verdict ? {
+      verdict: verdict.verdict,
+      note: verdict.note,
+      created_at: verdict.created_at
+    } : null,
+    latest_mark: latestMark ? formatLifecycleMark(latestMark) : null,
+    signals: {
+      source: run.source ?? "live",
+      confidence: run.confidence ?? "unknown",
+      adapter_exit_code: run.adapter?.exit_code ?? null,
+      adapter_timed_out: run.adapter?.timed_out ?? false,
+      adapter_stdout_bytes: run.adapter?.stdout_bytes ?? null,
+      adapter_stderr_bytes: run.adapter?.stderr_bytes ?? null,
+      adapter_stderr_signal: stderrSignal?.level ?? null,
+      adapter_stderr_reason: stderrSignal?.reason ?? null,
+      repo_snapshot: Boolean(run.repo),
+      repo_dirty_before: run.repo?.before?.dirty_entries ?? run.repo?.imported_at?.dirty_entries ?? null,
+      repo_dirty_after: run.repo?.after?.dirty_entries ?? null,
+      checks_total: checks.length,
+      checks_failed: failedChecks.length,
+      check_changed_files: changedByChecks.length,
+      changed_files: Array.isArray(run.changed_files) ? run.changed_files.length : 0,
+      child_runs: children.length,
+      child_failures: childFailures.length,
+      child_checks_total: childChecks.length,
+      marks_total: marks.length,
+      reverted: hasLifecycleMark(marks, "reverted"),
+      replayed: hasLifecycleMark(marks, "replayed"),
+      accepted_downstream: hasLifecycleMark(marks, "accepted-downstream")
+    },
+    outcome: summarizeOutcome(run, children, verdict, marks),
+    cost_hint: run.cost_hint ?? null,
+    routing: {
+      eligible: blockers.length === 0,
+      blockers,
+      score,
+      score_basis: scoreBasis(run, verdict, blockers, marks)
+    },
+    release: {
+      provider_smoke_evidence: providerSmokeReleaseEvidence
+    },
+    children: children.map((child) => ({
+      id: child.id,
+      role: child.role,
+      runner: child.runner,
+      status: child.status,
+      checks_total: Array.isArray(child.checks) ? child.checks.length : 0,
+      changed_files: Array.isArray(child.changed_files) ? child.changed_files.length : 0
+    }))
+  };
+}
+
+function scoreBasis(run, verdict, blockers, marks = []) {
+  if (blockers.length > 0) {
+    return `blocked:${blockers.join(",")}`;
+  }
+  if (hasLifecycleMark(marks, "accepted-downstream")) {
+    return "lifecycle_mark:accepted_downstream";
+  }
+  if (verdict?.verdict) {
+    return `human_verdict:${verdict.verdict}`;
+  }
+  if (Array.isArray(run.checks) && run.checks.length > 0 && run.checks.every((check) => check.exit_code === 0) && run.status === "ok") {
+    return "checks_passed";
+  }
+  if (Array.isArray(run.checks) && run.checks.length > 0 && run.checks.some((check) => check.exit_code !== 0)) {
+    return "checks_failed";
+  }
+  return "no_positive_signal";
+}
+
+function countBy(values) {
+  const counts = {};
+  for (const value of values) {
+    counts[value] = (counts[value] ?? 0) + 1;
+  }
+  return counts;
+}
+
+function buildProposalFindings(runs, verdicts, marks, release = null) {
+  const findings = [];
+  const providerSmokeRuns = runs.filter((run) => run.source === "live" && run.runner !== "fake" && run.purpose === "provider_smoke");
+  const liveProviderRuns = runs.filter((run) => run.source === "live" && run.runner !== "fake" && run.purpose !== "provider_smoke");
+  const importedRuns = runs.filter((run) => run.source === "imported");
+  const unlabeledRuns = liveProviderRuns.filter((run) => !verdicts.has(run.id) && (!Array.isArray(run.checks) || run.checks.length === 0));
+  const failedRuns = runs.filter((run) => run.status === "failed" || (Array.isArray(run.checks) && run.checks.some((check) => check.exit_code !== 0)) || hasLifecycleMark(marks.get(run.id) ?? [], "reverted"));
+  const positiveProviderRuns = liveProviderRuns.filter((run) => outcomeWeight(run, verdicts.get(run.id), marks.get(run.id) ?? []) > 0);
+  const releaseBlockers = release?.gates?.filter((gate) => !gate.ok) ?? [];
+
+  if (runs.length === 0) {
+    findings.push({
+      category: "capture",
+      title: "Capture the first run",
+      body: "No run records exist yet. The next useful step is one live provider run with a check command and a human verdict.",
+      run_ids: []
+    });
+    return findings;
+  }
+
+  if (release && releaseBlockers.length > 0) {
+    const evidenceBlockers = new Set([
+      "claude_smoke_evidence",
+      "codex_smoke_evidence",
+      "gemini_smoke_evidence",
+      "real_provider_task_evidence"
+    ]);
+    const citedRuns = releaseBlockers.some((gate) => evidenceBlockers.has(gate.name))
+      ? (liveProviderRuns.length > 0 ? liveProviderRuns : providerSmokeRuns)
+      : runs;
+    findings.push({
+      category: "release",
+      title: "Keep release blocked until evidence gates pass",
+      body: `Release-check is not ready. Current blockers: ${releaseBlockers.map(formatReleaseBlocker).join("; ")}. Do not remove package privacy or publish until these are deliberately cleared.`,
+      run_ids: lastRunIds(citedRuns)
+    });
+  }
+
+  if (unlabeledRuns.length > 0) {
+    findings.push({
+      category: "labels",
+      title: "Attach verdicts to live provider runs",
+      body: `${unlabeledRuns.length} live provider run(s) have no check result or human verdict. They are useful history, but they cannot guide routing yet.`,
+      run_ids: lastRunIds(unlabeledRuns)
+    });
+  }
+
+  if (failedRuns.length > 0) {
+    findings.push({
+      category: "checks",
+      title: "Review failed runs before adding automation",
+      body: `${failedRuns.length} run(s) failed, had failing checks, or were later reverted. Use these to define the first repair roster instead of guessing at retry behavior.`,
+      run_ids: lastRunIds(failedRuns)
+    });
+  }
+
+  if (importedRuns.length > 0) {
+    findings.push({
+      category: "imports",
+      title: "Keep imported history as continuity, not proof",
+      body: `${importedRuns.length} imported run(s) are present. They should stay out of recommendations unless a human adds labels that make their limitations clear.`,
+      run_ids: lastRunIds(importedRuns)
+    });
+  }
+
+  if (positiveProviderRuns.length === 0) {
+    const citedRuns = liveProviderRuns.length > 0
+      ? liveProviderRuns
+      : providerSmokeRuns.length > 0
+        ? providerSmokeRuns
+        : runs;
+    findings.push({
+      category: liveProviderRuns.length === 0 && providerSmokeRuns.length > 0 ? "capture" : "routing",
+      title: liveProviderRuns.length === 0 && providerSmokeRuns.length > 0
+        ? "Capture a labeled provider task before routing"
+        : "Do not claim routing intelligence yet",
+      body: liveProviderRuns.length === 0 && providerSmokeRuns.length > 0
+        ? "Provider smoke evidence proves adapter readiness, not task quality. Capture one routing-eligible real provider task with a check command or human verdict before trusting routing recommendations."
+        : "No live provider run has a positive outcome label. Keep using explicit runner choice until at least one real provider run is accepted or passes checks.",
+      run_ids: lastRunIds(citedRuns)
+    });
+  }
+
+  if (findings.length === 0) {
+    findings.push({
+      category: "steady_state",
+      title: "Keep collecting labeled runs",
+      body: "The ledger has positive live provider evidence and no obvious hygiene gaps. The next useful improvement is a fixed roster run so routing can compare solo versus reviewed work.",
+      run_ids: lastRunIds(runs)
+    });
+  }
+
+  return findings;
+}
+
+function formatProposal({ id, cwd, createdAt, runs, verdicts, release, findings }) {
+  const liveRuns = runs.filter((run) => run.source === "live").length;
+  const importedRuns = runs.filter((run) => run.source === "imported").length;
+  const labeledRuns = runs.filter((run) => verdicts.has(run.id) || (Array.isArray(run.checks) && run.checks.length > 0)).length;
+  const releaseBlockers = release?.gates?.filter((gate) => !gate.ok) ?? [];
+
+  return [
+    `# Rux Proposal`,
+    "",
+    `ID: ${id}`,
+    `Created: ${createdAt.toISOString()}`,
+    `Repo: ${cwd}`,
+    "",
+    "## Snapshot",
+    "",
+    `- Runs: ${runs.length}`,
+    `- Live runs: ${liveRuns}`,
+    `- Imported runs: ${importedRuns}`,
+    `- Labeled runs: ${labeledRuns}`,
+    `- Release ready: ${release?.ready === true ? "yes" : "no"}`,
+    `- Release blockers: ${releaseBlockers.length > 0 ? releaseBlockers.map((gate) => gate.name).join(", ") : "none"}`,
+    `- One-time blockers: ${release?.blocker_summary?.one_time?.length > 0 ? release.blocker_summary.one_time.join(", ") : "none"}`,
+    `- Permanent blockers: ${release?.blocker_summary?.permanent?.length > 0 ? release.blocker_summary.permanent.join(", ") : "none"}`,
+    "",
+    "## Proposed Improvements",
+    "",
+    ...findings.flatMap((finding, index) => [
+      `### ${index + 1}. ${finding.title}`,
+      "",
+      finding.body,
+      "",
+      `Cited runs: ${finding.run_ids.length > 0 ? finding.run_ids.join(", ") : "none"}`,
+      ""
+    ]),
+    "## Guardrail",
+    "",
+    "This proposal is advisory. Rux must not apply source changes, mutate prompts, or change routing policy without a human action."
+  ].join("\n");
+}
+
+function lastRunIds(runs) {
+  return newestRuns(runs).slice(0, 5).map((run) => run.id);
+}
+
+function formatReleaseBlocker(gate) {
+  return `${gate.name} (${gate.lifecycle}/${gate.category})`;
+}
+
+function inferRunnerFromImport(path, text) {
+  const haystack = `${path}\n${text.slice(0, 2000)}`.toLowerCase();
+  if (haystack.includes("claude")) return "claude";
+  if (haystack.includes("codex")) return "codex";
+  if (haystack.includes("gemini")) return "gemini";
+  return "unknown";
+}
+
+function normalizeImportedRunner(value) {
+  const normalized = value.toLowerCase();
+  const allowed = new Set(["claude", "codex", "gemini", "cursor", "zed", "unknown"]);
+  if (!allowed.has(normalized)) {
+    throw new Error(`Unsupported imported runner: ${value}. Use claude, codex, gemini, cursor, zed, or unknown.`);
+  }
+  return normalized;
+}
+
+function normalizeImportedStatus(value) {
+  const normalized = value.toLowerCase();
+  const allowed = new Set(["ok", "failed", "timeout", "cancelled", "unknown"]);
+  if (!allowed.has(normalized)) {
+    throw new Error(`Unsupported imported status: ${value}. Use ok, failed, timeout, cancelled, or unknown.`);
+  }
+  return normalized;
+}
+
+function parseDateOption(value, fallback) {
+  if (!value) return fallback;
+  const date = new Date(String(value));
+  if (Number.isNaN(date.getTime())) {
+    throw new Error(`Invalid date: ${value}`);
+  }
+  return date;
+}
+
+function formatImportedTranscript({ from, runner, task, status, startedAt, endedAt, importedText }) {
+  return [
+    `runner: ${runner}`,
+    `source: imported`,
+    `confidence: low`,
+    `imported_from: ${from}`,
+    `task: ${task}`,
+    `started_at: ${startedAt.toISOString()}`,
+    `ended_at: ${endedAt.toISOString()}`,
+    `status: ${status}`,
+    "",
+    "## imported transcript",
+    importedText.trimEnd()
+  ].join("\n");
+}
