@@ -526,6 +526,24 @@ try {
   const claudeTranscript = await readFile(join(tempRoot, claudeSummary.transcript_path), "utf8");
   assert(claudeTranscript.includes("--permission-mode plan"), "claude runner should use plan permission mode");
   assert(claudeTranscript.includes("mock claude received"), "claude transcript should capture stdout");
+  const claudeWriteRun = spawnSync("node", [
+    cliPath,
+    "run",
+    "write claude guard",
+    "--runner",
+    "claude",
+    "--provider-mode",
+    "write",
+    "--cwd",
+    tempRoot
+  ], {
+    encoding: "utf8",
+    env: { ...process.env, PATH: `${tempBin}:${process.env.PATH ?? ""}` }
+  });
+  assert(claudeWriteRun.status === 0, "mocked claude write-mode runner should complete");
+  const claudeWriteSummary = JSON.parse(claudeWriteRun.stdout);
+  const claudeWriteTranscript = await readFile(join(tempRoot, claudeWriteSummary.transcript_path), "utf8");
+  assert(claudeWriteTranscript.includes("--permission-mode acceptEdits"), "claude write mode should accept edits instead of plan mode");
   run("node", [
     cliPath,
     "verdict",
@@ -593,6 +611,24 @@ try {
   const codexTranscript = await readFile(join(tempRoot, codexSummary.transcript_path), "utf8");
   assert(codexTranscript.includes("exec --sandbox read-only"), "codex runner should use read-only sandbox");
   assert(codexTranscript.includes("mock codex received"), "codex transcript should capture stdout");
+  const codexWriteRun = spawnSync("node", [
+    cliPath,
+    "run",
+    "codex write guard",
+    "--runner",
+    "codex",
+    "--provider-mode",
+    "write",
+    "--cwd",
+    tempRoot
+  ], {
+    encoding: "utf8",
+    env: { ...process.env, PATH: `${tempBin}:${process.env.PATH ?? ""}` }
+  });
+  assert(codexWriteRun.status === 0, "mocked codex write-mode runner should complete");
+  const codexWriteSummary = JSON.parse(codexWriteRun.stdout);
+  const codexWriteTranscript = await readFile(join(tempRoot, codexWriteSummary.transcript_path), "utf8");
+  assert(codexWriteTranscript.includes("exec --sandbox workspace-write"), "codex write mode should use workspace-write sandbox");
 
   const geminiRun = spawnSync("node", [cliPath, "run", "gemini guard", "--runner", "gemini", "--cwd", tempRoot], {
     encoding: "utf8",
@@ -607,6 +643,86 @@ try {
   assert(geminiTranscript.includes("--approval-mode plan"), "gemini runner should use plan approval mode");
   assert(geminiTranscript.includes("--skip-trust"), "gemini runner should skip workspace trust prompts for headless runs");
   assert(geminiTranscript.includes("mock gemini received"), "gemini transcript should capture stdout");
+  const geminiWriteRun = spawnSync("node", [
+    cliPath,
+    "run",
+    "gemini write guard",
+    "--runner",
+    "gemini",
+    "--provider-mode",
+    "write",
+    "--cwd",
+    tempRoot
+  ], {
+    encoding: "utf8",
+    env: { ...process.env, PATH: `${tempBin}:${process.env.PATH ?? ""}` }
+  });
+  assert(geminiWriteRun.status === 0, "mocked gemini write-mode runner should complete");
+  const geminiWriteSummary = JSON.parse(geminiWriteRun.stdout);
+  const geminiWriteTranscript = await readFile(join(tempRoot, geminiWriteSummary.transcript_path), "utf8");
+  assert(geminiWriteTranscript.includes("--approval-mode auto_edit"), "gemini write mode should use auto_edit approval mode");
+
+  const blockedGeminiRun = spawnSync("node", [
+    cliPath,
+    "run",
+    "needs provider approval",
+    "--runner",
+    "gemini",
+    "--cwd",
+    tempRoot
+  ], {
+    encoding: "utf8",
+    env: { ...process.env, PATH: `${tempBin}:${process.env.PATH ?? ""}` }
+  });
+  assert(blockedGeminiRun.status === 0, "provider approval run should still record a run");
+  assert(blockedGeminiRun.stderr.includes("Do you agree with this approach?"), "provider output should be visible on stderr while stdout stays JSON");
+  const blockedGeminiSummary = JSON.parse(blockedGeminiRun.stdout);
+  assert(blockedGeminiSummary.status === "blocked", "provider approval output should not be marked ok");
+  assert(blockedGeminiSummary.status_reason === "provider_needs_input", "provider approval output should classify as needing input");
+  assert(blockedGeminiSummary.output_signal.kind === "needs_input", "blocked run summary should expose output signal");
+  const blockedGeminiOutcome = JSON.parse(run("node", [cliPath, "outcome", blockedGeminiSummary.id, "--cwd", tempRoot]).stdout);
+  assert(blockedGeminiOutcome.outcome.label === "blocked_for_input", "blocked provider runs should get a distinct outcome");
+  assert(blockedGeminiOutcome.outcome.risks.includes("provider_needs_input"), "blocked provider outcome should expose input risk");
+  const blockedGeminiEval = JSON.parse(run("node", [cliPath, "eval", blockedGeminiSummary.id, "--cwd", tempRoot]).stdout);
+  assert(blockedGeminiEval.routing.blockers.includes("run_not_ok"), "blocked provider runs should not become routing evidence");
+  assert(blockedGeminiEval.signals.output_signal === "needs_input", "eval should expose output signal");
+  const softBlockedGeminiRun = spawnSync("node", [
+    cliPath,
+    "run",
+    "soft provider approval",
+    "--runner",
+    "gemini",
+    "--cwd",
+    tempRoot
+  ], {
+    encoding: "utf8",
+    env: { ...process.env, PATH: `${tempBin}:${process.env.PATH ?? ""}` }
+  });
+  assert(softBlockedGeminiRun.status === 0, "soft provider approval run should record");
+  const softBlockedGeminiSummary = JSON.parse(softBlockedGeminiRun.stdout);
+  assert(softBlockedGeminiSummary.status === "blocked", "soft approval wording should be blocked");
+  assert(softBlockedGeminiSummary.status_reason === "provider_needs_input", "soft approval wording should classify as needing input");
+
+  const planChangedGeminiRun = spawnSync("node", [
+    cliPath,
+    "run",
+    "plan mode edits",
+    "--runner",
+    "gemini",
+    "--cwd",
+    tempRoot
+  ], {
+    encoding: "utf8",
+    env: { ...process.env, PATH: `${tempBin}:${process.env.PATH ?? ""}` }
+  });
+  assert(planChangedGeminiRun.status === 0, "plan-mode file changes should still record a run");
+  const planChangedGeminiSummary = JSON.parse(planChangedGeminiRun.stdout);
+  assert(planChangedGeminiSummary.status === "failed", "plan-mode file changes should fail the run");
+  assert(planChangedGeminiSummary.status_reason === "provider_plan_changed_files", "plan-mode file changes should get a safety-specific reason");
+  assert(planChangedGeminiSummary.output_signal.kind === "plan_changed_files", "plan-mode write violation should expose output signal");
+  assert(planChangedGeminiSummary.changed_files.includes("plan-mode-edited.txt"), "plan-mode write violation should report changed file");
+  const planChangedGeminiOutcome = JSON.parse(run("node", [cliPath, "outcome", planChangedGeminiSummary.id, "--cwd", tempRoot]).stdout);
+  assert(planChangedGeminiOutcome.outcome.risks.includes("provider_plan_changed_files"), "plan-mode write violation should be an outcome risk");
 
   const checkedGeminiRun = spawnSync("node", [
     cliPath,
@@ -1115,6 +1231,23 @@ async function installMockGemini(binDir) {
     mockPath,
     [
       "#!/bin/sh",
+      "case \" $* \" in",
+      "  *\"plan mode edits\"*)",
+      "    printf 'I changed a file even though the adapter requested plan mode.\\n'",
+      "    printf 'changed\\n' > plan-mode-edited.txt",
+      "    exit 0",
+      "    ;;",
+      "  *\"needs provider approval\"*)",
+      "    printf 'I found a scoped implementation approach.\\n'",
+      "    printf 'Do you agree with this approach? If so, I will draft the implementation plan.\\n'",
+      "    exit 0",
+      "    ;;",
+      "  *\"soft provider approval\"*)",
+      "    printf 'Does this targeted standardization approach align with your expectations?\\n'",
+      "    printf 'Let me know and I will write up the formal plan.\\n'",
+      "    exit 0",
+      "    ;;",
+      "esac",
       "printf 'mock gemini received:'",
       "for arg in \"$@\"; do printf ' [%s]' \"$arg\"; done",
       "printf '\\n'",

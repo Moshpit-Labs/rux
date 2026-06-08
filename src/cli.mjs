@@ -3,7 +3,7 @@
 import { appendFile, mkdir, readFile, readdir, stat, writeFile } from "node:fs/promises";
 import { existsSync } from "node:fs";
 import { basename, join, relative, resolve } from "node:path";
-import { spawnSync } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { CLI_NAME, NPM_ORG, PRODUCT_NAME, STORE_DIR } from "./identity.mjs";
 
@@ -110,7 +110,7 @@ function printHelp() {
 Usage:
   ${CLI_NAME} runners
   ${CLI_NAME} init [--cwd PATH] [--force]
-  ${CLI_NAME} run "<task>" [--runner fake|claude|codex|gemini] [--roster solo|pair|repair|plan-code-review] [--model NAME] [--effort LEVEL] [--cost-hint USD] [--cwd PATH] [--check "COMMAND"] [--timeout-ms N]
+  ${CLI_NAME} run "<task>" [--runner fake|claude|codex|gemini] [--roster solo|pair|repair|plan-code-review] [--provider-mode plan|write] [--model NAME] [--effort LEVEL] [--cost-hint USD] [--cwd PATH] [--check "COMMAND"] [--timeout-ms N]
   ${CLI_NAME} provider-smoke --runner claude|codex|gemini [--model NAME] [--effort LEVEL] [--cwd PATH] [--timeout-ms N]
   ${CLI_NAME} import --from PATH [--runner claude|codex|gemini|unknown] [--task "TEXT"] [--model NAME] [--effort LEVEL] [--cost-hint USD] [--cwd PATH]
   ${CLI_NAME} plan "<task>" [--runner fake|claude|codex|gemini] [--roster solo|pair|repair|plan-code-review] [--model NAME] [--effort LEVEL] [--cost-hint USD] [--cwd PATH] [--check "COMMAND"]
@@ -917,15 +917,32 @@ async function captureRunAttempt({
   const startedAt = new Date();
   const beforeStatus = gitStatusMap(cwd);
   const beforeRepo = gitSnapshot(cwd, beforeStatus);
-  const transcript = await executeRunner({ runner, task, cwd, options });
+  const transcript = await executeRunner({ runner, task, cwd, options, role, purpose });
   const check = checkCommand ? { source: "run_check", ...runCheck(checkCommand, cwd) } : null;
   const afterStatus = gitStatusMap(cwd);
   const afterRepo = gitSnapshot(cwd, afterStatus);
   const changedFiles = gitChangedFilesBetween(beforeStatus, afterStatus);
   const endedAt = new Date();
+  let outputSignal = classifyProviderOutputSignal({ runner, purpose, role, task, transcript, changedFiles, check });
+  const executionMode = runner === "fake" ? "internal" : providerExecutionMode(options, { role, purpose });
   let status = check && check.exit_code !== 0 ? "failed" : transcript.status;
   let statusReason = classifyRunStatus({ transcript, check, failOnChangedFiles, changedFiles });
   const runNotes = [...notes];
+  if (status === "ok" && executionMode === "plan" && purpose === "task_run" && runner !== "fake" && changedFiles.length > 0) {
+    outputSignal = {
+      kind: "plan_changed_files",
+      status: "failed",
+      reason: "provider_plan_changed_files",
+      note: "Provider was invoked in plan mode but changed files. Rux recorded the run as failed because the adapter violated the requested safety mode."
+    };
+    status = "failed";
+    statusReason = "provider_plan_changed_files";
+    runNotes.push(outputSignal.note);
+  } else if (outputSignal.status === "blocked" && status === "ok") {
+    status = "blocked";
+    statusReason = outputSignal.reason;
+    runNotes.push(outputSignal.note);
+  }
   if (failOnChangedFiles && changedFiles.length > 0) {
     status = "failed";
     statusReason = "provider_smoke_changed_files";
@@ -964,6 +981,7 @@ async function captureRunAttempt({
     checks: check ? [check] : [],
     human_verdict: null,
     cost_hint: metadata.cost_hint ?? null,
+    output_signal: outputSignal,
     adapter: buildAdapterRecord(transcript.adapter, metadata),
     replay,
     notes: runNotes
@@ -1153,10 +1171,12 @@ async function executeRoster({ roster, task, cwd, options, runnerByRole, metadat
   return run;
 }
 
-async function executeRunner({ runner, task, cwd, options }) {
+async function executeRunner({ runner, task, cwd, options, role, purpose }) {
   if (runner === "fake") {
     return {
       status: "ok",
+      stdout: "",
+      stderr: "",
       adapter: buildAdapterInvocation({
         runner: "fake",
         command: "(built-in)",
@@ -1178,54 +1198,137 @@ async function executeRunner({ runner, task, cwd, options }) {
   }
 
   if (runner === "claude") {
-    return executeClaudeRunner({ task, cwd, options });
+    return executeClaudeRunner({ task, cwd, options, role, purpose });
   }
 
   if (runner === "codex") {
-    return executeCodexRunner({ task, cwd, options });
+    return executeCodexRunner({ task, cwd, options, role, purpose });
   }
 
   if (runner === "gemini") {
-    return executeGeminiRunner({ task, cwd, options });
+    return executeGeminiRunner({ task, cwd, options, role, purpose });
   }
 
   throw new Error(`${runner} runner is detected but not implemented yet. Run "rux runners" to see supported local runners.`);
 }
 
-function executeClaudeRunner({ task, cwd, options }) {
+function runProviderProcess({ command, args, cwd, timeoutMs }) {
+  const startedAt = new Date();
+  const maxBufferBytes = 20 * 1024 * 1024;
+  let stdout = "";
+  let stderr = "";
+  let timedOut = false;
+  let spawnError = null;
+  let settled = false;
+  let killedForBuffer = false;
+
+  return new Promise((resolveProcess) => {
+    const child = spawn(command, args, {
+      cwd,
+      env: process.env,
+      stdio: ["ignore", "pipe", "pipe"]
+    });
+
+    const timer = setTimeout(() => {
+      timedOut = true;
+      child.kill("SIGTERM");
+    }, timeoutMs);
+
+    const finish = (exitCode) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      const endedAt = new Date();
+      resolveProcess({
+        startedAt,
+        endedAt,
+        exitCode,
+        timedOut,
+        stdout,
+        stderr,
+        error: spawnError
+          ? `${spawnError.name}: ${spawnError.message}`
+          : killedForBuffer
+            ? "Error: provider output exceeded 20 MiB buffer"
+            : null
+      });
+    };
+
+    const appendOutput = (streamName, chunk) => {
+      const text = chunk.toString("utf8");
+      if (streamName === "stdout") {
+        stdout += text;
+      } else {
+        stderr += text;
+      }
+
+      process.stderr.write(text);
+
+      if (byteLength(stdout) + byteLength(stderr) > maxBufferBytes && !killedForBuffer) {
+        killedForBuffer = true;
+        child.kill("SIGTERM");
+      }
+    };
+
+    child.stdout.on("data", (chunk) => appendOutput("stdout", chunk));
+    child.stderr.on("data", (chunk) => appendOutput("stderr", chunk));
+    child.on("error", (error) => {
+      spawnError = error;
+      finish(null);
+    });
+    child.on("close", (code) => {
+      finish(typeof code === "number" ? code : null);
+    });
+  });
+}
+
+function providerExecutionMode(options, { role, purpose } = {}) {
+  if (purpose === "provider_smoke" || role === "reviewer" || role === "planner") {
+    return "plan";
+  }
+
+  const raw = options["provider-mode"] ?? options.mode ?? "plan";
+  if (raw === true) {
+    throw new Error("--provider-mode requires plan or write");
+  }
+
+  const mode = String(raw).trim();
+  if (mode !== "plan" && mode !== "write") {
+    throw new Error("--provider-mode must be plan or write");
+  }
+
+  return mode;
+}
+
+async function executeClaudeRunner({ task, cwd, options, role, purpose }) {
   const timeoutMs = Number(options["timeout-ms"] ?? 10 * 60 * 1000);
   if (!Number.isFinite(timeoutMs) || timeoutMs <= 0) {
     throw new Error("--timeout-ms must be a positive number");
   }
 
+  const providerMode = providerExecutionMode(options, { role, purpose });
+  const permissionMode = providerMode === "write" ? "acceptEdits" : "plan";
   const args = [
     "--permission-mode",
-    "plan",
+    permissionMode,
     "--output-format",
     "text",
     "-p",
     task
   ];
 
-  const startedAt = new Date();
-  const result = spawnSync("claude", args, {
-    cwd,
-    encoding: "utf8",
-    timeout: timeoutMs,
-    maxBuffer: 20 * 1024 * 1024,
-    env: process.env
-  });
-  const endedAt = new Date();
-
-  const timedOut = Boolean(result.error && result.error.code === "ETIMEDOUT");
-  const exitCode = typeof result.status === "number" ? result.status : null;
+  const result = await runProviderProcess({ command: "claude", args, cwd, timeoutMs });
+  const timedOut = result.timedOut;
+  const exitCode = result.exitCode;
   const status = timedOut ? "timeout" : exitCode === 0 ? "ok" : "failed";
   const stdout = result.stdout ?? "";
   const stderr = result.stderr ?? "";
-  const error = result.error ? `${result.error.name}: ${result.error.message}` : "";
+  const error = result.error ?? "";
 
   return {
     status,
+    stdout,
+    stderr,
     adapter: buildAdapterInvocation({
       runner: "claude",
       command: "claude",
@@ -1240,8 +1343,8 @@ function executeClaudeRunner({ task, cwd, options }) {
       `runner: claude`,
       `cwd: ${cwd}`,
       `command: claude ${args.map(shellQuote).join(" ")}`,
-      `started_at: ${startedAt.toISOString()}`,
-      `ended_at: ${endedAt.toISOString()}`,
+      `started_at: ${result.startedAt.toISOString()}`,
+      `ended_at: ${result.endedAt.toISOString()}`,
       `exit_code: ${exitCode ?? ""}`,
       `status: ${status}`,
       "",
@@ -1256,16 +1359,18 @@ function executeClaudeRunner({ task, cwd, options }) {
   };
 }
 
-function executeCodexRunner({ task, cwd, options }) {
+async function executeCodexRunner({ task, cwd, options, role, purpose }) {
   const timeoutMs = Number(options["timeout-ms"] ?? 10 * 60 * 1000);
   if (!Number.isFinite(timeoutMs) || timeoutMs <= 0) {
     throw new Error("--timeout-ms must be a positive number");
   }
 
+  const providerMode = providerExecutionMode(options, { role, purpose });
+  const sandboxMode = providerMode === "write" ? "workspace-write" : "read-only";
   const args = [
     "exec",
     "--sandbox",
-    "read-only",
+    sandboxMode,
     "--color",
     "never",
     "-C",
@@ -1273,25 +1378,18 @@ function executeCodexRunner({ task, cwd, options }) {
     task
   ];
 
-  const startedAt = new Date();
-  const result = spawnSync("codex", args, {
-    cwd,
-    encoding: "utf8",
-    timeout: timeoutMs,
-    maxBuffer: 20 * 1024 * 1024,
-    env: process.env
-  });
-  const endedAt = new Date();
-
-  const timedOut = Boolean(result.error && result.error.code === "ETIMEDOUT");
-  const exitCode = typeof result.status === "number" ? result.status : null;
+  const result = await runProviderProcess({ command: "codex", args, cwd, timeoutMs });
+  const timedOut = result.timedOut;
+  const exitCode = result.exitCode;
   const status = timedOut ? "timeout" : exitCode === 0 ? "ok" : "failed";
   const stdout = result.stdout ?? "";
   const stderr = result.stderr ?? "";
-  const error = result.error ? `${result.error.name}: ${result.error.message}` : "";
+  const error = result.error ?? "";
 
   return {
     status,
+    stdout,
+    stderr,
     adapter: buildAdapterInvocation({
       runner: "codex",
       command: "codex",
@@ -1306,8 +1404,8 @@ function executeCodexRunner({ task, cwd, options }) {
       `runner: codex`,
       `cwd: ${cwd}`,
       `command: codex ${args.map(shellQuote).join(" ")}`,
-      `started_at: ${startedAt.toISOString()}`,
-      `ended_at: ${endedAt.toISOString()}`,
+      `started_at: ${result.startedAt.toISOString()}`,
+      `ended_at: ${result.endedAt.toISOString()}`,
       `exit_code: ${exitCode ?? ""}`,
       `status: ${status}`,
       "",
@@ -1322,15 +1420,17 @@ function executeCodexRunner({ task, cwd, options }) {
   };
 }
 
-function executeGeminiRunner({ task, cwd, options }) {
+async function executeGeminiRunner({ task, cwd, options, role, purpose }) {
   const timeoutMs = Number(options["timeout-ms"] ?? 10 * 60 * 1000);
   if (!Number.isFinite(timeoutMs) || timeoutMs <= 0) {
     throw new Error("--timeout-ms must be a positive number");
   }
 
+  const providerMode = providerExecutionMode(options, { role, purpose });
+  const approvalMode = providerMode === "write" ? "auto_edit" : "plan";
   const args = [
     "--approval-mode",
-    "plan",
+    approvalMode,
     "--output-format",
     "text",
     "--skip-trust",
@@ -1338,25 +1438,18 @@ function executeGeminiRunner({ task, cwd, options }) {
     task
   ];
 
-  const startedAt = new Date();
-  const result = spawnSync("gemini", args, {
-    cwd,
-    encoding: "utf8",
-    timeout: timeoutMs,
-    maxBuffer: 20 * 1024 * 1024,
-    env: process.env
-  });
-  const endedAt = new Date();
-
-  const timedOut = Boolean(result.error && result.error.code === "ETIMEDOUT");
-  const exitCode = typeof result.status === "number" ? result.status : null;
+  const result = await runProviderProcess({ command: "gemini", args, cwd, timeoutMs });
+  const timedOut = result.timedOut;
+  const exitCode = result.exitCode;
   const status = timedOut ? "timeout" : exitCode === 0 ? "ok" : "failed";
   const stdout = result.stdout ?? "";
   const stderr = result.stderr ?? "";
-  const error = result.error ? `${result.error.name}: ${result.error.message}` : "";
+  const error = result.error ?? "";
 
   return {
     status,
+    stdout,
+    stderr,
     adapter: buildAdapterInvocation({
       runner: "gemini",
       command: "gemini",
@@ -1371,8 +1464,8 @@ function executeGeminiRunner({ task, cwd, options }) {
       `runner: gemini`,
       `cwd: ${cwd}`,
       `command: gemini ${args.map(shellQuote).join(" ")}`,
-      `started_at: ${startedAt.toISOString()}`,
-      `ended_at: ${endedAt.toISOString()}`,
+      `started_at: ${result.startedAt.toISOString()}`,
+      `ended_at: ${result.endedAt.toISOString()}`,
       `exit_code: ${exitCode ?? ""}`,
       `status: ${status}`,
       "",
@@ -1387,6 +1480,57 @@ function executeGeminiRunner({ task, cwd, options }) {
   };
 }
 
+function classifyProviderOutputSignal({ runner, purpose, role, task, transcript, changedFiles, check }) {
+  const emptySignal = {
+    kind: "none",
+    status: null,
+    reason: null,
+    note: null
+  };
+
+  if (runner === "fake" || purpose !== "task_run" || transcript.status !== "ok") {
+    return emptySignal;
+  }
+
+  if (check && check.exit_code !== 0) {
+    return emptySignal;
+  }
+
+  const output = `${transcript.stdout ?? ""}\n${transcript.stderr ?? ""}`;
+  if (providerAskedForInput(output)) {
+    return {
+      kind: "needs_input",
+      status: "blocked",
+      reason: "provider_needs_input",
+      note: "Provider output asked for confirmation or more input. Rux recorded the run but did not treat it as completed."
+    };
+  }
+
+  const roleNeedsFiles = ["runner", "implementer", "attempt", "coder"].includes(role ?? "runner");
+  if (roleNeedsFiles && changedFiles.length === 0 && isChangeLikeTask(task) && providerLooksPlanOnly(output)) {
+    return {
+      kind: "plan_only",
+      status: "blocked",
+      reason: "provider_plan_only",
+      note: "Provider output looked like a plan/proposal for a change task and no files changed. Rux recorded the run but did not treat it as completed."
+    };
+  }
+
+  return emptySignal;
+}
+
+function providerAskedForInput(output) {
+  return /\b(do you (agree|approve|confirm|want)|does this .* align|would you like me to|should i proceed|let me know( if (you|you'd) (like|want)| and i will)|please confirm|awaiting (your )?(approval|confirmation)|needs approval|requires approval|if so, i will|if you approve|once you confirm|reply with)\b/i.test(output);
+}
+
+function providerLooksPlanOnly(output) {
+  return /\b(plan|proposal|strategy|approach|recommendation|i will|i would|next steps|implementation plan)\b/i.test(output);
+}
+
+function isChangeLikeTask(task) {
+  return /\b(add|adjust|align|build|change|clean up|cleanup|create|delete|edit|fix|implement|make|migrate|modify|refactor|remove|rename|repair|replace|standardize|update|wire|write)\b/i.test(task);
+}
+
 function classifyRunStatus({ transcript, check, failOnChangedFiles, changedFiles }) {
   if (failOnChangedFiles && changedFiles.length > 0) return "provider_smoke_changed_files";
   if (check && check.exit_code !== 0) return "check_failed";
@@ -1398,8 +1542,12 @@ function classifyRunStatus({ transcript, check, failOnChangedFiles, changedFiles
 
 function classifyRosterStatus(children) {
   if (children.some((child) => child.status_reason === "check_failed")) return "child_check_failed";
+  if (children.some((child) => child.status_reason === "provider_plan_changed_files")) return "child_provider_plan_changed_files";
   if (children.some((child) => child.status_reason === "provider_timeout")) return "child_provider_timeout";
   if (children.some((child) => child.status_reason === "provider_failed")) return "child_provider_failed";
+  if (children.some((child) => child.status_reason === "provider_needs_input")) return "child_provider_needs_input";
+  if (children.some((child) => child.status_reason === "provider_plan_only")) return "child_provider_plan_only";
+  if (children.some((child) => child.status === "blocked")) return "child_blocked";
   if (children.some((child) => child.status !== "ok")) return "child_failed";
   return "completed";
 }
@@ -2151,7 +2299,7 @@ function buildRunCommand({ task, runner, roster, options, model = null, effort =
     parts.push("--effort", effort);
   }
 
-  for (const key of ["cost-hint", "check", "planner-runner", "coder-runner", "implementer-runner", "reviewer-runner", "repair-runner", "timeout-ms"]) {
+  for (const key of ["cost-hint", "check", "provider-mode", "planner-runner", "coder-runner", "implementer-runner", "reviewer-runner", "repair-runner", "timeout-ms"]) {
     const value = options[key];
     if (value !== undefined && value !== true) {
       parts.push(`--${key}`, String(value));
@@ -2749,6 +2897,7 @@ function summarizeRun(run) {
     child_run_ids: run.child_run_ids ?? [],
     transcript_path: run.transcript_path,
     replay: replayMetadataForRun(run),
+    output_signal: run.output_signal ?? null,
     adapter: run.adapter ?? null,
     repo: run.repo ?? null,
     changed_files: run.changed_files,
@@ -2853,6 +3002,8 @@ function aggregateRosterStatus(roster, children) {
   if (roster === "repair") {
     return children[children.length - 1]?.status ?? "failed";
   }
+  if (children.some((child) => child.status === "failed")) return "failed";
+  if (children.some((child) => child.status === "blocked")) return "blocked";
   return children.every((child) => child.status === "ok") ? "ok" : "failed";
 }
 
@@ -2952,6 +3103,7 @@ function recommendationBlockers(run, verdict, marks = []) {
   if (run.source !== "live") blockers.push("not_live");
   if (run.confidence !== "high") blockers.push("not_high_confidence");
   if (run.runner === "fake") blockers.push("fake_runner");
+  if (run.status !== "ok") blockers.push("run_not_ok");
   if (hasLifecycleMark(marks, "reverted")) blockers.push("reverted_downstream");
   if (checkChangedFiles(run).length > 0) blockers.push("check_modified_files");
   if (run.purpose !== "provider_smoke" && !verdict && (!Array.isArray(run.checks) || run.checks.length === 0)) blockers.push("unlabeled");
@@ -3207,6 +3359,23 @@ function summarizeOutcome(run, children, verdict, marks = []) {
     };
   }
 
+  if (run.status === "blocked") {
+    return {
+      label: "blocked_for_input",
+      confidence: "high",
+      source: "run_status",
+      score: 0,
+      reason: run.status_reason === "provider_needs_input"
+        ? "Provider asked for confirmation or more input before completing the task."
+        : "Provider produced a plan/proposal instead of completing the task.",
+      verdict: null,
+      marks: marks.map(formatLifecycleMark),
+      checks: outcomeCheckSummary(checks, failedChecks, childChecks, failedChildChecks),
+      release: { provider_smoke_evidence: false },
+      risks: outcomeRisks(run, children, verdict, marks)
+    };
+  }
+
   if (run.status !== "ok") {
     return {
       label: "run_failed",
@@ -3259,6 +3428,10 @@ function outcomeRisks(run, children, verdict, marks = []) {
   if (run.source !== "live") risks.push("not_live");
   if (run.confidence !== "high") risks.push("not_high_confidence");
   if (run.runner === "fake") risks.push("fake_runner");
+  if (run.status === "blocked") risks.push("blocked_run");
+  if (run.status_reason === "provider_needs_input") risks.push("provider_needs_input");
+  if (run.status_reason === "provider_plan_only") risks.push("provider_plan_only");
+  if (run.status_reason === "provider_plan_changed_files") risks.push("provider_plan_changed_files");
   if (checkChangedFiles(run).length > 0) risks.push("check_modified_files");
   if (Array.isArray(run.changed_files) && run.changed_files.length > 10) risks.push("large_change_surface");
   if (children.some((child) => child.status !== "ok")) risks.push("child_run_failed");
@@ -3333,6 +3506,7 @@ function evaluateRunRecord(run, children, verdicts, marksByRun = new Map()) {
       adapter_stderr_signal: stderrSignal?.level ?? null,
       adapter_stderr_reason: stderrSignal?.reason ?? null,
       repo_snapshot: Boolean(run.repo),
+      output_signal: run.output_signal?.kind ?? null,
       repo_dirty_before: run.repo?.before?.dirty_entries ?? run.repo?.imported_at?.dirty_entries ?? null,
       repo_dirty_after: run.repo?.after?.dirty_entries ?? null,
       checks_total: checks.length,

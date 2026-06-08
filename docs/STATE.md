@@ -24,6 +24,9 @@ Rux is a public coding-agent run ledger that records real outcomes first, then u
 - Claude runner capture is implemented conservatively: non-interactive `claude -p`, text output, and `--permission-mode plan`.
 - Codex runner capture is implemented conservatively against the installed CLI: non-interactive `codex exec`, read-only sandbox, and color off.
 - Gemini runner capture is implemented conservatively against the installed CLI: non-interactive `gemini -p`, text output, `--approval-mode plan`, and `--skip-trust`.
+- `rux run` now supports explicit `--provider-mode plan|write`. The default remains `plan`; `write` maps to Claude `acceptEdits`, Codex `workspace-write`, and Gemini `auto_edit`. Planner/reviewer/provider-smoke legs remain plan-only.
+- Provider stdout/stderr is mirrored to Rux stderr while the provider runs, while Rux stdout stays JSON for scripts.
+- Provider output is classified before a run can count as completed. Approval questions become `status: blocked` with `status_reason: provider_needs_input`. If a provider changes files while Rux requested plan mode, the run becomes `status: failed` with `status_reason: provider_plan_changed_files`.
 - `--model`, `--effort`, and `--cost-hint` are recorded as run metadata. They are not passed to provider CLIs until adapter-specific flag mapping is verified.
 - `rux provider-smoke --runner claude|codex|gemini` records explicit release evidence and fails the smoke run if files change. Provider-smoke runs are not routing evidence and cannot receive checks, verdicts, or lifecycle marks.
 - Real provider-smoke evidence is now recorded in the Rux store for Claude (`20260607T180537Z-a133edf2`), Codex (`20260607T180353Z-747ebaa4`), and Gemini (`20260607T180507Z-5955c823`). Older Runbook-named evidence was migrated into `.rux/` as historical continuity data, and the legacy `.runbook/` directory has been removed.
