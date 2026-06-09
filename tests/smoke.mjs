@@ -33,6 +33,7 @@ try {
   assert(helpRun.stdout.includes("rux run"), "--help should include run command");
   assert(helpRun.stdout.includes("rux check"), "--help should include post-run check command");
   assert(helpRun.stdout.includes("rux report"), "--help should include feedback report command");
+  assert(helpRun.stdout.includes("--allow-dirty"), "--help should include dirty worktree override");
   assert(helpRun.stdout.includes("rux release-check [--cwd PATH] [--strict]"), "--help should include strict release-check flag");
   const shortHelpRun = run("node", [cliPath, "-h"]);
   assert(shortHelpRun.stdout.includes("Usage:"), "-h should print usage");
@@ -57,6 +58,60 @@ try {
   assert(unknownFlagRun.status !== 0, "unknown flags should fail before running providers");
   assert(unknownFlagRun.stderr.includes("Unknown option --privoder-mode"), "unknown flag error should name the bad flag");
   assert(unknownFlagRun.stderr.includes("Did you mean --provider-mode?"), "unknown flag error should suggest provider-mode");
+
+  const dirtyGuardRoot = join(tempRoot, "dirty-guard");
+  await mkdir(dirtyGuardRoot, { recursive: true });
+  run("git", ["init"], dirtyGuardRoot);
+  await writeFile(join(dirtyGuardRoot, "README.md"), "# Dirty Guard\n", "utf8");
+  run("git", ["add", "README.md"], dirtyGuardRoot);
+  run("git", ["commit", "-m", "initial"], dirtyGuardRoot, {
+    GIT_AUTHOR_NAME: "Rux Smoke",
+    GIT_AUTHOR_EMAIL: "smoke@example.com",
+    GIT_COMMITTER_NAME: "Rux Smoke",
+    GIT_COMMITTER_EMAIL: "smoke@example.com"
+  });
+  await writeFile(join(dirtyGuardRoot, "dirty.txt"), "uncommitted\n", "utf8");
+  const dirtyProviderGuard = spawnSync("node", [
+    cliPath,
+    "run",
+    "dirty provider guard",
+    "--runner",
+    "codex",
+    "--cwd",
+    dirtyGuardRoot
+  ], {
+    encoding: "utf8",
+    env: { ...process.env, PATH: `${tempBin}:${process.env.PATH ?? ""}` }
+  });
+  assert(dirtyProviderGuard.status !== 0, "real provider runs should refuse dirty worktrees by default");
+  assert(dirtyProviderGuard.stderr.includes("Refusing to run real provider runner(s) codex in a dirty worktree"), "dirty guard should explain the refusal");
+  assert(dirtyProviderGuard.stderr.includes("dirty.txt"), "dirty guard should name dirty files");
+  const dirtyFakeRun = spawnSync("node", [
+    cliPath,
+    "run",
+    "dirty fake run",
+    "--runner",
+    "fake",
+    "--cwd",
+    dirtyGuardRoot
+  ], { encoding: "utf8" });
+  assert(dirtyFakeRun.status === 0, "fake runs should still work in dirty worktrees");
+  const dirtyOverrideRun = spawnSync("node", [
+    cliPath,
+    "run",
+    "dirty override run",
+    "--runner",
+    "codex",
+    "--allow-dirty",
+    "--cwd",
+    dirtyGuardRoot
+  ], {
+    encoding: "utf8",
+    env: { ...process.env, PATH: `${tempBin}:${process.env.PATH ?? ""}` }
+  });
+  assert(dirtyOverrideRun.status === 0, "--allow-dirty should explicitly bypass the provider dirty guard");
+  const dirtyOverrideSummary = JSON.parse(dirtyOverrideRun.stdout);
+  assert(dirtyOverrideSummary.replay.command.includes("--allow-dirty"), "dirty override should stay visible in replay metadata");
   const repoReleaseCheck = JSON.parse(run("node", [cliPath, "release-check"], repoRoot).stdout);
   assert(repoReleaseCheck.identity.product === "Rux", "release-check should expose current product identity");
   assert(repoReleaseCheck.identity.cli === "rux", "release-check should expose current CLI identity");
@@ -209,13 +264,13 @@ try {
     transcript_export_default: "omit",
     self_modification: "proposal_only"
   }, null, 2), "utf8");
-  const smokeOnlyGemini = spawnSync("node", [cliPath, "provider-smoke", "--runner", "gemini", "--cwd", smokeOnlyRoot], {
+  const smokeOnlyGemini = spawnSync("node", [cliPath, "provider-smoke", "--runner", "gemini", "--allow-dirty", "--cwd", smokeOnlyRoot], {
     encoding: "utf8",
     env: { ...process.env, PATH: `${tempBin}:${process.env.PATH ?? ""}` }
   });
   assert(smokeOnlyGemini.status === 0, "smoke-only gemini provider smoke should complete");
   const smokeOnlyGeminiSummary = JSON.parse(smokeOnlyGemini.stdout);
-  const smokeOnlyCodex = spawnSync("node", [cliPath, "provider-smoke", "--runner", "codex", "--cwd", smokeOnlyRoot], {
+  const smokeOnlyCodex = spawnSync("node", [cliPath, "provider-smoke", "--runner", "codex", "--allow-dirty", "--cwd", smokeOnlyRoot], {
     encoding: "utf8",
     env: { ...process.env, PATH: `${tempBin}:${process.env.PATH ?? ""}` }
   });
@@ -283,6 +338,7 @@ try {
     "codex release evidence mutation guard",
     "--runner",
     "codex",
+    "--allow-dirty",
     "--cwd",
     mutatingOnlyRoot
   ], {
@@ -537,6 +593,7 @@ try {
     "guard",
     "--runner",
     "claude",
+    "--allow-dirty",
     "--model",
     "claude-sonnet-smoke",
     "--effort",
@@ -580,6 +637,7 @@ try {
     "write claude guard",
     "--runner",
     "claude",
+    "--allow-dirty",
     "--provider-mode",
     "write",
     "--cwd",
@@ -615,7 +673,7 @@ try {
   assert(claudeEval.signals.adapter_stdout_bytes > 0, "eval should include adapter output size");
   assert(claudeEval.signals.adapter_stderr_signal === "none", "eval should include adapter stderr signal");
 
-  const codexRun = spawnSync("node", [cliPath, "run", "codex guard", "--runner", "codex", "--cwd", tempRoot], {
+  const codexRun = spawnSync("node", [cliPath, "run", "codex guard", "--runner", "codex", "--allow-dirty", "--cwd", tempRoot], {
     encoding: "utf8",
     env: { ...process.env, PATH: `${tempBin}:${process.env.PATH ?? ""}` }
   });
@@ -671,6 +729,7 @@ try {
     "codex write guard",
     "--runner",
     "codex",
+    "--allow-dirty",
     "--provider-mode",
     "write",
     "--cwd",
@@ -684,7 +743,7 @@ try {
   const codexWriteTranscript = await readFile(join(tempRoot, codexWriteSummary.transcript_path), "utf8");
   assert(codexWriteTranscript.includes("exec --sandbox workspace-write"), "codex write mode should use workspace-write sandbox");
 
-  const geminiRun = spawnSync("node", [cliPath, "run", "gemini guard", "--runner", "gemini", "--cwd", tempRoot], {
+  const geminiRun = spawnSync("node", [cliPath, "run", "gemini guard", "--runner", "gemini", "--allow-dirty", "--cwd", tempRoot], {
     encoding: "utf8",
     env: { ...process.env, PATH: `${tempBin}:${process.env.PATH ?? ""}` }
   });
@@ -703,6 +762,7 @@ try {
     "gemini write guard",
     "--runner",
     "gemini",
+    "--allow-dirty",
     "--provider-mode",
     "write",
     "--cwd",
@@ -722,6 +782,7 @@ try {
     "needs provider approval",
     "--runner",
     "gemini",
+    "--allow-dirty",
     "--cwd",
     tempRoot
   ], {
@@ -747,6 +808,7 @@ try {
     "soft provider approval",
     "--runner",
     "gemini",
+    "--allow-dirty",
     "--cwd",
     tempRoot
   ], {
@@ -764,6 +826,7 @@ try {
     "plan mode edits",
     "--runner",
     "gemini",
+    "--allow-dirty",
     "--cwd",
     tempRoot
   ], {
@@ -786,6 +849,7 @@ try {
     "gemini checked guard",
     "--runner",
     "gemini",
+    "--allow-dirty",
     "--cwd",
     tempRoot,
     "--check",
@@ -808,6 +872,7 @@ try {
     "codex failed post-run check guard",
     "--runner",
     "codex",
+    "--allow-dirty",
     "--cwd",
     tempRoot
   ], {
@@ -838,6 +903,7 @@ try {
     "codex mutating post-run check guard",
     "--runner",
     "codex",
+    "--allow-dirty",
     "--cwd",
     tempRoot
   ], {
@@ -870,7 +936,7 @@ try {
   assert(preSmokeReleaseCheck.gates.find((gate) => gate.name === "codex_smoke_evidence")?.ok === false, "release-check should require explicit codex provider-smoke evidence");
   assert(preSmokeReleaseCheck.gates.find((gate) => gate.name === "gemini_smoke_evidence")?.ok === false, "release-check should require explicit gemini provider-smoke evidence");
 
-  const claudeProviderSmoke = spawnSync("node", [cliPath, "provider-smoke", "--runner", "claude", "--cwd", tempRoot], {
+  const claudeProviderSmoke = spawnSync("node", [cliPath, "provider-smoke", "--runner", "claude", "--allow-dirty", "--cwd", tempRoot], {
     encoding: "utf8",
     env: { ...process.env, PATH: `${tempBin}:${process.env.PATH ?? ""}` }
   });
@@ -918,7 +984,7 @@ try {
   assert(providerSmokeCheck.status !== 0, "provider-smoke runs should reject post-run checks");
   assert(providerSmokeCheck.stderr.includes("adapter readiness only"), "provider-smoke check rejection should explain the boundary");
 
-  const codexProviderSmoke = spawnSync("node", [cliPath, "provider-smoke", "--runner", "codex", "--cwd", tempRoot], {
+  const codexProviderSmoke = spawnSync("node", [cliPath, "provider-smoke", "--runner", "codex", "--allow-dirty", "--cwd", tempRoot], {
     encoding: "utf8",
     env: { ...process.env, PATH: `${tempBin}:${process.env.PATH ?? ""}` }
   });
@@ -927,7 +993,7 @@ try {
   assert(codexProviderSmokeSummary.purpose === "provider_smoke", "codex provider smoke should mark purpose");
   assert(codexProviderSmokeSummary.changed_files.length === 0, "codex provider smoke should not report file changes");
 
-  const geminiProviderSmoke = spawnSync("node", [cliPath, "provider-smoke", "--runner", "gemini", "--cwd", tempRoot], {
+  const geminiProviderSmoke = spawnSync("node", [cliPath, "provider-smoke", "--runner", "gemini", "--allow-dirty", "--cwd", tempRoot], {
     encoding: "utf8",
     env: { ...process.env, PATH: `${tempBin}:${process.env.PATH ?? ""}` }
   });

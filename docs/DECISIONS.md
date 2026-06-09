@@ -57,3 +57,11 @@ This is the lightweight decision log for Rux. Add entries when a choice would ot
 - Reason: Early learning should be local, low-friction, and broader than failures. Confusing UX, adapter friction, ideas, and successful patterns are all useful evidence.
 - Consequence: Report events and markdown files live in the repo-local `.rux/` store, can link to run IDs and commands, and do not change source, routing policy, or external issue state.
 - Revisit when: the hosted/team layer is ready to sync curated reports into shared backlog workflows.
+
+## RUX-008: Dirty Worktrees Block Real Provider Runs
+
+- Date: 2026-06-09
+- Decision: Rux refuses to launch real provider CLIs when the target git worktree has uncommitted changes outside `.rux/`, unless the user passes `--allow-dirty`.
+- Reason: Dogfood found that running provider CLIs in a shared dirty checkout can race with concurrent agent/user work and destroy uncommitted changes.
+- Consequence: Users must commit, stash, revert, or explicitly override before real provider execution. Fake runs stay allowed in dirty trees for local ledger development.
+- Revisit when: worktree isolation is implemented and can safely run providers away from the user's active checkout.

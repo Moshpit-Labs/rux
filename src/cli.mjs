@@ -17,6 +17,7 @@ const rosterDefinitions = new Set(["solo", "pair", "repair", "plan-code-review"]
 const lifecycleMarkDefinitions = new Set(["reverted", "replayed", "accepted-downstream"]);
 const reportKindDefinitions = new Set(["bug", "ux", "adapter", "docs", "routing", "orchestration", "install", "idea", "success", "other"]);
 const knownOptionNames = new Set([
+  "allow-dirty",
   "check",
   "coder-runner",
   "command",
@@ -145,8 +146,8 @@ function printHelp() {
 Usage:
   ${CLI_NAME} runners
   ${CLI_NAME} init [--cwd PATH] [--force]
-  ${CLI_NAME} run "<task>" [--runner fake|claude|codex|gemini] [--roster solo|pair|repair|plan-code-review] [--provider-mode plan|write] [--model NAME] [--effort LEVEL] [--cost-hint USD] [--cwd PATH] [--check "COMMAND"] [--timeout-ms N]
-  ${CLI_NAME} provider-smoke --runner claude|codex|gemini [--model NAME] [--effort LEVEL] [--cwd PATH] [--timeout-ms N]
+  ${CLI_NAME} run "<task>" [--runner fake|claude|codex|gemini] [--roster solo|pair|repair|plan-code-review] [--provider-mode plan|write] [--model NAME] [--effort LEVEL] [--cost-hint USD] [--cwd PATH] [--check "COMMAND"] [--timeout-ms N] [--allow-dirty]
+  ${CLI_NAME} provider-smoke --runner claude|codex|gemini [--model NAME] [--effort LEVEL] [--cwd PATH] [--timeout-ms N] [--allow-dirty]
   ${CLI_NAME} import --from PATH [--runner claude|codex|gemini|unknown] [--task "TEXT"] [--model NAME] [--effort LEVEL] [--cost-hint USD] [--cwd PATH]
   ${CLI_NAME} plan "<task>" [--runner fake|claude|codex|gemini] [--roster solo|pair|repair|plan-code-review] [--model NAME] [--effort LEVEL] [--cost-hint USD] [--cwd PATH] [--check "COMMAND"]
   ${CLI_NAME} suggest "<task>" [--cwd PATH]
@@ -997,12 +998,22 @@ async function captureRunAttempt({
   role = null,
   purpose = "task_run",
   failOnChangedFiles = false,
+  skipDirtyGuard = false,
   notes = [],
   metadata = {},
   replay = null
 }) {
   const startedAt = new Date();
   const beforeStatus = gitStatusMap(cwd);
+  if (!skipDirtyGuard) {
+    assertProviderWorktreeReady({
+      cwd,
+      runners: [runner],
+      options,
+      statusMap: beforeStatus,
+      context: `${CLI_NAME} run --runner ${runner}`
+    });
+  }
   const beforeRepo = gitSnapshot(cwd, beforeStatus);
   const transcript = await executeRunner({ runner, task, cwd, options, role, purpose });
   const check = checkCommand ? { source: "run_check", ...runCheckWithProgress(checkCommand, cwd) } : null;
@@ -1082,6 +1093,13 @@ async function captureRunAttempt({
 async function executeRoster({ roster, task, cwd, options, runnerByRole, metadata }) {
   const parentStartedAt = new Date();
   const parentBeforeStatus = gitStatusMap(cwd);
+  assertProviderWorktreeReady({
+    cwd,
+    runners: Object.values(runnerByRole),
+    options,
+    statusMap: parentBeforeStatus,
+    context: `${CLI_NAME} run --roster ${roster}`
+  });
   const parentBeforeRepo = gitSnapshot(cwd, parentBeforeStatus);
   const parentId = createRunId(parentStartedAt);
   const parentReplayCommand = buildRunCommand({
@@ -1104,6 +1122,7 @@ async function executeRoster({ roster, task, cwd, options, runnerByRole, metadat
       checkCommand: options.check ? String(options.check) : null,
       parentId,
       role: "implementer",
+      skipDirtyGuard: true,
       metadata,
       replay: childReplayMetadata(parentId, parentReplayCommand)
     }));
@@ -1116,6 +1135,7 @@ async function executeRoster({ roster, task, cwd, options, runnerByRole, metadat
       checkCommand: null,
       parentId,
       role: "reviewer",
+      skipDirtyGuard: true,
       metadata,
       replay: childReplayMetadata(parentId, parentReplayCommand)
     }));
@@ -1129,6 +1149,7 @@ async function executeRoster({ roster, task, cwd, options, runnerByRole, metadat
       checkCommand: options.check ? String(options.check) : null,
       parentId,
       role: "attempt",
+      skipDirtyGuard: true,
       metadata,
       replay: childReplayMetadata(parentId, parentReplayCommand)
     });
@@ -1144,6 +1165,7 @@ async function executeRoster({ roster, task, cwd, options, runnerByRole, metadat
         checkCommand: options.check ? String(options.check) : null,
         parentId,
         role: "repairer",
+        skipDirtyGuard: true,
         metadata,
         replay: childReplayMetadata(parentId, parentReplayCommand)
       }));
@@ -1158,6 +1180,7 @@ async function executeRoster({ roster, task, cwd, options, runnerByRole, metadat
       checkCommand: null,
       parentId,
       role: "planner",
+      skipDirtyGuard: true,
       metadata,
       replay: childReplayMetadata(parentId, parentReplayCommand)
     }));
@@ -1170,6 +1193,7 @@ async function executeRoster({ roster, task, cwd, options, runnerByRole, metadat
       checkCommand: options.check ? String(options.check) : null,
       parentId,
       role: "coder",
+      skipDirtyGuard: true,
       metadata,
       replay: childReplayMetadata(parentId, parentReplayCommand)
     }));
@@ -1182,6 +1206,7 @@ async function executeRoster({ roster, task, cwd, options, runnerByRole, metadat
       checkCommand: null,
       parentId,
       role: "reviewer",
+      skipDirtyGuard: true,
       metadata,
       replay: childReplayMetadata(parentId, parentReplayCommand)
     }));
@@ -2404,6 +2429,9 @@ function buildRunCommand({ task, runner, roster, options, model = null, effort =
       parts.push(`--${key}`, String(value));
     }
   }
+  if (options["allow-dirty"] === true) {
+    parts.push("--allow-dirty");
+  }
 
   return parts.map(shellQuote).join(" ");
 }
@@ -2426,6 +2454,9 @@ function buildProviderSmokeCommand({ runner, options, model = null, effort = nul
   }
   if (options["timeout-ms"] !== undefined && options["timeout-ms"] !== true) {
     parts.push("--timeout-ms", String(options["timeout-ms"]));
+  }
+  if (options["allow-dirty"] === true) {
+    parts.push("--allow-dirty");
   }
 
   return parts.map(shellQuote).join(" ");
@@ -3005,6 +3036,26 @@ function gitStatusMap(cwd) {
     entries.set(file, status);
   }
   return entries;
+}
+
+function assertProviderWorktreeReady({ cwd, runners, options, statusMap, context }) {
+  const realRunners = unique(runners).filter((runner) => runner !== "fake");
+  if (realRunners.length === 0 || options["allow-dirty"] === true || statusMap.size === 0) {
+    return;
+  }
+
+  const files = [...statusMap.keys()].sort();
+  const shownFiles = files.slice(0, 12).join(", ");
+  const hiddenCount = files.length - 12;
+  const hiddenText = hiddenCount > 0 ? `, and ${hiddenCount} more` : "";
+  const runnerText = realRunners.join(", ");
+  throw new Error([
+    `Refusing to run real provider runner(s) ${runnerText} in a dirty worktree.`,
+    `Context: ${context}.`,
+    `Repo: ${cwd}.`,
+    `Dirty files: ${shownFiles}${hiddenText}.`,
+    "Commit, stash, or revert existing changes first, or rerun with --allow-dirty only when those changes are intentionally part of the provider context."
+  ].join(" "));
 }
 
 function gitChangedFilesBetween(beforeStatus, afterStatus) {

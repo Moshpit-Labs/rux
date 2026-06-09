@@ -63,6 +63,7 @@ mustInclude("docs/STANDARDS.md", standards, "weekly patch train");
 mustInclude("docs/DECISIONS.md", decisions, "RUX-001: Capture Before Routing");
 mustInclude("docs/DECISIONS.md", decisions, "RUX-006: Swami-Lite Docs");
 mustInclude("docs/DECISIONS.md", decisions, "RUX-007: Feedback Reports Before External Issue Automation");
+mustInclude("docs/DECISIONS.md", decisions, "RUX-008: Dirty Worktrees Block Real Provider Runs");
 
 const scripts = packageJson.scripts ?? {};
 if (!scripts["check:docs"] || !scripts["check:docs"].includes("scripts/check-docs.mjs")) {
