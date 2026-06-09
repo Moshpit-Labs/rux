@@ -7,12 +7,12 @@
   "type": "module",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/moshpit-india/rux.git"
+    "url": "git+https://github.com/Moshpit-Labs/rux.git"
   },
   "bugs": {
-    "url": "https://github.com/moshpit-india/rux/issues"
+    "url": "https://github.com/Moshpit-Labs/rux/issues"
   },
-  "homepage": "https://github.com/moshpit-india/rux#readme",
+  "homepage": "https://github.com/Moshpit-Labs/rux#readme",
   "publishConfig": {
     "access": "public"
   },
