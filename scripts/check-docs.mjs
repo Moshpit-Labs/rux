@@ -51,6 +51,10 @@ mustInclude("docs/VISION.md", vision, "Rux is the operating layer for agentic wo
 mustInclude("docs/VISION.md", vision, "The frontier is not access to models. The frontier is judgment.");
 mustInclude("docs/VISION.md", vision, "eval: which models, agents, modes, and effort levels work best for which tasks");
 mustInclude("docs/VISION.md", vision, "an orchestrator layer that designs the roster for the task and coordinates the work");
+mustInclude("docs/VISION.md", vision, "API-backed model routes");
+mustInclude("docs/VISION.md", vision, "Agent-backed tool routes");
+mustInclude("docs/VISION.md", vision, "Observe: ingest evidence from a tool already being used.");
+mustInclude("docs/VISION.md", vision, "open-source local engine plus hosted team memory");
 mustInclude("docs/VISION.md", vision, "Rux should meet users where they already work.");
 mustInclude("docs/VISION.md", vision, "Capture before routing.");
 mustInclude("docs/VISION.md", vision, "Final Frontier");

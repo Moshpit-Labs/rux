@@ -56,6 +56,29 @@ Rux should be that layer:
 
 The first versions can be humble. The destination is not.
 
+## Execution And Interface Strategy
+
+Rux should support two execution families:
+
+- API-backed model routes: OpenAI, Anthropic, Gemini, OpenRouter-style providers, and future model APIs.
+- Agent-backed tool routes: Claude Code, Codex, Gemini CLI, Cursor, VS Code agents, Zed, hosted coding agents, and future agent tools.
+
+The mistake to avoid is treating every tool as just a model. Some tools are valuable because of their harness: editor context, repo understanding, permissions, terminal control, file edits, review loops, or provider-native workflow. Rux should route to the harness when the harness is the advantage.
+
+Interface support should grow in levels:
+
+1. Observe: ingest evidence from a tool already being used.
+2. Recommend: tell the user or tool which setup to use.
+3. Launch: start the selected CLI, app workflow, or API-backed route with prepared context.
+4. Control: stream status, cancel, resume, and capture artifacts.
+5. Govern: apply worktree isolation, budgets, review gates, team policy, and audit trails.
+
+This lets Rux support tools unevenly without pretending every adapter is equally deep on day one.
+
+Inbound interfaces should eventually include CLI, local service/API, MCP, editor integrations, hosted APIs, and simple model-compatible routes where useful. Outbound interfaces should include CLI/PTY adapters, official SDK/API adapters, MCP bridges, worktree/sandbox management, and log/usage extractors.
+
+The first-run experience should detect installed tools, auth state, versions, supported flags, and capability depth. No forced migration.
+
 ## Why Coding First
 
 Coding is the proving ground because it has feedback loops Rux can verify:
@@ -91,6 +114,8 @@ Rux should feel like a clean workbench for AI work:
 For individuals, it should make personal agent use less chaotic.
 
 For teams, it should create shared operating memory without forcing everyone into the same provider, editor, model, or workflow.
+
+The likely long-term product shape is open-source local engine plus hosted team memory. The local engine earns trust: adapters, routing records, policy, schema, CLI, and local storage should remain inspectable. Hosted team memory can add collaboration, backups, shared scorecards, org policy, audit trails, and managed eval corpora when teams need them.
 
 ## Interface Principle
 

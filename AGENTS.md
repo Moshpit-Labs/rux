@@ -27,6 +27,16 @@ Runtime naming lives in `src/identity.mjs`; package publishing stays gated by lo
 - If a task needs multiple agents, state why one agent is not enough.
 - If a feature adds new nouns, push back unless it clearly reduces user effort.
 
+## Rux Dogfood
+
+Rux is the default evidence layer for substantial agent-owned work.
+
+- Before non-trivial implementation, review, or repair work, run `rux plan "<task>" --cwd "$PWD"` and use it as a read-only roster/evidence preview.
+- When delegating to a provider CLI, use `rux run "<task>" --runner claude|codex|gemini --provider-mode plan|write --cwd "$PWD" --check "<repo check>"` instead of invoking the provider directly.
+- Do not spawn nested Codex/Claude/Gemini runs only to satisfy this rule when the current agent is already doing the work; record that Rux cannot yet capture the current session directly.
+- After reviewing a Rux run, attach `rux verdict <run-id> accepted|partial|rejected --cwd "$PWD" --note "<why>"`.
+- If Rux is unavailable or would block an urgent/trivial task, continue and report why the run was not captured.
+
 ## Documentation Contract
 
 This repo should stay readable in minutes:
