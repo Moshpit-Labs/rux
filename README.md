@@ -27,6 +27,7 @@ The first useful version is intentionally small:
 - Rank runner/model/effort/roster evidence by task kind.
 - Suggest a runner only when local labeled evidence supports it.
 - Write proposal-only improvement notes that cite run IDs.
+- Capture local feedback reports for bugs, confusing UX, adapter issues, ideas, and useful wins.
 - Export shareable run evidence for review.
 - Keep repo-level runner safety defaults in a committed policy file.
 - Check local readiness and release gates before publishing.
@@ -52,7 +53,7 @@ That memory starts with capture. If the record is weak, routing is theater.
 
 ## Current State
 
-This repo has the first v0.1 capture spine: a CLI with repo init, a fake runner, Claude plan-mode capture, Codex read-only capture, Gemini plan-mode capture, explicit provider smoke checks, fixed sequential rosters, dry-run roster planning, repo policy, explicit file import for old sessions, model/effort/cost metadata, JSONL ledger, transcript capture, repo-state capture, changed-file capture, inline and post-run check capture, `ls`, `show`, `outcome`, `eval`, `rank`, `suggest`, `plan`, `status`, `export`, `policy`, `propose`, `doctor`, `release-check`, human verdict events, and downstream lifecycle marks.
+This repo has the first v0.1 capture spine: a CLI with repo init, a fake runner, Claude plan-mode capture, Codex read-only capture, Gemini plan-mode capture, explicit provider smoke checks, fixed sequential rosters, dry-run roster planning, repo policy, explicit file import for old sessions, model/effort/cost metadata, JSONL ledger, transcript capture, repo-state capture, changed-file capture, inline and post-run check capture, `ls`, `show`, `outcome`, `eval`, `rank`, `suggest`, `plan`, `status`, `export`, `policy`, `propose`, `report`, `doctor`, `release-check`, human verdict events, downstream lifecycle marks, and local feedback reports.
 
 ## Install
 
@@ -70,6 +71,7 @@ rux init
 rux runners
 rux run "review the navigation code" --runner gemini
 rux run "update the navigation code" --runner gemini --provider-mode write --check "npm run typecheck"
+rux report "Gemini surfaced a question but the terminal flow was unclear" --kind ux --command "rux run ..." --note "The question appeared in the transcript but was easy to miss."
 ```
 
 `rux run` keeps stdout as JSON for scripts. Provider output and Rux progress are mirrored to stderr while the provider runs, so questions, start/finish state, checks, and quiet long-running work are visible in the terminal. The default provider mode is `plan`; use `--provider-mode write` when you want the wrapped provider to edit files. If a provider asks for input, Rux records the run as `blocked`. If a provider changes files while Rux asked for plan mode, Rux records the run as `failed`.

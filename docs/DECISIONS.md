@@ -49,3 +49,11 @@ This is the lightweight decision log for Rux. Add entries when a choice would ot
 - Reason: Repeat hiccups should become documented decisions or verifiable checks, but Rux should stay readable in minutes.
 - Consequence: No manifest, generated wiki, or phase machinery until the repo earns it.
 - Revisit when: docs drift becomes frequent enough to justify stronger indexing or generation.
+
+## RUX-007: Feedback Reports Before External Issue Automation
+
+- Date: 2026-06-09
+- Decision: Agents record Rux dogfood feedback with `rux report` before any GitHub issue or hosted tracker automation exists.
+- Reason: Early learning should be local, low-friction, and broader than failures. Confusing UX, adapter friction, ideas, and successful patterns are all useful evidence.
+- Consequence: Report events and markdown files live in the repo-local `.rux/` store, can link to run IDs and commands, and do not change source, routing policy, or external issue state.
+- Revisit when: the hosted/team layer is ready to sync curated reports into shared backlog workflows.

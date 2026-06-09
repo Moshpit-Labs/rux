@@ -32,6 +32,7 @@ try {
   assert(helpRun.stdout.includes("rux init"), "--help should include init command");
   assert(helpRun.stdout.includes("rux run"), "--help should include run command");
   assert(helpRun.stdout.includes("rux check"), "--help should include post-run check command");
+  assert(helpRun.stdout.includes("rux report"), "--help should include feedback report command");
   assert(helpRun.stdout.includes("rux release-check [--cwd PATH] [--strict]"), "--help should include strict release-check flag");
   const shortHelpRun = run("node", [cliPath, "-h"]);
   assert(shortHelpRun.stdout.includes("Usage:"), "-h should print usage");
@@ -338,6 +339,34 @@ try {
   assert(summary.replay.command.includes("--check 'node --version'"), "run replay command should include captured check command");
   assert(summary.replay.provider_call_required === false, "fake run replay should not imply a provider call");
   assert(existsSync(join(tempRoot, summary.transcript_path)), "transcript should exist");
+
+  const reportResult = JSON.parse(run("node", [
+    cliPath,
+    "report",
+    "The fake runner made smoke feedback easy to capture",
+    "--kind",
+    "success",
+    "--run-id",
+    summary.id,
+    "--command",
+    summary.replay.command,
+    "--note",
+    "General dogfood feedback should not require a failure.",
+    "--source-repo",
+    tempRoot,
+    "--cwd",
+    tempRoot
+  ]).stdout);
+  assert(reportResult.type === "report", "report should append a report event");
+  assert(reportResult.kind === "success", "report should support non-failure feedback kinds");
+  assert(reportResult.run_id === summary.id, "report should preserve optional run link");
+  assert(reportResult.run_found === true, "report should say whether the linked run exists");
+  assert(reportResult.report_path.endsWith(".md"), "report should write a markdown report");
+  assert(existsSync(join(tempRoot, reportResult.report_path)), "report markdown should exist");
+  const reportMarkdown = await readFile(join(tempRoot, reportResult.report_path), "utf8");
+  assert(reportMarkdown.includes("# Rux Feedback Report"), "report markdown should have a clear heading");
+  assert(reportMarkdown.includes("Kind: success"), "report markdown should include feedback kind");
+  assert(reportMarkdown.includes("This is raw feedback."), "report markdown should explain the guardrail");
 
   run("node", [
     cliPath,
@@ -997,6 +1026,7 @@ try {
   assert(doctor.runners.find((runner) => runner.name === "gemini")?.available === true, "doctor should see mocked gemini on PATH");
   assert(doctor.store.runs >= 1, "doctor should summarize local run records");
   assert(doctor.store.checks >= 1, "doctor should count post-run check records");
+  assert(doctor.store.reports >= 1, "doctor should count report records");
 
   const statusResult = run("node", [cliPath, "status", "--cwd", tempRoot], repoRoot, {
     PATH: `${tempBin}:${process.env.PATH ?? ""}`
@@ -1007,6 +1037,7 @@ try {
   assert(status.policy.parallel_provider_cli_runs === false, "status should expose concurrency policy");
   assert(status.outcomes.labels.human_accepted >= 1, "status should count human accepted outcomes");
   assert(status.ledger.checks >= 1, "status should count post-run check records");
+  assert(status.ledger.reports >= 1, "status should count report records");
   assert(status.outcomes.labels.checks_passed >= 2, "status should count check-passing outcomes");
   assert(status.outcomes.labels.checks_failed >= 1, "status should count failing check outcomes");
   assert(status.outcomes.labels.provider_smoke_passed >= 3, "status should count provider smoke outcomes");

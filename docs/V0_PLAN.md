@@ -94,12 +94,13 @@ Done when suggestions cite previous run IDs, plans explain their evidence maturi
 
 ### 7. Proposal Loop
 
+- Add `rux report` for raw local feedback.
 - Add `rux propose`.
 - Summarize recent ledger entries.
 - Generate a markdown proposal with cited run IDs.
 - Never apply automatically.
 
-Done when the proposal is useful even if no code changes are made.
+Done when raw feedback and proposals are useful even if no code changes are made.
 
 ## v0.1 Cut
 
@@ -123,6 +124,7 @@ If scope pressure appears, ship only:
 - `rux export [--run-id ID] [--include-transcripts]`,
 - `rux policy`,
 - `rux propose`,
+- `rux report "<summary>"`,
 - `rux doctor`,
 - `rux release-check`,
 - fixed sequential rosters,

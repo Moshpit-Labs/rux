@@ -42,6 +42,7 @@ const currentDocs = {
 
 mustInclude("README.md", readme, "Rux is an open-source, test-first run ledger");
 mustInclude("README.md", readme, "It is not a model gateway");
+mustInclude("README.md", readme, "`report`");
 mustInclude("README.md", readme, "[Vision](docs/VISION.md)");
 mustInclude("README.md", readme, "[Standards](docs/STANDARDS.md)");
 mustInclude("AGENTS.md", agents, "`docs/VISION.md` tells us the product arc and guardrails.");
@@ -61,6 +62,7 @@ mustInclude("docs/VISION.md", vision, "Final Frontier");
 mustInclude("docs/STANDARDS.md", standards, "weekly patch train");
 mustInclude("docs/DECISIONS.md", decisions, "RUX-001: Capture Before Routing");
 mustInclude("docs/DECISIONS.md", decisions, "RUX-006: Swami-Lite Docs");
+mustInclude("docs/DECISIONS.md", decisions, "RUX-007: Feedback Reports Before External Issue Automation");
 
 const scripts = packageJson.scripts ?? {};
 if (!scripts["check:docs"] || !scripts["check:docs"].includes("scripts/check-docs.mjs")) {

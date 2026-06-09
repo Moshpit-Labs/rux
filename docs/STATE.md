@@ -1,6 +1,6 @@
 # Current State
 
-Last updated: 2026-06-08
+Last updated: 2026-06-09
 
 ## One-Line Summary
 
@@ -51,6 +51,7 @@ Rux is a public coding-agent run ledger that records real outcomes first, then u
 - `rux export` is the first team-review surface. It is read-only, emits shareable JSON summaries, omits transcript text by default, and includes transcripts only with `--include-transcripts`.
 - `rux.policy.json` is the committed team policy file. `rux policy` reads it, `rux status` surfaces it, `rux plan` uses its cold-start runner order/default roster, and `release-check` requires it before publishing.
 - `rux propose` now writes local markdown improvement proposals under `.rux/proposals/` and appends proposal events to the ledger. Proposals cite run IDs, distinguish adapter-smoke evidence from task-quality evidence, include release-check blockers grouped by lifecycle, and never apply changes.
+- `rux report "<summary>"` records local feedback under `.rux/reports/` and appends report events to the ledger. Feedback can be bugs, confusing UX, adapter issues, docs gaps, routing/orchestration observations, install problems, ideas, successes, or other notes. Reports can optionally link a run ID, command, source repo, and note; they do not open external issues or change policy.
 - `rux doctor` is a read-only local readiness check for Node, git, ledger state, and runner CLI availability.
 - `rux release-check` is a read-only publish gate. It checks package scope, package file shape, privacy, docs, scripts, committed release state, provider-smoke evidence, at least one routing-eligible live provider task, and name readiness. Mutating post-run checks are recorded but do not satisfy task-evidence release readiness. Gates declare lifecycle: `one_time`, `release`, or `permanent`. `release-check --strict` exits non-zero while blockers remain, and npm `prepublishOnly` runs `npm run release:verify` so publish attempts use the strict gate.
 - Release cadence is documented in `docs/STANDARDS.md`: batch normal fixes into a weekly patch train, reserve emergency patches for dangerous execution behavior, data loss, broken installs, provider auth/security breakage, or unusable published packages, and bump package versions only when cutting a release.

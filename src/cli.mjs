@@ -10,10 +10,12 @@ import { CLI_NAME, NPM_ORG, PRODUCT_NAME, STORE_DIR } from "./identity.mjs";
 const LEDGER_DIR = "ledger";
 const TRANSCRIPT_DIR = "transcripts";
 const PROPOSAL_DIR = "proposals";
+const REPORT_DIR = "reports";
 const POLICY_FILE = "rux.policy.json";
 const SCHEMA_VERSION = 1;
 const rosterDefinitions = new Set(["solo", "pair", "repair", "plan-code-review"]);
 const lifecycleMarkDefinitions = new Set(["reverted", "replayed", "accepted-downstream"]);
+const reportKindDefinitions = new Set(["bug", "ux", "adapter", "docs", "routing", "orchestration", "install", "idea", "success", "other"]);
 const knownOptionNames = new Set([
   "check",
   "coder-runner",
@@ -25,6 +27,7 @@ const knownOptionNames = new Set([
   "from",
   "implementer-runner",
   "include-transcripts",
+  "kind",
   "limit",
   "mode",
   "model",
@@ -36,6 +39,7 @@ const knownOptionNames = new Set([
   "roster",
   "run-id",
   "runner",
+  "source-repo",
   "started-at",
   "status",
   "strict",
@@ -113,6 +117,8 @@ async function main() {
       return releaseCheck(args);
     case "propose":
       return proposeImprovements(args);
+    case "report":
+      return recordReport(args);
     case "check":
       return addCheck(args);
     case "verdict":
@@ -151,6 +157,7 @@ Usage:
   ${CLI_NAME} doctor [--cwd PATH]
   ${CLI_NAME} release-check [--cwd PATH] [--strict]
   ${CLI_NAME} propose [--cwd PATH]
+  ${CLI_NAME} report "<summary>" [--kind bug|ux|adapter|docs|routing|orchestration|install|idea|success|other] [--source-repo PATH] [--run-id ID] [--command "COMMAND"] [--note "TEXT"] [--cwd PATH]
   ${CLI_NAME} --version
   ${CLI_NAME} ls [--cwd PATH]
   ${CLI_NAME} show <run-id> [--cwd PATH]
@@ -274,6 +281,14 @@ function parsePositiveInteger(value, fallback, flagName) {
     throw new Error(`${flagName} must be a positive integer`);
   }
   return number;
+}
+
+function normalizeReportKind(value) {
+  const normalized = value.toLowerCase();
+  if (!reportKindDefinitions.has(normalized)) {
+    throw new Error(`Unsupported report kind: ${value}. Use ${[...reportKindDefinitions].join(", ")}.`);
+  }
+  return normalized;
 }
 
 function defaultPolicy() {
@@ -445,6 +460,7 @@ async function doctor(args) {
   const events = await readLedger(cwd);
   const runs = events.filter((event) => event.type === "run");
   const proposals = events.filter((event) => event.type === "proposal");
+  const reports = events.filter((event) => event.type === "report");
   const checks = events.filter((event) => event.type === "check");
   const verdicts = events.filter((event) => event.type === "verdict");
   const marks = events.filter((event) => event.type === "mark");
@@ -474,7 +490,8 @@ async function doctor(args) {
       checks: checks.length,
       verdicts: verdicts.length,
       marks: marks.length,
-      proposals: proposals.length
+      proposals: proposals.length,
+      reports: reports.length
     },
     runners,
     notes: [
@@ -619,6 +636,7 @@ async function status(args) {
   const runs = runsWithAppendedChecks(events);
   const topRuns = topLevelRuns(runs);
   const proposals = events.filter((event) => event.type === "proposal");
+  const reports = events.filter((event) => event.type === "report");
   const verdicts = latestVerdictByRun(events);
   const marks = lifecycleMarksByRun(events);
   const release = await buildReleaseCheck(cwd);
@@ -678,7 +696,8 @@ async function status(args) {
       checks: events.filter((event) => event.type === "check").length,
       verdicts: events.filter((event) => event.type === "verdict").length,
       marks: events.filter((event) => event.type === "mark").length,
-      proposals: proposals.length
+      proposals: proposals.length,
+      reports: reports.length
     },
     outcomes: {
       labels: countBy(outcomes.map((outcome) => outcome.label)),
@@ -2623,6 +2642,58 @@ async function proposeImprovements(args) {
   }, null, 2));
 }
 
+async function recordReport(args) {
+  const { positionals, options } = parseOptions(args);
+  const summary = positionals.join(" ").trim();
+  if (!summary) {
+    throw new Error(`Usage: ${CLI_NAME} report "<summary>" [--kind bug|ux|adapter|docs|routing|orchestration|install|idea|success|other] [--run-id ID] [--command "COMMAND"] [--note "TEXT"]`);
+  }
+
+  const cwd = resolveCwd(options);
+  const kind = normalizeReportKind(String(options.kind ?? "bug"));
+  const runId = normalizeOptionalString(options["run-id"]);
+  const command = normalizeOptionalString(options.command);
+  const note = normalizeOptionalString(options.note);
+  const sourceRepo = resolve(String(options["source-repo"] ?? cwd));
+  const events = await readLedger(cwd);
+  const run = runId ? events.find((event) => event.type === "run" && event.id === runId) ?? null : null;
+  const createdAt = new Date();
+  const id = `report-${createRunId(createdAt)}`;
+  const reportPath = await writeReport(cwd, id, formatReport({
+    id,
+    kind,
+    summary,
+    note,
+    command,
+    runId,
+    runFound: runId ? Boolean(run) : null,
+    sourceRepo,
+    cwd,
+    createdAt
+  }));
+  const event = {
+    schema_version: SCHEMA_VERSION,
+    type: "report",
+    id,
+    kind,
+    summary,
+    note: note ?? "",
+    command: command ?? "",
+    run_id: runId,
+    run_found: runId ? Boolean(run) : null,
+    source_repo: sourceRepo,
+    cwd,
+    created_at: createdAt.toISOString(),
+    report_path: relative(cwd, reportPath),
+    repo: {
+      reported_at: gitSnapshot(cwd)
+    }
+  };
+
+  await appendLedger(cwd, event);
+  console.log(JSON.stringify(event, null, 2));
+}
+
 async function addCheck(args) {
   const { positionals, options } = parseOptions(args);
   const runId = positionals[0];
@@ -2771,6 +2842,13 @@ async function writeTranscript(cwd, runId, text) {
 async function writeProposal(cwd, proposalId, text) {
   const path = join(cwd, STORE_DIR, PROPOSAL_DIR, `${proposalId}.md`);
   await mkdir(join(cwd, STORE_DIR, PROPOSAL_DIR), { recursive: true });
+  await writeFile(path, text, "utf8");
+  return path;
+}
+
+async function writeReport(cwd, reportId, text) {
+  const path = join(cwd, STORE_DIR, REPORT_DIR, `${reportId}.md`);
+  await mkdir(join(cwd, STORE_DIR, REPORT_DIR), { recursive: true });
   await writeFile(path, text, "utf8");
   return path;
 }
@@ -3804,6 +3882,33 @@ function formatProposal({ id, cwd, createdAt, runs, verdicts, release, findings 
     "## Guardrail",
     "",
     "This proposal is advisory. Rux must not apply source changes, mutate prompts, or change routing policy without a human action."
+  ].join("\n");
+}
+
+function formatReport({ id, kind, summary, note, command, runId, runFound, sourceRepo, cwd, createdAt }) {
+  return [
+    "# Rux Feedback Report",
+    "",
+    `ID: ${id}`,
+    `Created: ${createdAt.toISOString()}`,
+    `Kind: ${kind}`,
+    `Store repo: ${cwd}`,
+    `Source repo: ${sourceRepo}`,
+    `Run ID: ${runId ?? "none"}`,
+    `Run found: ${runFound === null ? "not provided" : runFound ? "yes" : "no"}`,
+    `Command: ${command ?? "not provided"}`,
+    "",
+    "## Summary",
+    "",
+    summary,
+    "",
+    "## Notes",
+    "",
+    note ?? "none",
+    "",
+    "## Guardrail",
+    "",
+    "This is raw feedback. It records a local observation and does not open an external issue, change routing policy, or modify source code."
   ].join("\n");
 }
 

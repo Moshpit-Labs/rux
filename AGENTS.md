@@ -35,7 +35,8 @@ Rux is the default evidence layer for substantial agent-owned work.
 - When delegating to a provider CLI, use `rux run "<task>" --runner claude|codex|gemini --provider-mode plan|write --cwd "$PWD" --check "<repo check>"` instead of invoking the provider directly.
 - Do not spawn nested Codex/Claude/Gemini runs only to satisfy this rule when the current agent is already doing the work; record that Rux cannot yet capture the current session directly.
 - After reviewing a Rux run, attach `rux verdict <run-id> accepted|partial|rejected --cwd "$PWD" --note "<why>"`.
-- If Rux is unavailable or would block an urgent/trivial task, continue and report why the run was not captured.
+- Capture dogfood feedback with `rux report "<summary>" --kind bug|ux|adapter|docs|routing|orchestration|install|idea|success|other --source-repo "$PWD" --run-id <id-if-any> --command "<command>" --note "<details>" --cwd "$PWD"`.
+- If Rux is unavailable or would block an urgent/trivial task, continue and mention why the run or report was not captured.
 
 ## Documentation Contract
 

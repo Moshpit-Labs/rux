@@ -155,6 +155,7 @@ rux export --limit 10
 rux export --run-id <run-id> --include-transcripts
 rux policy
 rux propose
+rux report "<summary>" --kind ux --run-id <run-id>
 rux doctor
 rux release-check
 rux ls
@@ -301,7 +302,7 @@ ledger -> proposal -> human review -> normal code change
 
 Every proposal must cite run IDs. Unsupported claims are discarded.
 
-Current behavior is deterministic and local: `rux propose` writes a markdown proposal under `.rux/proposals/` and appends a proposal event to the ledger. It looks for missing labels, failed checks, imported low-confidence history, provider-smoke-only history, lack of positive provider task evidence, and release-check blockers.
+Current behavior is deterministic and local: `rux report` records raw feedback under `.rux/reports/`, while `rux propose` writes a markdown proposal under `.rux/proposals/` and appends a proposal event to the ledger. Reports are observations, not tickets or policy changes. Proposals look for missing labels, failed checks, imported low-confidence history, provider-smoke-only history, lack of positive provider task evidence, and release-check blockers.
 
 Allowed proposal categories:
 
