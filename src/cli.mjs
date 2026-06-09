@@ -46,7 +46,8 @@ const knownOptionNames = new Set([
   "strict",
   "task",
   "task-kind",
-  "timeout-ms"
+  "timeout-ms",
+  "write-scope"
 ]);
 
 const runnerDefinitions = {
@@ -146,7 +147,7 @@ function printHelp() {
 Usage:
   ${CLI_NAME} runners
   ${CLI_NAME} init [--cwd PATH] [--force]
-  ${CLI_NAME} run "<task>" [--runner fake|claude|codex|gemini] [--roster solo|pair|repair|plan-code-review] [--provider-mode plan|write] [--model NAME] [--effort LEVEL] [--cost-hint USD] [--cwd PATH] [--check "COMMAND"] [--timeout-ms N] [--allow-dirty]
+  ${CLI_NAME} run "<task>" [--runner fake|claude|codex|gemini] [--roster solo|pair|repair|plan-code-review] [--provider-mode plan|write] [--model NAME] [--effort LEVEL] [--cost-hint USD] [--cwd PATH] [--check "COMMAND"] [--timeout-ms N] [--write-scope PATH[,PATH...]] [--allow-dirty]
   ${CLI_NAME} provider-smoke --runner claude|codex|gemini [--model NAME] [--effort LEVEL] [--cwd PATH] [--timeout-ms N] [--allow-dirty]
   ${CLI_NAME} import --from PATH [--runner claude|codex|gemini|unknown] [--task "TEXT"] [--model NAME] [--effort LEVEL] [--cost-hint USD] [--cwd PATH]
   ${CLI_NAME} plan "<task>" [--runner fake|claude|codex|gemini] [--roster solo|pair|repair|plan-code-review] [--model NAME] [--effort LEVEL] [--cost-hint USD] [--cwd PATH] [--check "COMMAND"]
@@ -282,6 +283,38 @@ function parsePositiveInteger(value, fallback, flagName) {
     throw new Error(`${flagName} must be a positive integer`);
   }
   return number;
+}
+
+function parseWriteScope(value) {
+  if (value === undefined) {
+    return {
+      declared: false,
+      entries: []
+    };
+  }
+  if (value === true) {
+    throw new Error("--write-scope requires a comma-separated list of files or directories");
+  }
+
+  const entries = String(value)
+    .split(",")
+    .map((entry) => normalizeWriteScopeEntry(entry))
+    .filter(Boolean);
+  if (entries.length === 0) {
+    throw new Error("--write-scope requires at least one file or directory");
+  }
+  return {
+    declared: true,
+    entries: unique(entries)
+  };
+}
+
+function normalizeWriteScopeEntry(entry) {
+  return String(entry)
+    .trim()
+    .replace(/\\/g, "/")
+    .replace(/^\.\//, "")
+    .replace(/\/{2,}/g, "/");
 }
 
 function normalizeReportKind(value) {
@@ -856,6 +889,7 @@ async function exportRunRecord({ cwd, run, children, verdicts, marks, includeTra
     adapter: run.adapter ?? null,
     repo: run.repo ?? null,
     changed_files: Array.isArray(run.changed_files) ? run.changed_files : [],
+    write_scope: run.write_scope ?? null,
     checks: Array.isArray(run.checks) ? run.checks.map((check) => ({
       id: check.id ?? null,
       source: check.source ?? "run_check",
@@ -1020,6 +1054,7 @@ async function captureRunAttempt({
   const afterStatus = gitStatusMap(cwd);
   const afterRepo = gitSnapshot(cwd, afterStatus);
   const changedFiles = gitChangedFilesBetween(beforeStatus, afterStatus);
+  const writeScope = evaluateWriteScope(options, changedFiles);
   const endedAt = new Date();
   let outputSignal = classifyProviderOutputSignal({ runner, purpose, role, task, transcript, changedFiles, check });
   const executionMode = runner === "fake" ? "internal" : providerExecutionMode(options, { role, purpose });
@@ -1039,6 +1074,17 @@ async function captureRunAttempt({
   } else if (outputSignal.status === "blocked" && status === "ok") {
     status = "blocked";
     statusReason = outputSignal.reason;
+    runNotes.push(outputSignal.note);
+  }
+  if (status === "ok" && writeScope.violations.length > 0) {
+    outputSignal = {
+      kind: "write_scope_violation",
+      status: "failed",
+      reason: "write_scope_violation",
+      note: `Provider changed files outside --write-scope: ${writeScope.violations.join(", ")}.`
+    };
+    status = "failed";
+    statusReason = "write_scope_violation";
     runNotes.push(outputSignal.note);
   }
   if (failOnChangedFiles && changedFiles.length > 0) {
@@ -1076,6 +1122,10 @@ async function captureRunAttempt({
     },
     transcript_path: relative(cwd, transcriptPath),
     changed_files: changedFiles,
+    write_scope: writeScope.declared ? {
+      allowed: writeScope.allowed,
+      violations: writeScope.violations
+    } : null,
     checks: check ? [check] : [],
     human_verdict: null,
     cost_hint: metadata.cost_hint ?? null,
@@ -1666,6 +1716,7 @@ function classifyRunStatus({ transcript, check, failOnChangedFiles, changedFiles
 
 function classifyRosterStatus(children) {
   if (children.some((child) => child.status_reason === "check_failed")) return "child_check_failed";
+  if (children.some((child) => child.status_reason === "write_scope_violation")) return "child_write_scope_violation";
   if (children.some((child) => child.status_reason === "provider_plan_changed_files")) return "child_provider_plan_changed_files";
   if (children.some((child) => child.status_reason === "provider_timeout")) return "child_provider_timeout";
   if (children.some((child) => child.status_reason === "provider_failed")) return "child_provider_failed";
@@ -2423,7 +2474,7 @@ function buildRunCommand({ task, runner, roster, options, model = null, effort =
     parts.push("--effort", effort);
   }
 
-  for (const key of ["cost-hint", "check", "provider-mode", "planner-runner", "coder-runner", "implementer-runner", "reviewer-runner", "repair-runner", "timeout-ms"]) {
+  for (const key of ["cost-hint", "check", "provider-mode", "planner-runner", "coder-runner", "implementer-runner", "reviewer-runner", "repair-runner", "timeout-ms", "write-scope"]) {
     const value = options[key];
     if (value !== undefined && value !== true) {
       parts.push(`--${key}`, String(value));
@@ -3063,6 +3114,36 @@ function gitChangedFilesBetween(beforeStatus, afterStatus) {
   return files.filter((file) => beforeStatus.get(file) !== afterStatus.get(file));
 }
 
+function evaluateWriteScope(options, changedFiles) {
+  const scope = parseWriteScope(options["write-scope"]);
+  if (!scope.declared) {
+    return {
+      declared: false,
+      allowed: [],
+      violations: []
+    };
+  }
+
+  const violations = changedFiles
+    .map((file) => file.replace(/\\/g, "/"))
+    .filter((file) => !writeScopeAllowsFile(scope.entries, file))
+    .sort();
+  return {
+    declared: true,
+    allowed: scope.entries,
+    violations
+  };
+}
+
+function writeScopeAllowsFile(entries, file) {
+  return entries.some((entry) => {
+    if (entry.endsWith("/")) {
+      return file.startsWith(entry);
+    }
+    return file === entry || file.startsWith(`${entry}/`);
+  });
+}
+
 function runCheck(command, cwd) {
   const startedAt = new Date();
   const result = spawnSync(command, {
@@ -3132,6 +3213,7 @@ function summarizeRun(run) {
     adapter: run.adapter ?? null,
     repo: run.repo ?? null,
     changed_files: run.changed_files,
+    write_scope: run.write_scope ?? null,
     checks: run.checks.map((check) => ({
       source: check.source ?? "run_check",
       command: check.command,
@@ -3337,6 +3419,7 @@ function recommendationBlockers(run, verdict, marks = []) {
   if (run.status !== "ok") blockers.push("run_not_ok");
   if (hasLifecycleMark(marks, "reverted")) blockers.push("reverted_downstream");
   if (checkChangedFiles(run).length > 0) blockers.push("check_modified_files");
+  if (writeScopeViolations(run).length > 0) blockers.push("write_scope_violation");
   if (run.purpose !== "provider_smoke" && !verdict && (!Array.isArray(run.checks) || run.checks.length === 0)) blockers.push("unlabeled");
   return blockers;
 }
@@ -3344,6 +3427,10 @@ function recommendationBlockers(run, verdict, marks = []) {
 function checkChangedFiles(run) {
   const checks = Array.isArray(run.checks) ? run.checks : [];
   return unique(checks.flatMap((check) => Array.isArray(check.changed_files) ? check.changed_files : []));
+}
+
+function writeScopeViolations(run) {
+  return Array.isArray(run.write_scope?.violations) ? run.write_scope.violations : [];
 }
 
 function summarizeEvidenceGroups(runs, verdicts, marks) {
@@ -3663,6 +3750,7 @@ function outcomeRisks(run, children, verdict, marks = []) {
   if (run.status_reason === "provider_needs_input") risks.push("provider_needs_input");
   if (run.status_reason === "provider_plan_only") risks.push("provider_plan_only");
   if (run.status_reason === "provider_plan_changed_files") risks.push("provider_plan_changed_files");
+  if (run.status_reason === "write_scope_violation" || writeScopeViolations(run).length > 0) risks.push("write_scope_violation");
   if (checkChangedFiles(run).length > 0) risks.push("check_modified_files");
   if (Array.isArray(run.changed_files) && run.changed_files.length > 10) risks.push("large_change_surface");
   if (children.some((child) => child.status !== "ok")) risks.push("child_run_failed");
@@ -3744,6 +3832,7 @@ function evaluateRunRecord(run, children, verdicts, marksByRun = new Map()) {
       checks_failed: failedChecks.length,
       check_changed_files: changedByChecks.length,
       changed_files: Array.isArray(run.changed_files) ? run.changed_files.length : 0,
+      write_scope_violations: writeScopeViolations(run).length,
       child_runs: children.length,
       child_failures: childFailures.length,
       child_checks_total: childChecks.length,

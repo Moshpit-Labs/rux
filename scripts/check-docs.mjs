@@ -64,6 +64,7 @@ mustInclude("docs/DECISIONS.md", decisions, "RUX-001: Capture Before Routing");
 mustInclude("docs/DECISIONS.md", decisions, "RUX-006: Swami-Lite Docs");
 mustInclude("docs/DECISIONS.md", decisions, "RUX-007: Feedback Reports Before External Issue Automation");
 mustInclude("docs/DECISIONS.md", decisions, "RUX-008: Dirty Worktrees Block Real Provider Runs");
+mustInclude("docs/DECISIONS.md", decisions, "RUX-009: Write Scope Violations Are Failed Runs");
 
 const scripts = packageJson.scripts ?? {};
 if (!scripts["check:docs"] || !scripts["check:docs"].includes("scripts/check-docs.mjs")) {

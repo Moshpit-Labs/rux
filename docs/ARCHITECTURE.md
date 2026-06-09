@@ -146,6 +146,7 @@ rux runners
 rux provider-smoke --runner gemini --model gemini-pro --effort high
 rux run "<task>" --runner claude --roster solo --model claude-sonnet --effort high --cost-hint 0.25
 rux run "<task>" --runner gemini --provider-mode write --allow-dirty
+rux run "<task>" --runner codex --provider-mode write --write-scope "src/foo.ts,test/foo.test.ts"
 rux run "<task>" --runner claude --roster pair --reviewer-runner codex --model claude-sonnet
 rux import --from ./old-session.txt --runner claude --task "Imported old session" --model claude-opus
 rux plan "<task>"
@@ -292,6 +293,8 @@ The v0 policy file encodes that default. `rux plan` may use policy for cold-star
 `rux provider-smoke --runner claude|codex|gemini` is the deliberate release-evidence command. It creates a normal ledger run with `purpose: provider_smoke`, uses the provider's installed CLI/auth, and fails the smoke if files change. Provider-smoke runs prove adapter health; they are excluded from ranking and suggestion evidence, and cannot receive post-run checks, human verdicts, or downstream lifecycle marks.
 
 Real provider launches fail fast when the target git worktree already has uncommitted files outside `.rux/`. This prevents provider CLIs from racing against unrelated local work in a shared checkout. `--allow-dirty` is an explicit override for cases where the dirty files are deliberately part of the prompt context; the override is preserved in replay metadata.
+
+Provider write scope is an evidence guard. `--write-scope` accepts comma-separated files or directory prefixes. Rux still lets the provider run, then fails the run with `write_scope_violation` if changed files fall outside that boundary. This turns scope breaches into routing-negative evidence and gives users a clear post-run failure instead of a silent over-edit.
 
 `rux release-check` is also read-only. It reports publication blockers until npm scope, package file shape, package privacy, naming, docs, local scripts, committed repo state, explicit provider-smoke evidence, and at least one routing-eligible live provider task are ready. Mutating post-run checks are recorded, but they do not satisfy release evidence. Each gate carries a lifecycle: `one_time`, `release`, or `permanent`, so first-release decisions do not become permanent process by accident. `rux release-check --strict` returns a failing exit code while blockers remain, and npm `prepublishOnly` runs the strict gate through `npm run release:verify`.
 

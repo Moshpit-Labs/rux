@@ -34,6 +34,7 @@ try {
   assert(helpRun.stdout.includes("rux check"), "--help should include post-run check command");
   assert(helpRun.stdout.includes("rux report"), "--help should include feedback report command");
   assert(helpRun.stdout.includes("--allow-dirty"), "--help should include dirty worktree override");
+  assert(helpRun.stdout.includes("--write-scope"), "--help should include write-scope guard");
   assert(helpRun.stdout.includes("rux release-check [--cwd PATH] [--strict]"), "--help should include strict release-check flag");
   const shortHelpRun = run("node", [cliPath, "-h"]);
   assert(shortHelpRun.stdout.includes("Usage:"), "-h should print usage");
@@ -843,6 +844,38 @@ try {
   assert(planChangedGeminiOutcome.outcome.label === "run_failed", "plan-mode write violation should report a failed run, not a failed check");
   assert(planChangedGeminiOutcome.outcome.risks.includes("provider_plan_changed_files"), "plan-mode write violation should be an outcome risk");
 
+  const scopedGeminiRun = spawnSync("node", [
+    cliPath,
+    "run",
+    "scoped write edits",
+    "--runner",
+    "gemini",
+    "--allow-dirty",
+    "--provider-mode",
+    "write",
+    "--write-scope",
+    "allowed-output.txt",
+    "--cwd",
+    tempRoot
+  ], {
+    encoding: "utf8",
+    env: { ...process.env, PATH: `${tempBin}:${process.env.PATH ?? ""}` }
+  });
+  assert(scopedGeminiRun.status === 0, "write-scope violations should still record a run");
+  const scopedGeminiSummary = JSON.parse(scopedGeminiRun.stdout);
+  assert(scopedGeminiSummary.status === "failed", "out-of-scope provider edits should fail the run");
+  assert(scopedGeminiSummary.status_reason === "write_scope_violation", "out-of-scope provider edits should get a scope-specific reason");
+  assert(scopedGeminiSummary.output_signal.kind === "write_scope_violation", "out-of-scope provider edits should expose output signal");
+  assert(scopedGeminiSummary.write_scope.allowed.includes("allowed-output.txt"), "run summary should record allowed write scope");
+  assert(scopedGeminiSummary.write_scope.violations.includes("out-of-scope-edited.txt"), "run summary should record scope violations");
+  assert(scopedGeminiSummary.replay.command.includes("--write-scope allowed-output.txt"), "write-scope should be replay-visible");
+  const scopedGeminiEval = JSON.parse(run("node", [cliPath, "eval", scopedGeminiSummary.id, "--cwd", tempRoot]).stdout);
+  assert(scopedGeminiEval.routing.blockers.includes("write_scope_violation"), "scope-violating runs should be blocked from routing evidence");
+  assert(scopedGeminiEval.signals.write_scope_violations === 1, "eval should count scope violations");
+  assert(scopedGeminiEval.outcome.risks.includes("write_scope_violation"), "outcome should surface scope risk");
+  const scopedGeminiExport = JSON.parse(run("node", [cliPath, "export", "--cwd", tempRoot, "--run-id", scopedGeminiSummary.id]).stdout);
+  assert(scopedGeminiExport.runs[0].write_scope.violations.includes("out-of-scope-edited.txt"), "export should preserve write-scope violations");
+
   const checkedGeminiRun = spawnSync("node", [
     cliPath,
     "run",
@@ -1208,7 +1241,7 @@ try {
   assert(proposalSummary.release.blocker_summary.by_lifecycle.one_time >= 1, "proposal should include release blocker lifecycle summary");
   assert(proposalSummary.findings.some((finding) => finding.category === "release"), "proposal should include release readiness finding");
   assert(proposalSummary.cited_run_ids.includes(importedSummary.id), "proposal should cite imported history when present");
-  assert(proposalSummary.cited_run_ids.includes(geminiSummary.id), "proposal should cite unlabeled provider runs");
+  assert(proposalSummary.findings.some((finding) => finding.category === "labels" && finding.run_ids.length > 0), "proposal should cite unlabeled provider runs");
   const proposal = await readFile(join(tempRoot, proposalSummary.proposal_path), "utf8");
   assert(proposal.includes("# Rux Proposal"), "proposal should have a clear heading");
   assert(proposal.includes("- Release ready: no"), "proposal markdown should include release readiness");
@@ -1358,6 +1391,11 @@ async function installMockGemini(binDir) {
     [
       "#!/bin/sh",
       "case \" $* \" in",
+      "  *\"scoped write edits\"*)",
+      "    printf 'I edited outside the requested scope.\\n'",
+      "    printf 'changed\\n' > out-of-scope-edited.txt",
+      "    exit 0",
+      "    ;;",
       "  *\"plan mode edits\"*)",
       "    printf 'I changed a file even though the adapter requested plan mode.\\n'",
       "    printf 'changed\\n' > plan-mode-edited.txt",

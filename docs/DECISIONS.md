@@ -65,3 +65,11 @@ This is the lightweight decision log for Rux. Add entries when a choice would ot
 - Reason: Dogfood found that running provider CLIs in a shared dirty checkout can race with concurrent agent/user work and destroy uncommitted changes.
 - Consequence: Users must commit, stash, revert, or explicitly override before real provider execution. Fake runs stay allowed in dirty trees for local ledger development.
 - Revisit when: worktree isolation is implemented and can safely run providers away from the user's active checkout.
+
+## RUX-009: Write Scope Violations Are Failed Runs
+
+- Date: 2026-06-09
+- Decision: Rux lets users declare allowed files/directories with `--write-scope` and records a failed run when providers edit outside that scope.
+- Reason: Dogfood showed Gemini write mode editing files outside explicit task scope. Until Rux has stronger isolation or patch approval, scope breaches must become visible negative evidence.
+- Consequence: `write_scope_violation` appears in run status, output signal, eval routing blockers, outcome risks, and exports.
+- Revisit when: provider adapters can enforce write allowlists before edits, not just classify them after the run.

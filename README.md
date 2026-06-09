@@ -71,10 +71,11 @@ rux init
 rux runners
 rux run "review the navigation code" --runner gemini
 rux run "update the navigation code" --runner gemini --provider-mode write --check "npm run typecheck"
+rux run "update only the stats filters" --runner codex --provider-mode write --write-scope "lib/stats/filters.ts,test/stats-filters.test.ts" --check "npm test"
 rux report "Gemini surfaced a question but the terminal flow was unclear" --kind ux --command "rux run ..." --note "The question appeared in the transcript but was easy to miss."
 ```
 
-`rux run` keeps stdout as JSON for scripts. Provider output and Rux progress are mirrored to stderr while the provider runs, so questions, start/finish state, checks, and quiet long-running work are visible in the terminal. The default provider mode is `plan`; use `--provider-mode write` when you want the wrapped provider to edit files. Real provider runs refuse dirty worktrees by default; commit, stash, or revert existing changes first, or pass `--allow-dirty` only when those changes are intentionally part of the provider context. If a provider asks for input, Rux records the run as `blocked`. If a provider changes files while Rux asked for plan mode, Rux records the run as `failed`.
+`rux run` keeps stdout as JSON for scripts. Provider output and Rux progress are mirrored to stderr while the provider runs, so questions, start/finish state, checks, and quiet long-running work are visible in the terminal. The default provider mode is `plan`; use `--provider-mode write` when you want the wrapped provider to edit files. Real provider runs refuse dirty worktrees by default; commit, stash, or revert existing changes first, or pass `--allow-dirty` only when those changes are intentionally part of the provider context. Use `--write-scope` to declare the files or directories a provider is allowed to change; Rux records out-of-scope edits as failed runs. If a provider asks for input, Rux records the run as `blocked`. If a provider changes files while Rux asked for plan mode, Rux records the run as `failed`.
 
 Start here:
 
