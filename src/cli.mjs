@@ -89,6 +89,8 @@ async function main() {
       return initRepo(args);
     case "run":
       return runCommand(args);
+    case "record":
+      return recordManualRun(args);
     case "provider-smoke":
       return providerSmoke(args);
     case "ls":
@@ -148,6 +150,7 @@ Usage:
   ${CLI_NAME} runners
   ${CLI_NAME} init [--cwd PATH] [--force]
   ${CLI_NAME} run "<task>" [--runner fake|claude|codex|gemini] [--roster solo|pair|repair|plan-code-review] [--provider-mode plan|write] [--model NAME] [--effort LEVEL] [--cost-hint USD] [--cwd PATH] [--check "COMMAND"] [--timeout-ms N] [--write-scope PATH[,PATH...]] [--allow-dirty]
+  ${CLI_NAME} record "<task>" --runner claude|codex|gemini [--cwd PATH] [--check "COMMAND"] [--note "TEXT"] [--model NAME] [--effort LEVEL] [--cost-hint USD] [--write-scope PATH[,PATH...]]
   ${CLI_NAME} provider-smoke --runner claude|codex|gemini [--model NAME] [--effort LEVEL] [--cwd PATH] [--timeout-ms N] [--allow-dirty]
   ${CLI_NAME} import --from PATH [--runner claude|codex|gemini|unknown] [--task "TEXT"] [--model NAME] [--effort LEVEL] [--cost-hint USD] [--cwd PATH]
   ${CLI_NAME} plan "<task>" [--runner fake|claude|codex|gemini] [--roster solo|pair|repair|plan-code-review] [--model NAME] [--effort LEVEL] [--cost-hint USD] [--cwd PATH] [--check "COMMAND"]
@@ -426,6 +429,15 @@ function normalizeRunner(runner) {
   return runner;
 }
 
+function normalizeManualRunner(runner) {
+  const normalized = runner.toLowerCase();
+  const allowed = new Set(["claude", "codex", "gemini"]);
+  if (!allowed.has(normalized)) {
+    throw new Error(`Unsupported record runner: ${runner}. Use claude, codex, or gemini.`);
+  }
+  return normalized;
+}
+
 function normalizeRoster(roster) {
   if (!rosterDefinitions.has(roster)) {
     throw new Error(`Unknown roster: ${roster}. Use solo, pair, repair, or plan-code-review.`);
@@ -575,7 +587,7 @@ async function buildReleaseCheck(cwd) {
     releaseGate("claude_smoke_evidence", hasProviderSmoke(topRuns, "claude"), "Ledger contains a successful Claude provider-smoke run with no file changes.", { lifecycle: "release", category: "provider_evidence" }),
     releaseGate("codex_smoke_evidence", hasProviderSmoke(topRuns, "codex"), "Ledger contains a successful Codex provider-smoke run with no file changes.", { lifecycle: "release", category: "provider_evidence" }),
     releaseGate("gemini_smoke_evidence", hasProviderSmoke(topRuns, "gemini"), "Ledger contains a successful Gemini provider-smoke run with no file changes.", { lifecycle: "release", category: "provider_evidence" }),
-    releaseGate("real_provider_task_evidence", eligibility.eligible.length > 0, "Ledger contains at least one routing-eligible live provider task with a check or human verdict.", { lifecycle: "one_time", category: "provider_evidence" }),
+    releaseGate("real_provider_task_evidence", eligibility.eligible.some(isLiveProviderTaskRun), "Ledger contains at least one routing-eligible live provider task with a check or human verdict.", { lifecycle: "one_time", category: "provider_evidence" }),
     releaseGate("no_local_only_language", !(await hasLocalOnlyLanguage(cwd)), "Docs do not describe the product as local-only.", { lifecycle: "one_time", category: "docs" })
   ];
 
@@ -676,6 +688,7 @@ async function status(args) {
   const release = await buildReleaseCheck(cwd);
   const eligibility = partitionRecommendationEvidence(topRuns, verdicts, marks);
   const liveProviderTaskRuns = topRuns.filter(isLiveProviderTaskRun);
+  const manualTaskRuns = topRuns.filter(isManualTaskRun);
   const providerSmokeRuns = topRuns.filter((run) => run.purpose === "provider_smoke");
   const outcomes = topRuns.map((run) => summarizeOutcome(
     run,
@@ -742,6 +755,7 @@ async function status(args) {
     evidence: {
       eligible_runs: eligibility.eligible.length,
       live_provider_task_runs: liveProviderTaskRuns.length,
+      manual_task_runs: manualTaskRuns.length,
       provider_smoke_runs: providerSmokeRuns.length,
       ignored_runs: eligibility.ignored.length,
       ignored_reasons: countBy(eligibility.ignored.map((item) => item.reason)),
@@ -1018,6 +1032,124 @@ async function providerSmoke(args) {
     ]
   });
 
+  console.log(JSON.stringify(summarizeRun(run), null, 2));
+}
+
+async function recordManualRun(args) {
+  const { positionals, options } = parseOptions(args);
+  const task = positionals.join(" ").trim();
+  if (!task || !options.runner) {
+    throw new Error(`Usage: ${CLI_NAME} record "<task>" --runner claude|codex|gemini [--check "COMMAND"] [--note "TEXT"]`);
+  }
+
+  const cwd = resolveCwd(options);
+  const runner = normalizeManualRunner(String(options.runner));
+  const metadata = metadataFromOptions(options);
+  const note = normalizeOptionalString(options.note);
+  const startedAt = new Date();
+  await ensureStore(cwd);
+
+  const recordedStatus = gitStatusMap(cwd);
+  const recordedRepo = gitSnapshot(cwd, recordedStatus);
+  const changedFiles = [...recordedStatus.keys()].sort();
+  const check = options.check ? { source: "record_check", ...runCheckWithProgress(String(options.check), cwd) } : null;
+  const afterCheckStatus = gitStatusMap(cwd);
+  const afterCheckRepo = gitSnapshot(cwd, afterCheckStatus);
+  const checkChangedFiles = check ? gitChangedFilesBetween(recordedStatus, afterCheckStatus) : [];
+  const writeScope = evaluateWriteScope(options, changedFiles);
+  if (check) {
+    check.repo = {
+      before: recordedRepo,
+      after: afterCheckRepo
+    };
+    check.changed_files = checkChangedFiles;
+  }
+  const endedAt = new Date();
+  let status = check && check.exit_code !== 0 ? "failed" : "ok";
+  let statusReason = check && check.exit_code !== 0 ? "check_failed" : "manual_recorded";
+  let outputSignal = {
+    kind: "manual_record",
+    status,
+    reason: statusReason,
+    note: "Rux recorded current-session work without launching a provider CLI."
+  };
+  const notes = [
+    "Manual/current-session record. Rux did not launch the provider adapter for this run.",
+    "Manual records are down-weighted in recommendations and do not satisfy release provider-task evidence.",
+    ...(note ? [note] : [])
+  ];
+  if (status === "ok" && writeScope.violations.length > 0) {
+    status = "failed";
+    statusReason = "write_scope_violation";
+    outputSignal = {
+      kind: "write_scope_violation",
+      status: "failed",
+      reason: "write_scope_violation",
+      note: `Manual record changed files outside --write-scope: ${writeScope.violations.join(", ")}.`
+    };
+    notes.push(outputSignal.note);
+  }
+  const id = createRunId(startedAt);
+  const transcript = formatManualTranscript({
+    runner,
+    task,
+    note,
+    check,
+    changedFiles,
+    startedAt,
+    endedAt
+  });
+  const transcriptPath = await writeTranscript(cwd, id, transcript);
+  const replayCommand = buildRecordCommand({
+    task,
+    runner,
+    options,
+    model: metadata.model,
+    effort: metadata.effort
+  });
+
+  const run = {
+    schema_version: SCHEMA_VERSION,
+    type: "run",
+    id,
+    purpose: "task_run",
+    source: "manual",
+    confidence: "high",
+    task,
+    task_kind: classifyTask(task),
+    runner,
+    model: metadata.model ?? null,
+    effort: metadata.effort ?? null,
+    roster: "solo",
+    parent_id: null,
+    role: "runner",
+    cwd,
+    status,
+    status_reason: statusReason,
+    started_at: startedAt.toISOString(),
+    ended_at: endedAt.toISOString(),
+    duration_ms: endedAt.getTime() - startedAt.getTime(),
+    repo: {
+      recorded_at: recordedRepo,
+      after_check: check ? afterCheckRepo : null
+    },
+    transcript_path: relative(cwd, transcriptPath),
+    changed_files: changedFiles,
+    write_scope: writeScope.declared ? {
+      allowed: writeScope.allowed,
+      violations: writeScope.violations
+    } : null,
+    checks: check ? [check] : [],
+    human_verdict: null,
+    cost_hint: metadata.cost_hint ?? null,
+    output_signal: outputSignal,
+    adapter: buildManualAdapterRecord(runner, metadata),
+    replay: manualReplayMetadata(replayCommand),
+    notes
+  };
+
+  await appendLedger(cwd, run);
+  writeRuxProgress(`recorded manual run ${run.id} status=${run.status} reason=${run.status_reason}`);
   console.log(JSON.stringify(summarizeRun(run), null, 2));
 }
 
@@ -1764,6 +1896,27 @@ function buildAdapterRecord(adapter, metadata) {
   };
 }
 
+function buildManualAdapterRecord(runner, metadata) {
+  return {
+    runner,
+    command: null,
+    argv: [],
+    exit_code: null,
+    timed_out: false,
+    stdout_bytes: null,
+    stderr_bytes: null,
+    stderr_signal: {
+      level: "none",
+      reason: "Rux did not launch a provider adapter for this manual/current-session record."
+    },
+    error: null,
+    notes: [
+      "Manual/current-session record. Adapter invocation was not observed by Rux."
+    ],
+    metadata_sources: metadataSources(metadata)
+  };
+}
+
 function classifyAdapterStderr({ exitCode, timedOut, stderr, stderrBytes, error }) {
   const parsedBytes = Number(stderrBytes);
   const bytes = Number.isFinite(parsedBytes) ? parsedBytes : byteLength(stderr);
@@ -2136,6 +2289,8 @@ function buildRecommendation(task, events) {
         evidence_runs: best.evidence_runs,
         stats: {
           labeled_runs: best.total,
+          manual_runs: best.manual,
+          adapter_observed_runs: best.adapter_observed,
           accepted_runs: best.accepted,
           partial_runs: best.partial,
           rejected_runs: best.rejected,
@@ -2153,6 +2308,8 @@ function buildRecommendation(task, events) {
         evidence_runs: [],
         stats: {
           labeled_runs: 0,
+          manual_runs: 0,
+          adapter_observed_runs: 0,
           accepted_runs: 0,
           partial_runs: 0,
           rejected_runs: 0,
@@ -2241,6 +2398,14 @@ function statusNextActions({ topRuns, liveProviderTaskRuns, eligibility, release
 
 function isLiveProviderTaskRun(run) {
   return run.source === "live" && run.runner !== "fake" && run.purpose !== "provider_smoke";
+}
+
+function isManualTaskRun(run) {
+  return run.source === "manual" && run.runner !== "fake" && run.purpose !== "provider_smoke";
+}
+
+function isRecommendationSourceRun(run) {
+  return run.source === "live" || run.source === "manual";
 }
 
 function buildNextCapture({ events, liveProviderTaskRuns, eligibility, policy, packageJson }) {
@@ -2487,6 +2652,34 @@ function buildRunCommand({ task, runner, roster, options, model = null, effort =
   return parts.map(shellQuote).join(" ");
 }
 
+function buildRecordCommand({ task, runner, options, model = null, effort = null }) {
+  const parts = [
+    CLI_NAME,
+    "record",
+    task,
+    "--runner",
+    runner,
+    "--cwd",
+    resolveCwd(options)
+  ];
+
+  if (model) {
+    parts.push("--model", model);
+  }
+  if (effort) {
+    parts.push("--effort", effort);
+  }
+
+  for (const key of ["cost-hint", "check", "note", "write-scope"]) {
+    const value = options[key];
+    if (value !== undefined && value !== true) {
+      parts.push(`--${key}`, String(value));
+    }
+  }
+
+  return parts.map(shellQuote).join(" ");
+}
+
 function buildProviderSmokeCommand({ runner, options, model = null, effort = null }) {
   const parts = [
     CLI_NAME,
@@ -2522,6 +2715,18 @@ function recordedReplayMetadata(command, { runner, humanReviewRequired, reason }
     writes_ledger: true,
     human_review_required: humanReviewRequired,
     reason
+  };
+}
+
+function manualReplayMetadata(command) {
+  return {
+    available: false,
+    source: "recorded",
+    command,
+    provider_call_required: false,
+    writes_ledger: true,
+    human_review_required: true,
+    reason: "This records current-session work after the fact. Re-running it would only duplicate the record, not replay the original agent work."
   };
 }
 
@@ -2565,6 +2770,16 @@ function replayMetadataForRun(run) {
 
   if (!run || run.source === "imported") {
     return unavailableReplayMetadata("Imported sessions are continuity records; Rux did not execute the original provider command.");
+  }
+
+  if (run.source === "manual") {
+    return manualReplayMetadata(buildRecordCommand({
+      task: run.task,
+      runner: run.runner,
+      options: replayOptionsFromRun(run),
+      model: run.model,
+      effort: run.effort
+    }));
   }
 
   if (run.parent_id) {
@@ -3413,7 +3628,7 @@ function recommendationBlockers(run, verdict, marks = []) {
   const blockers = [];
   if (run.parent_id) blockers.push("child_run");
   if (run.purpose === "provider_smoke") blockers.push("provider_smoke");
-  if (run.source !== "live") blockers.push("not_live");
+  if (!isRecommendationSourceRun(run)) blockers.push("not_live");
   if (run.confidence !== "high") blockers.push("not_high_confidence");
   if (run.runner === "fake") blockers.push("fake_runner");
   if (run.status !== "ok") blockers.push("run_not_ok");
@@ -3451,6 +3666,8 @@ function summarizeEvidenceGroups(runs, verdicts, marks) {
       accepted: 0,
       partial: 0,
       rejected: 0,
+      manual: 0,
+      adapter_observed: 0,
       score_total: 0,
       evidence_runs: []
     };
@@ -3458,6 +3675,11 @@ function summarizeEvidenceGroups(runs, verdicts, marks) {
     const runMarks = marks.get(run.id) ?? [];
     const weight = outcomeWeight(run, verdict, runMarks);
     group.total += 1;
+    if (run.source === "manual") {
+      group.manual += 1;
+    } else {
+      group.adapter_observed += 1;
+    }
     group.score_total += weight;
     if (verdict?.verdict === "accepted" || hasLifecycleMark(runMarks, "accepted-downstream")) group.accepted += 1;
     if (verdict?.verdict === "partial") group.partial += 1;
@@ -3551,15 +3773,17 @@ function maturityRank(level) {
 }
 
 function outcomeWeight(run, verdict, marks = []) {
+  const sourceMultiplier = run.source === "manual" ? 0.5 : 1;
+  let weight = 0;
   if (hasLifecycleMark(marks, "reverted")) return 0;
-  if (hasLifecycleMark(marks, "accepted-downstream")) return 1;
-  if (verdict?.verdict === "accepted") return 1;
-  if (verdict?.verdict === "partial") return 0.5;
-  if (verdict?.verdict === "rejected") return 0;
-  if (Array.isArray(run.checks) && run.checks.length > 0 && run.checks.every((check) => check.exit_code === 0) && run.status === "ok") {
-    return 0.75;
+  if (hasLifecycleMark(marks, "accepted-downstream")) weight = 1;
+  else if (verdict?.verdict === "accepted") weight = 1;
+  else if (verdict?.verdict === "partial") weight = 0.5;
+  else if (verdict?.verdict === "rejected") weight = 0;
+  else if (Array.isArray(run.checks) && run.checks.length > 0 && run.checks.every((check) => check.exit_code === 0) && run.status === "ok") {
+    weight = 0.75;
   }
-  return 0;
+  return weight * sourceMultiplier;
 }
 
 function summarizeOutcome(run, children, verdict, marks = []) {
@@ -3596,7 +3820,7 @@ function summarizeOutcome(run, children, verdict, marks = []) {
   if (hasLifecycleMark(marks, "accepted-downstream")) {
     return {
       label: "accepted_downstream",
-      confidence: run.source === "live" && run.confidence === "high" ? "high" : "medium",
+      confidence: isRecommendationSourceRun(run) && run.confidence === "high" ? "high" : "medium",
       source: "lifecycle_mark",
       score: 1,
       reason: "This run was later marked as accepted downstream.",
@@ -3615,7 +3839,7 @@ function summarizeOutcome(run, children, verdict, marks = []) {
   if (verdict?.verdict) {
     return {
       label: `human_${verdict.verdict}`,
-      confidence: run.source === "live" && run.confidence === "high" ? "high" : "medium",
+      confidence: isRecommendationSourceRun(run) && run.confidence === "high" ? "high" : "medium",
       source: "human_verdict",
       score: outcomeWeight(run, verdict, marks),
       reason: `Latest human verdict is ${verdict.verdict}.`,
@@ -3743,7 +3967,8 @@ function outcomeRisks(run, children, verdict, marks = []) {
   }
   if (hasLifecycleMark(marks, "reverted")) risks.push("reverted_downstream");
   if (hasLifecycleMark(marks, "replayed")) risks.push("replayed_downstream");
-  if (run.source !== "live") risks.push("not_live");
+  if (!isRecommendationSourceRun(run)) risks.push("not_live");
+  if (run.source === "manual") risks.push("manual_capture");
   if (run.confidence !== "high") risks.push("not_high_confidence");
   if (run.runner === "fake") risks.push("fake_runner");
   if (run.status === "blocked") risks.push("blocked_run");
@@ -3826,8 +4051,8 @@ function evaluateRunRecord(run, children, verdicts, marksByRun = new Map()) {
       adapter_stderr_reason: stderrSignal?.reason ?? null,
       repo_snapshot: Boolean(run.repo),
       output_signal: run.output_signal?.kind ?? null,
-      repo_dirty_before: run.repo?.before?.dirty_entries ?? run.repo?.imported_at?.dirty_entries ?? null,
-      repo_dirty_after: run.repo?.after?.dirty_entries ?? null,
+      repo_dirty_before: run.repo?.before?.dirty_entries ?? run.repo?.recorded_at?.dirty_entries ?? run.repo?.imported_at?.dirty_entries ?? null,
+      repo_dirty_after: run.repo?.after?.dirty_entries ?? run.repo?.after_check?.dirty_entries ?? null,
       checks_total: checks.length,
       checks_failed: failedChecks.length,
       check_changed_files: changedByChecks.length,
@@ -3864,20 +4089,21 @@ function evaluateRunRecord(run, children, verdicts, marksByRun = new Map()) {
 }
 
 function scoreBasis(run, verdict, blockers, marks = []) {
+  const prefix = run.source === "manual" ? "manual:" : "";
   if (blockers.length > 0) {
     return `blocked:${blockers.join(",")}`;
   }
   if (hasLifecycleMark(marks, "accepted-downstream")) {
-    return "lifecycle_mark:accepted_downstream";
+    return `${prefix}lifecycle_mark:accepted_downstream`;
   }
   if (verdict?.verdict) {
-    return `human_verdict:${verdict.verdict}`;
+    return `${prefix}human_verdict:${verdict.verdict}`;
   }
   if (Array.isArray(run.checks) && run.checks.length > 0 && run.checks.every((check) => check.exit_code === 0) && run.status === "ok") {
-    return "checks_passed";
+    return `${prefix}checks_passed`;
   }
   if (Array.isArray(run.checks) && run.checks.length > 0 && run.checks.some((check) => check.exit_code !== 0)) {
-    return "checks_failed";
+    return `${prefix}checks_failed`;
   }
   return "no_positive_signal";
 }
@@ -4109,4 +4335,36 @@ function formatImportedTranscript({ from, runner, task, status, startedAt, ended
     "## imported transcript",
     importedText.trimEnd()
   ].join("\n");
+}
+
+function formatManualTranscript({ runner, task, note, check, changedFiles, startedAt, endedAt }) {
+  const lines = [
+    `runner: ${runner}`,
+    `source: manual`,
+    `confidence: high`,
+    `task: ${task}`,
+    `started_at: ${startedAt.toISOString()}`,
+    `ended_at: ${endedAt.toISOString()}`,
+    "",
+    "## manual record",
+    "Rux recorded current-session work after the fact. It did not launch the provider CLI for this run.",
+    "",
+    "## changed files",
+    ...(changedFiles.length > 0 ? changedFiles.map((file) => `- ${file}`) : ["none"])
+  ];
+
+  if (check) {
+    lines.push(
+      "",
+      "## check",
+      `command: ${check.command}`,
+      `exit_code: ${check.exit_code}`
+    );
+  }
+
+  if (note) {
+    lines.push("", "## note", note);
+  }
+
+  return lines.join("\n");
 }

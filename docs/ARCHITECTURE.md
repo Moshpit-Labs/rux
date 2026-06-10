@@ -97,6 +97,8 @@ child_run_ids
 
 Imported runs are allowed, but they are not equivalent to live captured runs. Import only reads a user-selected local file, stores the transcript, and writes `source: imported` plus `confidence: low`. It must not crawl provider history directories automatically. Imported runs can help continuity, but recommendation should ignore them unless later labels make them useful.
 
+Manual records are the middle ground between wrapped runs and imports. `rux record` writes `source: manual` plus `confidence: high` when the user names the runner, records current dirty files as the changed surface, can run an explicit check, and applies `--write-scope` to the recorded dirty files. These records may guide local recommendations when checked or reviewed, but they are down-weighted, not adapter-observed, and therefore do not replace provider-smoke or release task evidence.
+
 ### Run
 
 A run is one attempt to complete a task with a selected roster and runner set.
@@ -109,7 +111,7 @@ Roster parent runs capture the repo state before the first child and after the l
 
 The ledger is the source of truth.
 
-It is append-only JSONL stored locally. It records tasks, runner calls, adapter invocation metadata, status reasons, stderr signal classification, transcripts, repo snapshots, files changed, replay commands, inline checks, post-run checks, verdicts, and user feedback. Post-run check events carry their own repo snapshot and changed-file list, because they may be captured after the original provider run. The ledger powers history, replay, evals, routing, and improvement proposals.
+It is append-only JSONL stored locally. It records tasks, runner calls, manual current-session records, adapter invocation metadata, status reasons, stderr signal classification, transcripts, repo snapshots, files changed, replay commands, inline checks, post-run checks, verdicts, and user feedback. Post-run check events carry their own repo snapshot and changed-file list, because they may be captured after the original provider run. The ledger powers history, replay, evals, routing, and improvement proposals.
 
 ## Core Flow
 
@@ -256,7 +258,7 @@ Recommendation outputs include evidence maturity:
 
 In v0, `--model`, `--effort`, and `--cost-hint` are run metadata. Rux records them and ranks by them, but does not assume every provider CLI accepts the same flags.
 
-`rux eval <run-id>` is the routing explanation surface for that behavior. It reports blockers such as `not_live`, `not_high_confidence`, `fake_runner`, `provider_smoke`, `child_run`, and `unlabeled`, plus outcome, score basis, status reason, adapter signals, stderr interpretation, and release-smoke evidence.
+`rux eval <run-id>` is the routing explanation surface for that behavior. It reports blockers such as `not_live`, `not_high_confidence`, `fake_runner`, `provider_smoke`, `child_run`, and `unlabeled`, plus outcome, score basis, status reason, adapter signals, stderr interpretation, and release-smoke evidence. Manual records that pass routing still show a `manual_capture` outcome risk so users know Rux did not launch the provider adapter.
 
 `rux status` is the creator/team overview. It combines ledger counts, outcome label distribution, recommendation evidence maturity, provider-smoke readiness, release blockers, recent runs, and next actions without calling providers or writing files. When it suggests the next capture command, it also says whether that command would call a provider, write ledger evidence, and need human review.
 

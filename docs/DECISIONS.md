@@ -73,3 +73,19 @@ This is the lightweight decision log for Rux. Add entries when a choice would ot
 - Reason: Dogfood showed Gemini write mode editing files outside explicit task scope. Until Rux has stronger isolation or patch approval, scope breaches must become visible negative evidence.
 - Consequence: `write_scope_violation` appears in run status, output signal, eval routing blockers, outcome risks, and exports.
 - Revisit when: provider adapters can enforce write allowlists before edits, not just classify them after the run.
+
+## RUX-010: Manual Current-Session Records Count, But Do Not Replace Adapter Evidence
+
+- Date: 2026-06-09
+- Decision: `rux record` captures current-session work after the fact without launching a nested provider CLI.
+- Reason: Dogfood showed that agents using Rux from inside an active Codex session could only run `rux plan` plus `rux report`; nesting another provider run just to satisfy capture would waste tokens and distort the evidence loop.
+- Consequence: Manual records can become recommendation evidence when they are high-confidence and backed by checks or verdicts. They remain clearly marked as manual, are down-weighted in scoring, carry a `manual_capture` outcome risk, respect `--write-scope`, and do not satisfy release gates that require adapter-observed provider task evidence.
+- Revisit when: Codex, Claude, Gemini, or editor integrations expose a first-class way for Rux to observe the active session directly.
+
+## RUX-011: Post-Goal Claude Review Is A Ritual, Not Infrastructure
+
+- Date: 2026-06-10
+- Decision: After a goal is achieved, use Claude CLI for lead-style review/advice before setting the next goal, but keep the mechanism to one prompt template and an explicit command.
+- Reason: The user wants a recurring second-opinion loop, but turning it into a daemon, scheduler, or service would add process weight before the product earns it.
+- Consequence: `prompts/post-goal-review.md` is the harness. Prompts are sanitized by default; private workspace details require explicit user approval after the disclosure risk is stated. If a requested model alias is unavailable, the fallback must be reported.
+- Revisit when: goal closeouts become frequent enough that manual invocation is the bottleneck.

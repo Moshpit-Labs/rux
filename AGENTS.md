@@ -35,10 +35,14 @@ Rux is the default evidence layer for substantial agent-owned work.
 - When delegating to a provider CLI, use `rux run "<task>" --runner claude|codex|gemini --provider-mode plan|write --cwd "$PWD" --check "<repo check>"` instead of invoking the provider directly.
 - For tightly scoped write tasks, add `--write-scope "path[,path...]"` so out-of-scope edits become failed evidence instead of silent drift.
 - If Rux refuses a real provider run because the worktree is dirty, do not pass `--allow-dirty` unless the dirty files are intentionally part of the provider context and the user has accepted that risk.
-- Do not spawn nested Codex/Claude/Gemini runs only to satisfy this rule when the current agent is already doing the work; record that Rux cannot yet capture the current session directly.
+- Do not spawn nested Codex/Claude/Gemini runs only to satisfy this rule when the current agent is already doing the work; use `rux record "<task>" --runner codex|claude|gemini --check "<repo check>" --cwd "$PWD"` after the work instead.
 - After reviewing a Rux run, attach `rux verdict <run-id> accepted|partial|rejected --cwd "$PWD" --note "<why>"`.
 - Capture dogfood feedback with `rux report "<summary>" --kind bug|ux|adapter|docs|routing|orchestration|install|idea|success|other --source-repo "$PWD" --run-id <id-if-any> --command "<command>" --note "<details>" --cwd "$PWD"`.
 - If Rux is unavailable or would block an urgent/trivial task, continue and mention why the run or report was not captured.
+
+## Post-Goal Lead Review
+
+After a goal is genuinely achieved and before creating the next goal, ask Claude CLI for lead-style review/advice using `prompts/post-goal-review.md`. Keep the prompt sanitized by default; do not send private repo names, local paths, proprietary code, secrets, customer data, or unpublished workspace details unless the user explicitly approves that disclosure after being told the risk. Record any unavailable requested model alias and the fallback used.
 
 ## Documentation Contract
 

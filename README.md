@@ -20,6 +20,7 @@ The first useful version is intentionally small:
 - Run fixed sequential rosters: `solo`, `pair`, `repair`, and `plan-code-review`.
 - Record the prompt, runner, model, effort, transcript, adapter invocation, status reason, repo state, changed files, outcome, and cost hints in a local ledger.
 - Capture tests/checks during or after a run, explicit human verdicts, and downstream lifecycle marks.
+- Record current-session work without nesting another provider run.
 - Store replay metadata so captured runs can explain how they were invoked.
 - Explain the outcome signal behind each run.
 - Explain why a run does or does not count as routing evidence.
@@ -53,7 +54,7 @@ That memory starts with capture. If the record is weak, routing is theater.
 
 ## Current State
 
-This repo has the first v0.1 capture spine: a CLI with repo init, a fake runner, Claude plan-mode capture, Codex read-only capture, Gemini plan-mode capture, explicit provider smoke checks, fixed sequential rosters, dry-run roster planning, repo policy, explicit file import for old sessions, model/effort/cost metadata, JSONL ledger, transcript capture, repo-state capture, changed-file capture, inline and post-run check capture, `ls`, `show`, `outcome`, `eval`, `rank`, `suggest`, `plan`, `status`, `export`, `policy`, `propose`, `report`, `doctor`, `release-check`, human verdict events, downstream lifecycle marks, and local feedback reports.
+This repo has the first v0.1 capture spine: a CLI with repo init, a fake runner, Claude plan-mode capture, Codex read-only capture, Gemini plan-mode capture, explicit provider smoke checks, fixed sequential rosters, dry-run roster planning, repo policy, explicit file import for old sessions, current-session manual records, model/effort/cost metadata, JSONL ledger, transcript capture, repo-state capture, changed-file capture, inline and post-run check capture, `ls`, `show`, `outcome`, `eval`, `rank`, `suggest`, `plan`, `status`, `export`, `policy`, `propose`, `report`, `doctor`, `release-check`, human verdict events, downstream lifecycle marks, and local feedback reports.
 
 ## Install
 
@@ -72,10 +73,13 @@ rux runners
 rux run "review the navigation code" --runner gemini
 rux run "update the navigation code" --runner gemini --provider-mode write --check "npm run typecheck"
 rux run "update only the stats filters" --runner codex --provider-mode write --write-scope "lib/stats/filters.ts,test/stats-filters.test.ts" --check "npm test"
+rux record "implemented the stats filters in the current Codex session" --runner codex --check "npm test" --note "No nested provider run; current session did the work."
 rux report "Gemini surfaced a question but the terminal flow was unclear" --kind ux --command "rux run ..." --note "The question appeared in the transcript but was easy to miss."
 ```
 
 `rux run` keeps stdout as JSON for scripts. Provider output and Rux progress are mirrored to stderr while the provider runs, so questions, start/finish state, checks, and quiet long-running work are visible in the terminal. The default provider mode is `plan`; use `--provider-mode write` when you want the wrapped provider to edit files. Real provider runs refuse dirty worktrees by default; commit, stash, or revert existing changes first, or pass `--allow-dirty` only when those changes are intentionally part of the provider context. Use `--write-scope` to declare the files or directories a provider is allowed to change; Rux records out-of-scope edits as failed runs. If a provider asks for input, Rux records the run as `blocked`. If a provider changes files while Rux asked for plan mode, Rux records the run as `failed`.
+
+Use `rux record` when the current agent session already did the work and you do not want to spawn a nested Claude/Codex/Gemini process just to satisfy the ledger. Manual records can help local recommendations when they have checks or verdicts, but they are down-weighted, labeled as manual evidence, and do not replace real provider-smoke or adapter-run evidence in the release gate. `--write-scope` applies to manual records too.
 
 Start here:
 

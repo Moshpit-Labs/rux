@@ -31,6 +31,7 @@ try {
   assert(helpRun.stdout.includes("Usage:"), "--help should print usage");
   assert(helpRun.stdout.includes("rux init"), "--help should include init command");
   assert(helpRun.stdout.includes("rux run"), "--help should include run command");
+  assert(helpRun.stdout.includes("rux record"), "--help should include manual record command");
   assert(helpRun.stdout.includes("rux check"), "--help should include post-run check command");
   assert(helpRun.stdout.includes("rux report"), "--help should include feedback report command");
   assert(helpRun.stdout.includes("--allow-dirty"), "--help should include dirty worktree override");
@@ -454,6 +455,88 @@ try {
   assert(fakeEval.status_reason === "completed", "eval should expose status reason");
   assert(fakeEval.signals.adapter_exit_code === 0, "eval should expose adapter exit code");
   assert(fakeEval.signals.adapter_stderr_signal === "none", "eval should expose adapter stderr signal");
+
+  const manualRecordRoot = join(tempRoot, "manual-record");
+  await mkdir(manualRecordRoot, { recursive: true });
+  run("git", ["init"], manualRecordRoot);
+  await writeFile(join(manualRecordRoot, "README.md"), "# Manual Record\n", "utf8");
+  run("git", ["add", "README.md"], manualRecordRoot);
+  run("git", ["commit", "-m", "initial"], manualRecordRoot, {
+    GIT_AUTHOR_NAME: "Rux Smoke",
+    GIT_AUTHOR_EMAIL: "smoke@example.com",
+    GIT_COMMITTER_NAME: "Rux Smoke",
+    GIT_COMMITTER_EMAIL: "smoke@example.com"
+  });
+  await writeFile(join(manualRecordRoot, "manual-change.txt"), "manual\n", "utf8");
+  const manualRecord = JSON.parse(run("node", [
+    cliPath,
+    "record",
+    "implemented work in the current Codex session",
+    "--runner",
+    "codex",
+    "--cwd",
+    manualRecordRoot,
+    "--check",
+    "node --version",
+    "--write-scope",
+    "manual-change.txt",
+    "--note",
+    "current session did the work"
+  ]).stdout);
+  assert(manualRecord.source === "manual", "manual record should mark source");
+  assert(manualRecord.confidence === "high", "manual record should be high confidence when checked/reviewable");
+  assert(manualRecord.status === "ok", "checked manual record should be ok when the check passes");
+  assert(manualRecord.status_reason === "manual_recorded", "manual record should expose manual status reason");
+  assert(manualRecord.runner === "codex", "manual record should preserve the claimed runner");
+  assert(manualRecord.adapter.command === null, "manual record should not invent adapter command");
+  assert(manualRecord.adapter.notes[0].includes("Manual/current-session"), "manual record should preserve adapter uncertainty");
+  assert(manualRecord.changed_files.includes("manual-change.txt"), "manual record should capture current dirty files as changed files");
+  assert(manualRecord.write_scope.violations.length === 0, "manual write scope should pass for declared files");
+  assert(manualRecord.checks[0]?.source === "record_check", "manual record checks should be source-labeled");
+  assert(manualRecord.replay.available === false, "manual record should not pretend to replay original work");
+  assert(manualRecord.replay.provider_call_required === false, "manual record replay should not require provider call");
+  const manualEval = JSON.parse(run("node", [cliPath, "eval", manualRecord.id, "--cwd", manualRecordRoot]).stdout);
+  assert(manualEval.routing.eligible === true, "checked manual records should be recommendation-eligible");
+  assert(manualEval.routing.score === 0.375, "manual check-backed records should be down-weighted");
+  assert(manualEval.routing.score_basis === "manual:checks_passed", "manual score basis should be explicit");
+  assert(manualEval.outcome.risks.includes("manual_capture"), "manual outcome should show manual capture risk");
+  assert(!manualEval.outcome.risks.includes("not_live"), "manual records should not be treated like imports");
+  const manualSuggestion = JSON.parse(run("node", [cliPath, "suggest", "manual work", "--cwd", manualRecordRoot]).stdout);
+  assert(manualSuggestion.recommendation.runner === "codex", "manual evidence should guide local recommendation");
+  assert(manualSuggestion.recommendation.stats.manual_runs === 1, "suggest should label manual supporting evidence");
+  assert(manualSuggestion.recommendation.stats.adapter_observed_runs === 0, "suggest should label missing adapter-observed support");
+  const manualStatus = JSON.parse(run("node", [cliPath, "status", "--cwd", manualRecordRoot]).stdout);
+  assert(manualStatus.evidence.manual_task_runs === 1, "status should count manual task runs");
+  assert(manualStatus.evidence.live_provider_task_runs === 0, "status should keep manual separate from live provider task runs");
+  const manualReleaseCheck = JSON.parse(run("node", [cliPath, "release-check", "--cwd", manualRecordRoot]).stdout);
+  assert(manualReleaseCheck.gates.find((gate) => gate.name === "real_provider_task_evidence")?.ok === false, "manual records should not satisfy release provider task evidence");
+
+  const manualScopeRoot = join(tempRoot, "manual-scope");
+  await mkdir(manualScopeRoot, { recursive: true });
+  run("git", ["init"], manualScopeRoot);
+  await writeFile(join(manualScopeRoot, "README.md"), "# Manual Scope\n", "utf8");
+  run("git", ["add", "README.md"], manualScopeRoot);
+  run("git", ["commit", "-m", "initial"], manualScopeRoot, {
+    GIT_AUTHOR_NAME: "Rux Smoke",
+    GIT_AUTHOR_EMAIL: "smoke@example.com",
+    GIT_COMMITTER_NAME: "Rux Smoke",
+    GIT_COMMITTER_EMAIL: "smoke@example.com"
+  });
+  await writeFile(join(manualScopeRoot, "outside.txt"), "outside\n", "utf8");
+  const manualScopeRecord = JSON.parse(run("node", [
+    cliPath,
+    "record",
+    "manual scope violation",
+    "--runner",
+    "codex",
+    "--cwd",
+    manualScopeRoot,
+    "--write-scope",
+    "allowed.txt"
+  ]).stdout);
+  assert(manualScopeRecord.status === "failed", "manual records should fail on write-scope violations");
+  assert(manualScopeRecord.status_reason === "write_scope_violation", "manual scope failures should use write-scope status reason");
+  assert(manualScopeRecord.write_scope.violations.includes("outside.txt"), "manual write-scope violations should list files");
 
   const ledgerPath = join(tempRoot, ".rux", "ledger");
   assert(existsSync(ledgerPath), "ledger directory should exist");
