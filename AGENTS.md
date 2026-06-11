@@ -27,18 +27,19 @@ Runtime naming lives in `src/identity.mjs`; package publishing stays gated by lo
 - If a task needs multiple agents, state why one agent is not enough.
 - If a feature adds new nouns, push back unless it clearly reduces user effort.
 
-## Rux Dogfood
+## Rux Proof Quarter — Routing With Receipts (until 2026-09-12)
 
-Rux is the default evidence layer for substantial agent-owned work.
+All Moshpit repos follow this discipline for substantial agent work (implementation, review, repair — not trivial edits). The pre-registered bar lives in `docs/PROOF.md` in this repo. Rux 0.2.0+ is installed globally as `rux`.
 
-- Before non-trivial implementation, review, or repair work, run `rux plan "<task>" --cwd "$PWD"` and use it as a read-only roster/evidence preview.
-- When delegating to a provider CLI, use `rux run "<task>" --runner claude|codex|gemini --provider-mode plan|write --cwd "$PWD" --check "<repo check>"` instead of invoking the provider directly.
-- For tightly scoped write tasks, add `--write-scope "path[,path...]"` so out-of-scope edits become failed evidence instead of silent drift.
-- If Rux refuses a real provider run because the worktree is dirty, do not pass `--allow-dirty` unless the dirty files are intentionally part of the provider context and the user has accepted that risk.
-- Do not spawn nested Codex/Claude/Gemini runs only to satisfy this rule when the current agent is already doing the work; use `rux record "<task>" --runner codex|claude|gemini --check "<repo check>" --cwd "$PWD"` after the work instead.
-- After reviewing a Rux run, attach `rux verdict <run-id> accepted|partial|rejected --cwd "$PWD" --note "<why>"`.
-- Capture dogfood feedback with `rux report "<summary>" --kind bug|ux|adapter|docs|routing|orchestration|install|idea|success|other --source-repo "$PWD" --run-id <id-if-any> --command "<command>" --note "<details>" --cwd "$PWD"`.
-- If Rux is unavailable or would block an urgent/trivial task, continue and mention why the run or report was not captured.
+1. Ask before working: `rux suggest "<task>" --cwd "$PWD"` (add `rux plan "<task>" --cwd "$PWD"` for large work). Note the recommendation and its maturity label.
+2. Capture the work:
+   - Delegating to a provider CLI: `rux run "<task>" --runner claude|codex|gemini --provider-mode plan|write --task-kind <kind> --check "<repo check>" --cwd "$PWD"`, with `--write-scope "path[,path...]"` for tightly scoped edits. Do not pass `--allow-dirty` unless the dirty files are intentionally part of the provider context and the user accepted that risk.
+   - Current session does the work itself: `rux record --start "<task>" --runner <your-cli> --cwd "$PWD"` before starting; when done, `rux record "<task>" --runner <your-cli> --task-kind <kind> --check "<repo check>" --verdict accepted|partial|rejected --cwd "$PWD"`. Never spawn a nested provider run just to satisfy the ledger.
+3. Stamp the routing decision at decision time, never reconstructed later: `rux report "routing decision: <task>" --kind routing --run-id <run-id> --cwd "$PWD" --note "suggest recommended <runner/roster> (maturity <level>); followed|overridden because <reason>"`. Every override needs a reason.
+4. Label honestly: real checks only; attach verdicts (`--verdict` inline or `rux verdict <run-id> ... --note "<why>"`); when earlier work is reverted or ships downstream, `rux mark <run-id> reverted|accepted-downstream --cwd "$PWD"`.
+5. Report friction and wins: `rux report "<summary>" --kind bug|ux|adapter|docs|routing|orchestration|install|idea|success|other --cwd "$PWD"` (success reports require `--run-id`, `--record`, or `--no-run "REASON"`).
+
+Never fabricate evidence, checks, or verdicts. If Rux is unavailable or would block an urgent or trivial task, continue and state in your summary why the evidence was not captured.
 
 ## Post-Goal Lead Review
 
