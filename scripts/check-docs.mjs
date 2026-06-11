@@ -68,6 +68,9 @@ mustInclude("docs/DECISIONS.md", decisions, "RUX-008: Dirty Worktrees Block Real
 mustInclude("docs/DECISIONS.md", decisions, "RUX-009: Write Scope Violations Are Failed Runs");
 mustInclude("docs/DECISIONS.md", decisions, "RUX-010: Manual Current-Session Records Count, But Do Not Replace Adapter Evidence");
 mustInclude("docs/DECISIONS.md", decisions, "RUX-011: Post-Goal Claude Review Is A Ritual, Not Infrastructure");
+mustInclude("docs/DECISIONS.md", decisions, "RUX-012: Evidence Taxonomy Is Explicit, Not Inferred");
+mustInclude("docs/DECISIONS.md", decisions, "RUX-013: Release Evidence Preserves Attempts");
+mustInclude("docs/DECISIONS.md", decisions, "RUX-014: Public Pages Must Trail Ledger Proof");
 
 const scripts = packageJson.scripts ?? {};
 if (!scripts["check:docs"] || !scripts["check:docs"].includes("scripts/check-docs.mjs")) {

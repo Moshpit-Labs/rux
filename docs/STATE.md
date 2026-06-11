@@ -73,6 +73,8 @@ Rux is a public coding-agent run ledger that records real outcomes first, then u
 - Refuse parallel-N over one subscription CLI account by default. Users can opt in only when their provider terms and account setup allow it.
 - Use "agent runner" and "roster" in the product. Avoid "AI gateway" in user-facing language.
 - Self-improvement is proposal-only: no silent self-modification.
+- Wave 2 exited on 2026-06-11. The gated static landing page was cut; README remains the public entry surface until a proof page can cite real ledger output without inflated claims.
+- The temporary Wave 2 sprint plan is archived at `docs/archive/sprint-2026-06.md`; permanent outcomes now live in `docs/DECISIONS.md`, `docs/STATE.md`, and `docs/V0_PLAN.md`.
 
 ## Research Takeaways
 
@@ -118,4 +120,4 @@ Local Moshpit learnings:
 
 ## Next Action
 
-The v0.1 package is public. Wave 2 has started from the cross-repo dogfood analysis in `docs/sprint-2026-06.md` (temporary planning artifact; sticky outcomes graduate into permanent docs at wave exit). Sprint 2.1, Sprint 2.2a, Sprint 2.2b, and Sprint 2.3 core are implemented, verified, and pushed through commit `b9b1dbd`: TTY output is human-readable by default, `--json` preserves machine output, headless verdict capture works on `record` and `check`, provider-smoke attempts are visible, mark nudges are computed from changed-file overlap, and README now leads with the five-minute loop. `npm run release:verify` passed on the clean tree. The static landing page remains the gated Sprint 2.3 item and should ship only after wave-exit criteria are confirmed; it is the first item to keep cut if the release train needs to stay tight. Next highest-leverage work is wave-exit graduation: move sticky outcomes from `docs/sprint-2026-06.md` into `DECISIONS`/`STATE`/`V0_PLAN`, archive the sprint artifact, and decide whether the gated landing page is still worth shipping.
+The v0.1 package is public. Wave 2 core is complete and exited: capture attribution, read-time classification, schema v2, adapter metadata, probe/task taxonomy, TTY output, headless verdicts, provider-smoke attempts, mark nudges, and the README quickstart are implemented, verified, and pushed. `npm run release:verify` passed on the clean tree at final Wave 2 exit. The landing page is cut, not pending. Next highest-leverage work is dogfood evidence: run the new capture loop on real tasks, attach verdicts and lifecycle marks, broaden observed provider metadata beyond mocks, and only promote `rank`/`suggest` claims at the maturity level the local ledger can defend.

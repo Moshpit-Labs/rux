@@ -90,3 +90,27 @@ This is the lightweight decision log for Rux. Add entries when a choice would ot
 - Reason: The user wants a recurring second-opinion loop, but turning it into a daemon, scheduler, or service would add process weight before the product earns it.
 - Consequence: `prompts/post-goal-review.md` is the harness. Prompts are sanitized by default; private workspace details require explicit user approval after the disclosure risk is stated. If a requested model alias is unavailable, the fallback must be reported.
 - Revisit when: goal closeouts become frequent enough that manual invocation is the bottleneck.
+
+## RUX-012: Evidence Taxonomy Is Explicit, Not Inferred
+
+- Date: 2026-06-11
+- Decision: New records must keep purpose, task kind, provider mode, and provenance explicit. Absent `--task-kind`, Rux records `task_kind: unspecified` with a non-authoritative suggestion instead of silently inferring docs work.
+- Reason: Dogfood showed that inferred labels made implementation runs look like documentation work and polluted routing evidence.
+- Consequence: `provider_mode`, `purpose`, `task_kind_source`, and `task_kind_suggestion` are first-class read surfaces. Probe runs are excluded from `suggest` and `rank` unless explicitly included.
+- Revisit when: there is enough labeled local evidence to justify stronger task-kind defaults without hiding uncertainty.
+
+## RUX-013: Release Evidence Preserves Attempts
+
+- Date: 2026-06-11
+- Decision: Provider-smoke runs are release evidence only, and repeated attempts remain visible instead of being collapsed into the final pass.
+- Reason: Silent retries would recreate the same dishonesty as vacuous passing checks: a green gate with no memory of what failed before it.
+- Consequence: `status` and `release-check` expose latest provider-smoke attempt IDs, passing run IDs, attempt chains, and attempt history. Provider-smoke records stay excluded from routing evidence and cannot receive checks, verdicts, or lifecycle marks.
+- Revisit when: release orchestration grows a first-class retry manager.
+
+## RUX-014: Public Pages Must Trail Ledger Proof
+
+- Date: 2026-06-11
+- Decision: The Wave 2 static landing page was cut. README remains the public entry surface until a page can show only claims the ledger can demonstrate.
+- Reason: The sprint's core evidence work shipped; adding a page before wave-exit proof would create marketing surface area without improving the product loop.
+- Consequence: Landing pages are allowed later, but only as small static proof surfaces grounded in real `run -> show -> verdict -> outcome` output and current `suggest` maturity counts. No broad marketing site, dashboard, or inflated claims.
+- Revisit when: Wave-exit evidence produces at least two defensible, directional-or-better heuristics and the page can cite real local output.

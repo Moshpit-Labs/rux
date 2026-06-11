@@ -60,9 +60,12 @@ Done when the same task can be captured through the supported runners. Mocked sm
 
 - Capture test/check commands and results.
 - Capture explicit human verdict: accepted, rejected, partial, unknown.
+- Capture headless verdicts on `rux record` and `rux check` with `--verdict`.
 - Capture explicit model, effort, and cost-hint metadata.
+- Capture observed model, effort, and cost metadata from structured provider output when adapters expose it.
 - Capture whether a run was later reverted or replayed.
 - Add `rux mark <run-id> reverted|replayed|accepted-downstream` as append-only lifecycle evidence.
+- Nudge for lifecycle marks at command time by comparing changed-file overlap with recent runs. Do not add a watcher or daemon.
 - Add a small `rux verdict <run-id>` command if the first pass needs it.
 - Add explicit-file import for old sessions as low-confidence records.
 - Add `rux outcome <run-id>` to explain what a run currently proves.
@@ -83,6 +86,8 @@ Done when child runs are visible in `show`.
 ### 6. Evidence-Based Suggestions
 
 - Add a tiny task-kind classifier.
+- Keep new task kind evidence explicit: absent `--task-kind`, record `unspecified` plus a non-authoritative suggestion.
+- Exclude probe runs from recommendations by default.
 - Add `rux rank` for evidence-backed runner/model/effort/roster rankings.
 - Suggest roster/runner from local history.
 - Add `rux plan "<task>"` as a dry-run roster preview that reuses suggestion evidence and fixed rules.
@@ -109,12 +114,15 @@ If scope pressure appears, ship only:
 - `rux init`,
 - `rux runners`,
 - `rux run`,
+- `rux record --start "<task>" --runner claude|codex|gemini`,
+- `rux record "<task>" --runner claude|codex|gemini`,
 - `rux provider-smoke --runner claude|codex|gemini`,
 - `rux ls`,
 - `rux show`,
 - `rux outcome <run-id>`,
 - `rux eval <run-id>`,
 - `rux check <run-id> --command "COMMAND"`,
+- `rux check <run-id> --command "COMMAND" --verdict accepted|rejected|partial|unknown`,
 - `rux mark <run-id> reverted|replayed|accepted-downstream`,
 - `rux import --from PATH`,
 - `rux plan "<task>"`,
@@ -133,8 +141,10 @@ If scope pressure appears, ship only:
 - changed-file capture,
 - inline and post-run check result capture,
 - model/effort/cost metadata capture,
+- structured provider-output parsing when supported by installed CLIs,
 - human verdict capture,
 - downstream lifecycle mark capture,
+- command-time mark nudges from changed-file overlap,
 - low-confidence import for selected old sessions,
 - proposal-only improvement notes.
 
@@ -174,8 +184,21 @@ Do not publish until:
 - explicit Claude, Codex, and Gemini provider-smoke runs have been run,
 - at least one routing-eligible real provider task has a check or human verdict,
 - provider command flags have been checked against installed CLIs,
+- provider-smoke attempt history is visible instead of silently collapsed,
 - docs describe current behavior without local-only language,
 - and the license/name/readme are ready for public readers.
+
+## Next Work After Wave 2
+
+The Wave 2 landing page was cut. Keep README as the public entry surface until the ledger can support a small proof page without inflated claims.
+
+Next useful product work is evidence accumulation, not more surface area:
+
+- capture more real provider task runs with checks and verdicts,
+- record real lifecycle marks when work is reverted, replayed, or accepted downstream,
+- broaden observed provider metadata beyond mock smoke paths,
+- revisit Claude live task evidence after auth/quota is available,
+- use `rank` and `suggest` only at the maturity level the local ledger can defend.
 
 ## First User Experience
 
@@ -186,7 +209,8 @@ rux runners
 rux plan "fix the failing auth test"
 rux run "fix the failing auth test" --runner claude --roster solo
 rux show <run-id>
-rux verdict <run-id>
+rux verdict <run-id> accepted
+rux status
 ```
 
 The user should understand the state of the project by reading `docs/STATE.md`, not by scanning a roadmap pile.
