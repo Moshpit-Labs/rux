@@ -32,6 +32,7 @@ try {
   assert(helpRun.stdout.includes("rux init"), "--help should include init command");
   assert(helpRun.stdout.includes("rux run"), "--help should include run command");
   assert(helpRun.stdout.includes("rux record"), "--help should include manual record command");
+  assert(helpRun.stdout.includes("record --start"), "--help should include manual record baseline command");
   assert(helpRun.stdout.includes("rux check"), "--help should include post-run check command");
   assert(helpRun.stdout.includes("rux report"), "--help should include feedback report command");
   assert(helpRun.stdout.includes("--allow-dirty"), "--help should include dirty worktree override");
@@ -398,6 +399,102 @@ try {
   assert(summary.replay.provider_call_required === false, "fake run replay should not imply a provider call");
   assert(existsSync(join(tempRoot, summary.transcript_path)), "transcript should exist");
 
+  const inlineMutatingCheckRun = JSON.parse(run("node", [
+    cliPath,
+    "run",
+    "inline mutating check attribution",
+    "--runner",
+    "fake",
+    "--cwd",
+    tempRoot,
+    "--check",
+    "node -e \"require('node:fs').writeFileSync('inline-check-mutated.txt','changed')\""
+  ]).stdout);
+  assert(inlineMutatingCheckRun.changed_files.length === 0, "inline check mutations should not be attributed to the provider run");
+  assert(inlineMutatingCheckRun.checks[0]?.changed_files.includes("inline-check-mutated.txt"), "inline run checks should capture files changed by the check");
+
+  const unlinkedSuccessReport = spawnSync("node", [
+    cliPath,
+    "report",
+    "unlinked success should be rejected",
+    "--kind",
+    "success",
+    "--cwd",
+    tempRoot
+  ], { encoding: "utf8" });
+  assert(unlinkedSuccessReport.status !== 0, "success reports should require run linkage or an explicit no-run reason");
+  assert(unlinkedSuccessReport.stderr.includes("report --kind success requires"), "unlinked success report should explain the linkage requirement");
+
+  const missingRunSuccessReport = spawnSync("node", [
+    cliPath,
+    "report",
+    "missing run success should be rejected",
+    "--kind",
+    "success",
+    "--run-id",
+    "missing-run-id",
+    "--cwd",
+    tempRoot
+  ], { encoding: "utf8" });
+  assert(missingRunSuccessReport.status !== 0, "success reports should reject nonexistent run links");
+  assert(missingRunSuccessReport.stderr.includes("requires an existing run"), "missing success run links should explain the existence requirement");
+
+  const failedRunForReport = JSON.parse(run("node", [
+    cliPath,
+    "run",
+    "failed run should not become success report",
+    "--runner",
+    "fake",
+    "--cwd",
+    tempRoot,
+    "--check",
+    "node -e \"process.exit(7)\""
+  ]).stdout);
+  assert(failedRunForReport.status === "failed", "test setup should create a failed run");
+  const failedRunSuccessReport = spawnSync("node", [
+    cliPath,
+    "report",
+    "failed run success should be rejected",
+    "--kind",
+    "success",
+    "--run-id",
+    failedRunForReport.id,
+    "--cwd",
+    tempRoot
+  ], { encoding: "utf8" });
+  assert(failedRunSuccessReport.status !== 0, "success reports should reject failed run links");
+  assert(failedRunSuccessReport.stderr.includes("requires a successful run"), "failed success run links should explain the successful-run requirement");
+
+  const noRunSuccessReport = JSON.parse(run("node", [
+    cliPath,
+    "report",
+    "success was verified outside the local Rux ledger",
+    "--kind",
+    "success",
+    "--no-run",
+    "external system verified the shipped outcome",
+    "--cwd",
+    tempRoot
+  ]).stdout);
+  assert(noRunSuccessReport.kind === "success", "success reports should allow an explicit no-run reason");
+  assert(noRunSuccessReport.run_id === null, "success --no-run should stay unlinked");
+  assert(noRunSuccessReport.no_run_reason === "external system verified the shipped outcome", "success --no-run should preserve its reason");
+
+  const unlinkedUxReport = spawnSync("node", [
+    cliPath,
+    "report",
+    "the report flow hint is helpful",
+    "--kind",
+    "ux",
+    "--cwd",
+    tempRoot
+  ], { encoding: "utf8" });
+  assert(unlinkedUxReport.status === 0, "non-success reports should stay low-friction without linkage");
+  assert(unlinkedUxReport.stderr.includes("nudge: this report is unlinked"), "unlinked non-success reports should print a stderr nudge");
+  const unlinkedUxReportEvent = JSON.parse(unlinkedUxReport.stdout);
+  assert(unlinkedUxReportEvent.kind === "ux", "unlinked ux report should be recorded");
+  assert(unlinkedUxReportEvent.run_id === null, "unlinked ux report should not invent a run link");
+
   const reportResult = JSON.parse(run("node", [
     cliPath,
     "report",
@@ -425,6 +522,111 @@ try {
   assert(reportMarkdown.includes("# Rux Feedback Report"), "report markdown should have a clear heading");
   assert(reportMarkdown.includes("Kind: success"), "report markdown should include feedback kind");
   assert(reportMarkdown.includes("This is raw feedback."), "report markdown should explain the guardrail");
+  const reportLinkedShow = JSON.parse(run("node", [cliPath, "show", summary.id, "--cwd", tempRoot]).stdout);
+  assert(reportLinkedShow.reports.some((report) => report.id === reportResult.id), "show should surface reports linked to a run");
+  assert(reportLinkedShow.evaluation.signals.linked_success_reports === 1, "eval should count linked success reports without making them routing labels");
+  const reportLinkedEval = JSON.parse(run("node", [cliPath, "eval", summary.id, "--cwd", tempRoot]).stdout);
+  assert(reportLinkedEval.signals.linked_reports_total === 1, "eval command should surface linked report counts");
+  const reportLinkedExport = JSON.parse(run("node", [cliPath, "export", "--cwd", tempRoot, "--run-id", summary.id]).stdout);
+  assert(reportLinkedExport.runs[0].reports.some((report) => report.id === reportResult.id), "export should preserve reports linked to a run");
+
+  const reportRecordRoot = join(tempRoot, "report-record-link");
+  await mkdir(reportRecordRoot, { recursive: true });
+  run("git", ["init"], reportRecordRoot);
+  await writeFile(join(reportRecordRoot, "README.md"), "# Report Record Link\n", "utf8");
+  run("git", ["add", "README.md"], reportRecordRoot);
+  run("git", ["commit", "-m", "initial"], reportRecordRoot, {
+    GIT_AUTHOR_NAME: "Rux Smoke",
+    GIT_AUTHOR_EMAIL: "smoke@example.com",
+    GIT_COMMITTER_NAME: "Rux Smoke",
+    GIT_COMMITTER_EMAIL: "smoke@example.com"
+  });
+  const reportRecordBaseline = JSON.parse(run("node", [
+    cliPath,
+    "record",
+    "--start",
+    "start report-linked success session",
+    "--runner",
+    "codex",
+    "--cwd",
+    reportRecordRoot
+  ]).stdout);
+  await writeFile(join(reportRecordRoot, "shipped.txt"), "shipped\n", "utf8");
+  const inlineRecordReport = JSON.parse(run("node", [
+    cliPath,
+    "report",
+    "report-linked success shipped",
+    "--kind",
+    "success",
+    "--record",
+    "--runner",
+    "codex",
+    "--check",
+    "node --version",
+    "--write-scope",
+    "shipped.txt",
+    "--cwd",
+    reportRecordRoot
+  ]).stdout);
+  assert(inlineRecordReport.kind === "success", "success --record should still record a success report");
+  assert(inlineRecordReport.run_id, "success --record should link the report to a minted manual run");
+  assert(inlineRecordReport.run_found === true, "success --record should mark the minted run as found");
+  const inlineRecordShow = JSON.parse(run("node", [cliPath, "show", inlineRecordReport.run_id, "--cwd", reportRecordRoot]).stdout);
+  assert(inlineRecordShow.run.source === "manual", "success --record should mint a manual run");
+  assert(inlineRecordShow.run.session_baseline.id === reportRecordBaseline.id, "success --record should use the open record baseline");
+  assert(inlineRecordShow.run.changed_files.includes("shipped.txt"), "success --record should capture files changed since the baseline");
+  assert(inlineRecordShow.run.checks[0]?.source === "record_check", "success --record should preserve manual record checks");
+  assert(inlineRecordShow.reports.some((report) => report.id === inlineRecordReport.id), "show should surface success reports created with --record");
+
+  const failedInlineRecordReport = spawnSync("node", [
+    cliPath,
+    "report",
+    "failed report-linked success should be rejected",
+    "--kind",
+    "success",
+    "--record",
+    "--runner",
+    "codex",
+    "--check",
+    "node -e \"process.exit(7)\"",
+    "--cwd",
+    reportRecordRoot
+  ], { encoding: "utf8" });
+  assert(failedInlineRecordReport.status !== 0, "success --record should reject failed inline manual records");
+  assert(failedInlineRecordReport.stderr.includes("requires a successful run"), "failed inline success records should explain the successful-run requirement");
+
+  const reportRecordDirBaseline = JSON.parse(run("node", [
+    cliPath,
+    "record",
+    "--start",
+    "start report-linked directory session",
+    "--runner",
+    "codex",
+    "--cwd",
+    reportRecordRoot
+  ]).stdout);
+  await mkdir(join(reportRecordRoot, "release-notes", "nested"), { recursive: true });
+  await writeFile(join(reportRecordRoot, "release-notes", "one.md"), "one\n", "utf8");
+  await writeFile(join(reportRecordRoot, "release-notes", "nested", "two.md"), "two\n", "utf8");
+  const inlineRecordDirectoryReport = JSON.parse(run("node", [
+    cliPath,
+    "report",
+    "report-linked directory shipped",
+    "--kind",
+    "success",
+    "--record",
+    "--runner",
+    "codex",
+    "--write-scope",
+    "release-notes",
+    "--cwd",
+    reportRecordRoot
+  ]).stdout);
+  const inlineRecordDirectoryShow = JSON.parse(run("node", [cliPath, "show", inlineRecordDirectoryReport.run_id, "--cwd", reportRecordRoot]).stdout);
+  assert(inlineRecordDirectoryShow.run.session_baseline.id === reportRecordDirBaseline.id, "success --record should use the directory session baseline");
+  assert(inlineRecordDirectoryShow.run.changed_files.includes("release-notes/one.md"), "success --record should expand untracked top-level files");
+  assert(inlineRecordDirectoryShow.run.changed_files.includes("release-notes/nested/two.md"), "success --record should expand untracked nested files");
+  assert(!inlineRecordDirectoryShow.run.changed_files.includes("release-notes"), "success --record should not report the untracked directory itself");
 
   run("node", [
     cliPath,
@@ -510,6 +712,135 @@ try {
   assert(manualStatus.evidence.live_provider_task_runs === 0, "status should keep manual separate from live provider task runs");
   const manualReleaseCheck = JSON.parse(run("node", [cliPath, "release-check", "--cwd", manualRecordRoot]).stdout);
   assert(manualReleaseCheck.gates.find((gate) => gate.name === "real_provider_task_evidence")?.ok === false, "manual records should not satisfy release provider task evidence");
+
+  const manualUntrackedDirRoot = join(tempRoot, "manual-untracked-dir");
+  await mkdir(manualUntrackedDirRoot, { recursive: true });
+  run("git", ["init"], manualUntrackedDirRoot);
+  await writeFile(join(manualUntrackedDirRoot, "README.md"), "# Manual Untracked Directory\n", "utf8");
+  run("git", ["add", "README.md"], manualUntrackedDirRoot);
+  run("git", ["commit", "-m", "initial"], manualUntrackedDirRoot, {
+    GIT_AUTHOR_NAME: "Rux Smoke",
+    GIT_AUTHOR_EMAIL: "smoke@example.com",
+    GIT_COMMITTER_NAME: "Rux Smoke",
+    GIT_COMMITTER_EMAIL: "smoke@example.com"
+  });
+  await mkdir(join(manualUntrackedDirRoot, "playbooks", "nested"), { recursive: true });
+  await writeFile(join(manualUntrackedDirRoot, "playbooks", "one.md"), "one\n", "utf8");
+  await writeFile(join(manualUntrackedDirRoot, "playbooks", "nested", "two.md"), "two\n", "utf8");
+  const manualUntrackedDirRecord = JSON.parse(run("node", [
+    cliPath,
+    "record",
+    "manual untracked directory attribution",
+    "--runner",
+    "codex",
+    "--cwd",
+    manualUntrackedDirRoot,
+    "--write-scope",
+    "playbooks"
+  ]).stdout);
+  assert(manualUntrackedDirRecord.status === "ok", "manual untracked directory record should pass with a directory write scope");
+  assert(manualUntrackedDirRecord.changed_files.includes("playbooks/one.md"), "manual untracked directory attribution should expand top-level files");
+  assert(manualUntrackedDirRecord.changed_files.includes("playbooks/nested/two.md"), "manual untracked directory attribution should expand nested files");
+  assert(!manualUntrackedDirRecord.changed_files.includes("playbooks"), "manual untracked directory attribution should not report the directory as the changed file");
+  assert(manualUntrackedDirRecord.write_scope.violations.length === 0, "expanded untracked files should respect directory write scopes");
+
+  const baselineRecordRoot = join(tempRoot, "manual-baseline");
+  await mkdir(baselineRecordRoot, { recursive: true });
+  run("git", ["init"], baselineRecordRoot);
+  await writeFile(join(baselineRecordRoot, "README.md"), "# Manual Baseline\n", "utf8");
+  run("git", ["add", "README.md"], baselineRecordRoot);
+  run("git", ["commit", "-m", "initial"], baselineRecordRoot, {
+    GIT_AUTHOR_NAME: "Rux Smoke",
+    GIT_AUTHOR_EMAIL: "smoke@example.com",
+    GIT_COMMITTER_NAME: "Rux Smoke",
+    GIT_COMMITTER_EMAIL: "smoke@example.com"
+  });
+  await writeFile(join(baselineRecordRoot, "dirty-at-baseline.txt"), "before\n", "utf8");
+  await writeFile(join(baselineRecordRoot, "unchanged-dirty.txt"), "same\n", "utf8");
+  const baselineStart = JSON.parse(run("node", [
+    cliPath,
+    "record",
+    "--start",
+    "begin baselined manual session",
+    "--runner",
+    "codex",
+    "--cwd",
+    baselineRecordRoot
+  ]).stdout);
+  assert(baselineStart.type === "session_baseline", "record --start should append a session baseline event");
+  assert(baselineStart.dirty_files.includes("dirty-at-baseline.txt"), "baseline should capture dirty files");
+  await writeFile(join(baselineRecordRoot, "dirty-at-baseline.txt"), "after\n", "utf8");
+  await writeFile(join(baselineRecordRoot, "new-after-baseline.txt"), "new\n", "utf8");
+  const baselineRecord = JSON.parse(run("node", [
+    cliPath,
+    "record",
+    "finished baselined manual session",
+    "--runner",
+    "codex",
+    "--cwd",
+    baselineRecordRoot,
+    "--check",
+    "node --version",
+    "--write-scope",
+    "dirty-at-baseline.txt,new-after-baseline.txt"
+  ]).stdout);
+  assert(baselineRecord.status === "ok", "baselined record should pass when changed files are in scope");
+  assert(baselineRecord.session_baseline.id === baselineStart.id, "manual record should link to the baseline it used");
+  assert(baselineRecord.changed_files.includes("dirty-at-baseline.txt"), "baselined record should include dirty baseline files that changed again");
+  assert(baselineRecord.changed_files.includes("new-after-baseline.txt"), "baselined record should include files created after baseline");
+  assert(!baselineRecord.changed_files.includes("unchanged-dirty.txt"), "baselined record should exclude dirty files unchanged since baseline");
+  assert(baselineRecord.contaminated_files.includes("dirty-at-baseline.txt"), "dirty-at-baseline files changed again should be contaminated");
+  const baselineEval = JSON.parse(run("node", [cliPath, "eval", baselineRecord.id, "--cwd", baselineRecordRoot]).stdout);
+  assert(baselineEval.signals.baseline_contaminated_files === 1, "eval should count contaminated baseline files");
+  assert(baselineEval.outcome.risks.includes("baseline_contaminated_files"), "outcome should flag contaminated baseline files");
+
+  const multiBaselineRoot = join(tempRoot, "manual-multiple-baseline");
+  await mkdir(multiBaselineRoot, { recursive: true });
+  run("git", ["init"], multiBaselineRoot);
+  await writeFile(join(multiBaselineRoot, "README.md"), "# Multiple Baselines\n", "utf8");
+  run("git", ["add", "README.md"], multiBaselineRoot);
+  run("git", ["commit", "-m", "initial"], multiBaselineRoot, {
+    GIT_AUTHOR_NAME: "Rux Smoke",
+    GIT_AUTHOR_EMAIL: "smoke@example.com",
+    GIT_COMMITTER_NAME: "Rux Smoke",
+    GIT_COMMITTER_EMAIL: "smoke@example.com"
+  });
+  const firstBaseline = JSON.parse(run("node", [
+    cliPath,
+    "record",
+    "--start",
+    "first open baseline",
+    "--runner",
+    "codex",
+    "--cwd",
+    multiBaselineRoot
+  ]).stdout);
+  const secondBaseline = JSON.parse(run("node", [
+    cliPath,
+    "record",
+    "--start",
+    "second open baseline",
+    "--runner",
+    "codex",
+    "--cwd",
+    multiBaselineRoot
+  ]).stdout);
+  await writeFile(join(multiBaselineRoot, "newest-baseline-change.txt"), "changed\n", "utf8");
+  const multiBaselineRun = spawnSync("node", [
+    cliPath,
+    "record",
+    "use newest open baseline",
+    "--runner",
+    "codex",
+    "--cwd",
+    multiBaselineRoot
+  ], { encoding: "utf8" });
+  assert(multiBaselineRun.status === 0, "record should succeed when multiple baselines are open");
+  assert(multiBaselineRun.stderr.includes("multiple open record baselines"), "record should warn when multiple baselines are open");
+  const multiBaselineRecord = JSON.parse(multiBaselineRun.stdout);
+  assert(multiBaselineRecord.session_baseline.id === secondBaseline.id, "record should use the newest open baseline");
+  assert(multiBaselineRecord.session_baseline.closed_baseline_ids.includes(firstBaseline.id), "record should close older open baselines it saw");
+  assert(multiBaselineRecord.session_baseline.closed_baseline_ids.includes(secondBaseline.id), "record should close the baseline it used");
 
   const manualScopeRoot = join(tempRoot, "manual-scope");
   await mkdir(manualScopeRoot, { recursive: true });
@@ -860,6 +1191,73 @@ try {
   const geminiWriteTranscript = await readFile(join(tempRoot, geminiWriteSummary.transcript_path), "utf8");
   assert(geminiWriteTranscript.includes("--approval-mode auto_edit"), "gemini write mode should use auto_edit approval mode");
 
+  const providerUntrackedDirRoot = join(tempRoot, "provider-untracked-dir");
+  await mkdir(providerUntrackedDirRoot, { recursive: true });
+  run("git", ["init"], providerUntrackedDirRoot);
+  await writeFile(join(providerUntrackedDirRoot, "README.md"), "# Provider Untracked Directory\n", "utf8");
+  run("git", ["add", "README.md"], providerUntrackedDirRoot);
+  run("git", ["commit", "-m", "initial"], providerUntrackedDirRoot, {
+    GIT_AUTHOR_NAME: "Rux Smoke",
+    GIT_AUTHOR_EMAIL: "smoke@example.com",
+    GIT_COMMITTER_NAME: "Rux Smoke",
+    GIT_COMMITTER_EMAIL: "smoke@example.com"
+  });
+  const providerUntrackedDirRun = spawnSync("node", [
+    cliPath,
+    "run",
+    "untracked directory attribution",
+    "--runner",
+    "gemini",
+    "--provider-mode",
+    "write",
+    "--allow-dirty",
+    "--write-scope",
+    "provider-output",
+    "--cwd",
+    providerUntrackedDirRoot
+  ], {
+    encoding: "utf8",
+    env: { ...process.env, PATH: `${tempBin}:${process.env.PATH ?? ""}` }
+  });
+  assert(providerUntrackedDirRun.status === 0, "provider untracked directory attribution run should complete");
+  const providerUntrackedDirSummary = JSON.parse(providerUntrackedDirRun.stdout);
+  assert(providerUntrackedDirSummary.status === "ok", "provider untracked directory run should pass with directory write scope");
+  assert(providerUntrackedDirSummary.changed_files.includes("provider-output/one.md"), "provider untracked directory attribution should expand top-level files");
+  assert(providerUntrackedDirSummary.changed_files.includes("provider-output/nested/two.md"), "provider untracked directory attribution should expand nested files");
+  assert(!providerUntrackedDirSummary.changed_files.includes("provider-output"), "provider untracked directory attribution should not report the directory itself");
+  assert(providerUntrackedDirSummary.write_scope.violations.length === 0, "expanded provider files should respect directory write scopes");
+
+  const providerDirtyContentRoot = join(tempRoot, "provider-dirty-content");
+  await mkdir(providerDirtyContentRoot, { recursive: true });
+  run("git", ["init"], providerDirtyContentRoot);
+  await writeFile(join(providerDirtyContentRoot, "dirty-content.txt"), "clean\n", "utf8");
+  run("git", ["add", "dirty-content.txt"], providerDirtyContentRoot);
+  run("git", ["commit", "-m", "initial"], providerDirtyContentRoot, {
+    GIT_AUTHOR_NAME: "Rux Smoke",
+    GIT_AUTHOR_EMAIL: "smoke@example.com",
+    GIT_COMMITTER_NAME: "Rux Smoke",
+    GIT_COMMITTER_EMAIL: "smoke@example.com"
+  });
+  await writeFile(join(providerDirtyContentRoot, "dirty-content.txt"), "before\n", "utf8");
+  const providerDirtyContentRun = spawnSync("node", [
+    cliPath,
+    "run",
+    "dirty content attribution",
+    "--runner",
+    "gemini",
+    "--provider-mode",
+    "write",
+    "--allow-dirty",
+    "--cwd",
+    providerDirtyContentRoot
+  ], {
+    encoding: "utf8",
+    env: { ...process.env, PATH: `${tempBin}:${process.env.PATH ?? ""}` }
+  });
+  assert(providerDirtyContentRun.status === 0, "provider dirty content attribution run should complete");
+  const providerDirtyContentSummary = JSON.parse(providerDirtyContentRun.stdout);
+  assert(providerDirtyContentSummary.changed_files.includes("dirty-content.txt"), "provider changed_files should include same-status dirty file edits");
+
   const blockedGeminiRun = spawnSync("node", [
     cliPath,
     "run",
@@ -903,6 +1301,105 @@ try {
   const softBlockedGeminiSummary = JSON.parse(softBlockedGeminiRun.stdout);
   assert(softBlockedGeminiSummary.status === "blocked", "soft approval wording should be blocked");
   assert(softBlockedGeminiSummary.status_reason === "provider_needs_input", "soft approval wording should classify as needing input");
+
+  const needsInputCheckFailedRun = spawnSync("node", [
+    cliPath,
+    "run",
+    "needs input check failed precedence",
+    "--runner",
+    "gemini",
+    "--allow-dirty",
+    "--cwd",
+    tempRoot,
+    "--check",
+    "node -e \"process.exit(7)\""
+  ], {
+    encoding: "utf8",
+    env: { ...process.env, PATH: `${tempBin}:${process.env.PATH ?? ""}` }
+  });
+  assert(needsInputCheckFailedRun.status === 0, "provider input plus failed check should still record");
+  const needsInputCheckFailedSummary = JSON.parse(needsInputCheckFailedRun.stdout);
+  assert(needsInputCheckFailedSummary.status === "failed", "failed checks should outrank provider input requests");
+  assert(needsInputCheckFailedSummary.status_reason === "check_failed", "failed checks should use check_failed before provider_needs_input");
+
+  const planCheckFailedRun = spawnSync("node", [
+    cliPath,
+    "run",
+    "plan check failed precedence",
+    "--runner",
+    "gemini",
+    "--allow-dirty",
+    "--cwd",
+    tempRoot,
+    "--check",
+    "node -e \"process.exit(7)\""
+  ], {
+    encoding: "utf8",
+    env: { ...process.env, PATH: `${tempBin}:${process.env.PATH ?? ""}` }
+  });
+  assert(planCheckFailedRun.status === 0, "plan-mode writes plus failed checks should still record");
+  const planCheckFailedSummary = JSON.parse(planCheckFailedRun.stdout);
+  assert(planCheckFailedSummary.status === "failed", "plan-mode writes should fail the run even when the check fails");
+  assert(planCheckFailedSummary.status_reason === "provider_plan_changed_files", "plan-mode file changes should outrank check_failed");
+
+  const planInputRun = spawnSync("node", [
+    cliPath,
+    "run",
+    "plan input precedence",
+    "--runner",
+    "gemini",
+    "--allow-dirty",
+    "--cwd",
+    tempRoot
+  ], {
+    encoding: "utf8",
+    env: { ...process.env, PATH: `${tempBin}:${process.env.PATH ?? ""}` }
+  });
+  assert(planInputRun.status === 0, "plan-mode writes plus input requests should still record");
+  const planInputSummary = JSON.parse(planInputRun.stdout);
+  assert(planInputSummary.status_reason === "provider_plan_changed_files", "plan-mode file changes should outrank provider_needs_input");
+
+  const scopePlanInputRun = spawnSync("node", [
+    cliPath,
+    "run",
+    "scope plan input precedence",
+    "--runner",
+    "gemini",
+    "--allow-dirty",
+    "--write-scope",
+    "allowed.txt",
+    "--cwd",
+    tempRoot
+  ], {
+    encoding: "utf8",
+    env: { ...process.env, PATH: `${tempBin}:${process.env.PATH ?? ""}` }
+  });
+  assert(scopePlanInputRun.status === 0, "scope violations plus plan/input signals should still record");
+  const scopePlanInputSummary = JSON.parse(scopePlanInputRun.stdout);
+  assert(scopePlanInputSummary.status_reason === "write_scope_violation", "write-scope violations should outrank plan-mode changes and provider_needs_input");
+
+  const scopeCheckFailedRun = spawnSync("node", [
+    cliPath,
+    "run",
+    "scope check failed precedence",
+    "--runner",
+    "gemini",
+    "--allow-dirty",
+    "--provider-mode",
+    "write",
+    "--write-scope",
+    "allowed.txt",
+    "--cwd",
+    tempRoot,
+    "--check",
+    "node -e \"process.exit(7)\""
+  ], {
+    encoding: "utf8",
+    env: { ...process.env, PATH: `${tempBin}:${process.env.PATH ?? ""}` }
+  });
+  assert(scopeCheckFailedRun.status === 0, "scope violations plus failed checks should still record");
+  const scopeCheckFailedSummary = JSON.parse(scopeCheckFailedRun.stdout);
+  assert(scopeCheckFailedSummary.status_reason === "write_scope_violation", "write-scope violations should outrank check_failed");
 
   const planChangedGeminiRun = spawnSync("node", [
     cliPath,
@@ -1044,6 +1541,41 @@ try {
   assert(mutatingCheckedCodexEval.outcome.risks.includes("check_modified_files"), "mutating check should be visible as an outcome risk");
   assert(mutatingCheckedCodexEval.routing.eligible === false, "mutating checks should not become routing evidence");
   assert(mutatingCheckedCodexEval.routing.blockers.includes("check_modified_files"), "mutating checks should explain the routing blocker");
+
+  const postRunCheckAttributionRoot = join(tempRoot, "post-run-check-attribution");
+  await mkdir(postRunCheckAttributionRoot, { recursive: true });
+  run("git", ["init"], postRunCheckAttributionRoot);
+  await writeFile(join(postRunCheckAttributionRoot, "check-dirty.txt"), "clean\n", "utf8");
+  run("git", ["add", "check-dirty.txt"], postRunCheckAttributionRoot);
+  run("git", ["commit", "-m", "initial"], postRunCheckAttributionRoot, {
+    GIT_AUTHOR_NAME: "Rux Smoke",
+    GIT_AUTHOR_EMAIL: "smoke@example.com",
+    GIT_COMMITTER_NAME: "Rux Smoke",
+    GIT_COMMITTER_EMAIL: "smoke@example.com"
+  });
+  const postRunCheckAttributionRun = JSON.parse(run("node", [
+    cliPath,
+    "run",
+    "post-run check attribution baseline",
+    "--runner",
+    "fake",
+    "--cwd",
+    postRunCheckAttributionRoot
+  ]).stdout);
+  await writeFile(join(postRunCheckAttributionRoot, "check-dirty.txt"), "before\n", "utf8");
+  const postRunDirtyCheck = JSON.parse(run("node", [
+    cliPath,
+    "check",
+    postRunCheckAttributionRun.id,
+    "--command",
+    "node -e \"require('node:fs').writeFileSync('check-dirty.txt','after\\n');require('node:fs').mkdirSync('check-output/nested',{recursive:true});require('node:fs').writeFileSync('check-output/one.md','one\\n');require('node:fs').writeFileSync('check-output/nested/two.md','two\\n')\"",
+    "--cwd",
+    postRunCheckAttributionRoot
+  ]).stdout);
+  assert(postRunDirtyCheck.changed_files.includes("check-dirty.txt"), "post-run checks should include same-status dirty file edits");
+  assert(postRunDirtyCheck.changed_files.includes("check-output/one.md"), "post-run checks should expand untracked top-level files");
+  assert(postRunDirtyCheck.changed_files.includes("check-output/nested/two.md"), "post-run checks should expand untracked nested files");
+  assert(!postRunDirtyCheck.changed_files.includes("check-output"), "post-run checks should not report untracked directories as changed files");
 
   const preSmokeReleaseCheck = JSON.parse(run("node", [cliPath, "release-check", "--cwd", tempRoot]).stdout);
   assert(preSmokeReleaseCheck.gates.find((gate) => gate.name === "policy_file")?.ok === true, "release-check should require committed policy file");
@@ -1474,6 +2006,44 @@ async function installMockGemini(binDir) {
     [
       "#!/bin/sh",
       "case \" $* \" in",
+      "  *\"untracked directory attribution\"*)",
+      "    printf 'I created an untracked directory.\\n'",
+      "    mkdir -p provider-output/nested",
+      "    printf 'one\\n' > provider-output/one.md",
+      "    printf 'two\\n' > provider-output/nested/two.md",
+      "    exit 0",
+      "    ;;",
+      "  *\"dirty content attribution\"*)",
+      "    printf 'I modified an already-dirty file.\\n'",
+      "    printf 'after\\n' > dirty-content.txt",
+      "    exit 0",
+      "    ;;",
+      "  *\"scope plan input precedence\"*)",
+      "    printf 'I changed a file and still need approval.\\n'",
+      "    printf 'Do you agree with this approach?\\n'",
+      "    printf 'changed\\n' > scope-plan-input-edited.txt",
+      "    exit 0",
+      "    ;;",
+      "  *\"scope check failed precedence\"*)",
+      "    printf 'I edited outside scope before the check failed.\\n'",
+      "    printf 'changed\\n' > scope-check-failed-edited.txt",
+      "    exit 0",
+      "    ;;",
+      "  *\"plan check failed precedence\"*)",
+      "    printf 'I changed a file before the check failed.\\n'",
+      "    printf 'changed\\n' > plan-check-failed-edited.txt",
+      "    exit 0",
+      "    ;;",
+      "  *\"plan input precedence\"*)",
+      "    printf 'I changed a file and have a question.\\n'",
+      "    printf 'Do you agree with this approach?\\n'",
+      "    printf 'changed\\n' > plan-input-edited.txt",
+      "    exit 0",
+      "    ;;",
+      "  *\"needs input check failed precedence\"*)",
+      "    printf 'Do you agree with this approach?\\n'",
+      "    exit 0",
+      "    ;;",
       "  *\"scoped write edits\"*)",
       "    printf 'I edited outside the requested scope.\\n'",
       "    printf 'changed\\n' > out-of-scope-edited.txt",

@@ -1,10 +1,10 @@
 #!/usr/bin/env node
 
 import { appendFile, mkdir, readFile, readdir, stat, writeFile } from "node:fs/promises";
-import { existsSync } from "node:fs";
+import { existsSync, lstatSync, readFileSync, readdirSync, readlinkSync } from "node:fs";
 import { basename, join, relative, resolve } from "node:path";
 import { spawn, spawnSync } from "node:child_process";
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { CLI_NAME, NPM_ORG, PRODUCT_NAME, STORE_DIR } from "./identity.mjs";
 
 const LEDGER_DIR = "ledger";
@@ -32,9 +32,11 @@ const knownOptionNames = new Set([
   "limit",
   "mode",
   "model",
+  "no-run",
   "note",
   "planner-runner",
   "provider-mode",
+  "record",
   "repair-runner",
   "reviewer-runner",
   "roster",
@@ -42,12 +44,21 @@ const knownOptionNames = new Set([
   "runner",
   "source-repo",
   "started-at",
+  "start",
   "status",
   "strict",
   "task",
   "task-kind",
   "timeout-ms",
   "write-scope"
+]);
+const booleanOptionNames = new Set([
+  "allow-dirty",
+  "force",
+  "include-transcripts",
+  "record",
+  "start",
+  "strict"
 ]);
 
 const runnerDefinitions = {
@@ -150,6 +161,7 @@ Usage:
   ${CLI_NAME} runners
   ${CLI_NAME} init [--cwd PATH] [--force]
   ${CLI_NAME} run "<task>" [--runner fake|claude|codex|gemini] [--roster solo|pair|repair|plan-code-review] [--provider-mode plan|write] [--model NAME] [--effort LEVEL] [--cost-hint USD] [--cwd PATH] [--check "COMMAND"] [--timeout-ms N] [--write-scope PATH[,PATH...]] [--allow-dirty]
+  ${CLI_NAME} record --start "<task>" --runner claude|codex|gemini [--cwd PATH] [--note "TEXT"] [--model NAME] [--effort LEVEL] [--cost-hint USD]
   ${CLI_NAME} record "<task>" --runner claude|codex|gemini [--cwd PATH] [--check "COMMAND"] [--note "TEXT"] [--model NAME] [--effort LEVEL] [--cost-hint USD] [--write-scope PATH[,PATH...]]
   ${CLI_NAME} provider-smoke --runner claude|codex|gemini [--model NAME] [--effort LEVEL] [--cwd PATH] [--timeout-ms N] [--allow-dirty]
   ${CLI_NAME} import --from PATH [--runner claude|codex|gemini|unknown] [--task "TEXT"] [--model NAME] [--effort LEVEL] [--cost-hint USD] [--cwd PATH]
@@ -162,7 +174,7 @@ Usage:
   ${CLI_NAME} doctor [--cwd PATH]
   ${CLI_NAME} release-check [--cwd PATH] [--strict]
   ${CLI_NAME} propose [--cwd PATH]
-  ${CLI_NAME} report "<summary>" [--kind bug|ux|adapter|docs|routing|orchestration|install|idea|success|other] [--source-repo PATH] [--run-id ID] [--command "COMMAND"] [--note "TEXT"] [--cwd PATH]
+  ${CLI_NAME} report "<summary>" [--kind bug|ux|adapter|docs|routing|orchestration|install|idea|success|other] [--source-repo PATH] [--run-id ID | --record --runner claude|codex|gemini | --no-run "REASON"] [--command "COMMAND"] [--note "TEXT"] [--cwd PATH]
   ${CLI_NAME} --version
   ${CLI_NAME} ls [--cwd PATH]
   ${CLI_NAME} show <run-id> [--cwd PATH]
@@ -193,6 +205,11 @@ function parseOptions(args) {
     const key = arg.slice(2);
     if (!knownOptionNames.has(key)) {
       throw new Error(formatUnknownOption(key));
+    }
+
+    if (booleanOptionNames.has(key)) {
+      options[key] = true;
+      continue;
     }
 
     const next = args[index + 1];
@@ -830,6 +847,7 @@ async function exportRuns(args) {
   const topRuns = topLevelRuns(allRuns);
   const verdicts = latestVerdictByRun(events);
   const marks = lifecycleMarksByRun(events);
+  const reports = reportsByRunId(events);
   const runId = normalizeOptionalString(options["run-id"]);
   const limit = parsePositiveInteger(options.limit, 20, "--limit");
   const includeTranscripts = options["include-transcripts"] === true;
@@ -849,6 +867,7 @@ async function exportRuns(args) {
       children,
       verdicts,
       marks,
+      reports,
       includeTranscripts
     }));
   }
@@ -878,10 +897,11 @@ async function exportRuns(args) {
   }, null, 2));
 }
 
-async function exportRunRecord({ cwd, run, children, verdicts, marks, includeTranscripts }) {
+async function exportRunRecord({ cwd, run, children, verdicts, marks, reports, includeTranscripts }) {
   const verdict = verdicts.get(run.id) ?? null;
   const runMarks = marks.get(run.id) ?? [];
-  const evaluation = evaluateRunRecord(run, children, verdicts, marks);
+  const runReports = reports.get(run.id) ?? [];
+  const evaluation = evaluateRunRecord(run, children, verdicts, marks, reports);
   const record = {
     id: run.id,
     purpose: run.purpose ?? "task_run",
@@ -903,6 +923,8 @@ async function exportRunRecord({ cwd, run, children, verdicts, marks, includeTra
     adapter: run.adapter ?? null,
     repo: run.repo ?? null,
     changed_files: Array.isArray(run.changed_files) ? run.changed_files : [],
+    session_baseline: run.session_baseline ?? null,
+    contaminated_files: Array.isArray(run.contaminated_files) ? run.contaminated_files : [],
     write_scope: run.write_scope ?? null,
     checks: Array.isArray(run.checks) ? run.checks.map((check) => ({
       id: check.id ?? null,
@@ -919,6 +941,7 @@ async function exportRunRecord({ cwd, run, children, verdicts, marks, includeTra
       created_at: verdict.created_at
     } : null,
     marks: runMarks.map(formatLifecycleMark),
+    reports: runReports.map(formatLinkedReport),
     outcome: evaluation.outcome,
     routing: evaluation.routing,
     release: evaluation.release,
@@ -1038,6 +1061,15 @@ async function providerSmoke(args) {
 async function recordManualRun(args) {
   const { positionals, options } = parseOptions(args);
   const task = positionals.join(" ").trim();
+  if (options.start === true) {
+    return recordSessionBaseline({ task, options });
+  }
+
+  const run = await createManualRun({ task, options });
+  console.log(JSON.stringify(summarizeRun(run), null, 2));
+}
+
+async function createManualRun({ task, options, extraNotes = [] }) {
   if (!task || !options.runner) {
     throw new Error(`Usage: ${CLI_NAME} record "<task>" --runner claude|codex|gemini [--check "COMMAND"] [--note "TEXT"]`);
   }
@@ -1049,13 +1081,24 @@ async function recordManualRun(args) {
   const startedAt = new Date();
   await ensureStore(cwd);
 
+  const sessionBaseline = await resolveSessionBaseline(cwd);
+  if (sessionBaseline.warning) {
+    writeRuxProgress(sessionBaseline.warning);
+  }
   const recordedStatus = gitStatusMap(cwd);
+  const recordedFingerprints = fingerprintStatusMap(cwd, recordedStatus);
   const recordedRepo = gitSnapshot(cwd, recordedStatus);
-  const changedFiles = [...recordedStatus.keys()].sort();
+  const baselineDiff = sessionBaseline.baseline
+    ? diffStatusAgainstBaseline(cwd, sessionBaseline.baseline, recordedStatus)
+    : null;
+  const changedFiles = baselineDiff ? baselineDiff.changed_files : [...recordedStatus.keys()].sort();
   const check = options.check ? { source: "record_check", ...runCheckWithProgress(String(options.check), cwd) } : null;
   const afterCheckStatus = gitStatusMap(cwd);
+  const afterCheckFingerprints = check ? fingerprintStatusMap(cwd, afterCheckStatus) : null;
   const afterCheckRepo = gitSnapshot(cwd, afterCheckStatus);
-  const checkChangedFiles = check ? gitChangedFilesBetween(recordedStatus, afterCheckStatus) : [];
+  const checkChangedFiles = check
+    ? gitChangedFilesBetween(recordedStatus, afterCheckStatus, cwd, recordedFingerprints, afterCheckFingerprints)
+    : [];
   const writeScope = evaluateWriteScope(options, changedFiles);
   if (check) {
     check.repo = {
@@ -1076,6 +1119,9 @@ async function recordManualRun(args) {
   const notes = [
     "Manual/current-session record. Rux did not launch the provider adapter for this run.",
     "Manual records are down-weighted in recommendations and do not satisfy release provider-task evidence.",
+    ...(sessionBaseline.baseline ? [`Diffed against record baseline ${sessionBaseline.baseline.id}.`] : []),
+    ...(baselineDiff && baselineDiff.contaminated_files.length > 0 ? [`Files changed after already being dirty at baseline: ${baselineDiff.contaminated_files.join(", ")}.`] : []),
+    ...extraNotes,
     ...(note ? [note] : [])
   ];
   if (status === "ok" && writeScope.violations.length > 0) {
@@ -1096,6 +1142,8 @@ async function recordManualRun(args) {
     note,
     check,
     changedFiles,
+    sessionBaseline: sessionBaseline.baseline,
+    contaminatedFiles: baselineDiff?.contaminated_files ?? [],
     startedAt,
     endedAt
   });
@@ -1133,6 +1181,16 @@ async function recordManualRun(args) {
       recorded_at: recordedRepo,
       after_check: check ? afterCheckRepo : null
     },
+    session_baseline: sessionBaseline.baseline ? {
+      id: sessionBaseline.baseline.id,
+      created_at: sessionBaseline.baseline.created_at,
+      head: sessionBaseline.baseline.repo?.head ?? null,
+      dirty_files: Array.isArray(sessionBaseline.baseline.dirty_files) ? sessionBaseline.baseline.dirty_files : [],
+      contaminated_files: baselineDiff?.contaminated_files ?? [],
+      open_baselines_found: sessionBaseline.open_count,
+      closed_baseline_ids: sessionBaseline.open_ids
+    } : null,
+    contaminated_files: baselineDiff?.contaminated_files ?? [],
     transcript_path: relative(cwd, transcriptPath),
     changed_files: changedFiles,
     write_scope: writeScope.declared ? {
@@ -1150,7 +1208,60 @@ async function recordManualRun(args) {
 
   await appendLedger(cwd, run);
   writeRuxProgress(`recorded manual run ${run.id} status=${run.status} reason=${run.status_reason}`);
-  console.log(JSON.stringify(summarizeRun(run), null, 2));
+  return run;
+}
+
+async function recordSessionBaseline({ task, options }) {
+  if (!task || !options.runner) {
+    throw new Error(`Usage: ${CLI_NAME} record --start "<task>" --runner claude|codex|gemini [--cwd PATH] [--note "TEXT"]`);
+  }
+
+  if (options.check !== undefined || options["write-scope"] !== undefined) {
+    throw new Error("record --start captures a baseline only; run checks and write-scope validation on the later record.");
+  }
+
+  const cwd = resolveCwd(options);
+  const runner = normalizeManualRunner(String(options.runner));
+  const metadata = metadataFromOptions(options);
+  const note = normalizeOptionalString(options.note);
+  const createdAt = new Date();
+  const statusMap = gitStatusMap(cwd);
+  const repo = gitSnapshot(cwd, statusMap);
+  const dirtyFiles = [...statusMap.keys()].sort();
+  const event = {
+    schema_version: SCHEMA_VERSION,
+    type: "session_baseline",
+    id: `baseline-${createRunId(createdAt)}`,
+    source: "manual",
+    confidence: "high",
+    task,
+    task_kind: classifyTask(task),
+    runner,
+    model: metadata.model ?? null,
+    effort: metadata.effort ?? null,
+    cwd,
+    created_at: createdAt.toISOString(),
+    repo,
+    dirty_files: dirtyFiles,
+    dirty_status: Object.fromEntries([...statusMap.entries()].sort((left, right) => left[0].localeCompare(right[0]))),
+    dirty_fingerprints: fingerprintStatusMap(cwd, statusMap),
+    cost_hint: metadata.cost_hint ?? null,
+    replay: recordBaselineReplayMetadata(buildRecordStartCommand({
+      task,
+      runner,
+      options,
+      model: metadata.model,
+      effort: metadata.effort
+    })),
+    notes: [
+      "Record baseline. The next manual record diffs against this snapshot unless a newer open baseline exists.",
+      ...(note ? [note] : [])
+    ]
+  };
+
+  await appendLedger(cwd, event);
+  writeRuxProgress(`recorded manual baseline ${event.id} dirty_files=${dirtyFiles.length}`);
+  console.log(JSON.stringify(summarizeSessionBaseline(event), null, 2));
 }
 
 async function captureRunAttempt({
@@ -1171,6 +1282,7 @@ async function captureRunAttempt({
 }) {
   const startedAt = new Date();
   const beforeStatus = gitStatusMap(cwd);
+  const beforeFingerprints = fingerprintStatusMap(cwd, beforeStatus);
   if (!skipDirtyGuard) {
     assertProviderWorktreeReady({
       cwd,
@@ -1182,33 +1294,34 @@ async function captureRunAttempt({
   }
   const beforeRepo = gitSnapshot(cwd, beforeStatus);
   const transcript = await executeRunner({ runner, task, cwd, options, role, purpose });
+  const providerAfterStatus = gitStatusMap(cwd);
+  const providerAfterFingerprints = fingerprintStatusMap(cwd, providerAfterStatus);
+  const providerAfterRepo = gitSnapshot(cwd, providerAfterStatus);
+  const changedFiles = gitChangedFilesBetween(beforeStatus, providerAfterStatus, cwd, beforeFingerprints, providerAfterFingerprints);
   const check = checkCommand ? { source: "run_check", ...runCheckWithProgress(checkCommand, cwd) } : null;
-  const afterStatus = gitStatusMap(cwd);
-  const afterRepo = gitSnapshot(cwd, afterStatus);
-  const changedFiles = gitChangedFilesBetween(beforeStatus, afterStatus);
+  const afterStatus = check ? gitStatusMap(cwd) : providerAfterStatus;
+  const afterFingerprints = check ? fingerprintStatusMap(cwd, afterStatus) : providerAfterFingerprints;
+  const afterRepo = check ? gitSnapshot(cwd, afterStatus) : providerAfterRepo;
+  if (check) {
+    check.repo = {
+      before: providerAfterRepo,
+      after: afterRepo
+    };
+    check.changed_files = gitChangedFilesBetween(providerAfterStatus, afterStatus, cwd, providerAfterFingerprints, afterFingerprints);
+  }
   const writeScope = evaluateWriteScope(options, changedFiles);
   const endedAt = new Date();
   let outputSignal = classifyProviderOutputSignal({ runner, purpose, role, task, transcript, changedFiles, check });
   const executionMode = runner === "fake" ? "internal" : providerExecutionMode(options, { role, purpose });
-  let status = check && check.exit_code !== 0 ? "failed" : transcript.status;
-  let statusReason = classifyRunStatus({ transcript, check, failOnChangedFiles, changedFiles });
+  let status = transcript.status;
+  let statusReason = classifyRunStatus({ transcript, check: null, failOnChangedFiles: false, changedFiles: [] });
   const runNotes = [...notes];
-  if (status === "ok" && executionMode === "plan" && purpose === "task_run" && runner !== "fake" && changedFiles.length > 0) {
-    outputSignal = {
-      kind: "plan_changed_files",
-      status: "failed",
-      reason: "provider_plan_changed_files",
-      note: "Provider was invoked in plan mode but changed files. Rux recorded the run as failed because the adapter violated the requested safety mode."
-    };
+  const providerChangedFilesInPlanMode = executionMode === "plan" && purpose === "task_run" && runner !== "fake" && changedFiles.length > 0;
+  if (failOnChangedFiles && changedFiles.length > 0) {
     status = "failed";
-    statusReason = "provider_plan_changed_files";
-    runNotes.push(outputSignal.note);
-  } else if (outputSignal.status === "blocked" && status === "ok") {
-    status = "blocked";
-    statusReason = outputSignal.reason;
-    runNotes.push(outputSignal.note);
-  }
-  if (status === "ok" && writeScope.violations.length > 0) {
+    statusReason = "provider_smoke_changed_files";
+    runNotes.push("Provider smoke failed because files changed during the run.");
+  } else if (writeScope.violations.length > 0) {
     outputSignal = {
       kind: "write_scope_violation",
       status: "failed",
@@ -1218,11 +1331,23 @@ async function captureRunAttempt({
     status = "failed";
     statusReason = "write_scope_violation";
     runNotes.push(outputSignal.note);
-  }
-  if (failOnChangedFiles && changedFiles.length > 0) {
+  } else if (providerChangedFilesInPlanMode) {
+    outputSignal = {
+      kind: "plan_changed_files",
+      status: "failed",
+      reason: "provider_plan_changed_files",
+      note: "Provider was invoked in plan mode but changed files. Rux recorded the run as failed because the adapter violated the requested safety mode."
+    };
     status = "failed";
-    statusReason = "provider_smoke_changed_files";
-    runNotes.push("Provider smoke failed because files changed during the run.");
+    statusReason = "provider_plan_changed_files";
+    runNotes.push(outputSignal.note);
+  } else if (check && check.exit_code !== 0) {
+    status = "failed";
+    statusReason = "check_failed";
+  } else if (outputSignal.status === "blocked") {
+    status = "blocked";
+    statusReason = outputSignal.reason;
+    runNotes.push(outputSignal.note);
   }
   const id = createRunId(startedAt);
   const transcriptPath = await writeTranscript(cwd, id, transcript.text);
@@ -1250,7 +1375,8 @@ async function captureRunAttempt({
     duration_ms: endedAt.getTime() - startedAt.getTime(),
     repo: {
       before: beforeRepo,
-      after: afterRepo
+      after: afterRepo,
+      after_provider: check ? providerAfterRepo : null
     },
     transcript_path: relative(cwd, transcriptPath),
     changed_files: changedFiles,
@@ -2101,15 +2227,18 @@ async function showRun(args) {
 
   const verdicts = events.filter((event) => event.type === "verdict" && event.run_id === id);
   const marks = events.filter((event) => event.type === "mark" && event.run_id === id);
+  const reports = reportsForRun(events, id);
   const children = runs.filter((event) => event.type === "run" && event.parent_id === id);
   const latestVerdicts = latestVerdictByRun(events);
   const lifecycleMarks = lifecycleMarksByRun(events);
+  const reportsByRun = reportsByRunId(events);
   console.log(JSON.stringify({
     run: withReplayMetadata(run),
     children: children.map(withReplayMetadata),
     verdicts,
     marks,
-    evaluation: evaluateRunRecord(run, children, latestVerdicts, lifecycleMarks)
+    reports,
+    evaluation: evaluateRunRecord(run, children, latestVerdicts, lifecycleMarks, reportsByRun)
   }, null, 2));
 }
 
@@ -2218,7 +2347,8 @@ async function evaluateRunCommand(args) {
   const children = runs.filter((event) => event.type === "run" && event.parent_id === id);
   const latestVerdicts = latestVerdictByRun(events);
   const lifecycleMarks = lifecycleMarksByRun(events);
-  console.log(JSON.stringify(evaluateRunRecord(run, children, latestVerdicts, lifecycleMarks), null, 2));
+  const reportsByRun = reportsByRunId(events);
+  console.log(JSON.stringify(evaluateRunRecord(run, children, latestVerdicts, lifecycleMarks, reportsByRun), null, 2));
 }
 
 async function outcomeRun(args) {
@@ -2680,6 +2810,35 @@ function buildRecordCommand({ task, runner, options, model = null, effort = null
   return parts.map(shellQuote).join(" ");
 }
 
+function buildRecordStartCommand({ task, runner, options, model = null, effort = null }) {
+  const parts = [
+    CLI_NAME,
+    "record",
+    "--start",
+    task,
+    "--runner",
+    runner,
+    "--cwd",
+    resolveCwd(options)
+  ];
+
+  if (model) {
+    parts.push("--model", model);
+  }
+  if (effort) {
+    parts.push("--effort", effort);
+  }
+
+  for (const key of ["cost-hint", "note"]) {
+    const value = options[key];
+    if (value !== undefined && value !== true) {
+      parts.push(`--${key}`, String(value));
+    }
+  }
+
+  return parts.map(shellQuote).join(" ");
+}
+
 function buildProviderSmokeCommand({ runner, options, model = null, effort = null }) {
   const parts = [
     CLI_NAME,
@@ -2727,6 +2886,18 @@ function manualReplayMetadata(command) {
     writes_ledger: true,
     human_review_required: true,
     reason: "This records current-session work after the fact. Re-running it would only duplicate the record, not replay the original agent work."
+  };
+}
+
+function recordBaselineReplayMetadata(command) {
+  return {
+    available: true,
+    source: "recorded",
+    command,
+    provider_call_required: false,
+    writes_ledger: true,
+    human_review_required: false,
+    reason: "This records a manual session baseline only; it does not call a provider CLI."
   };
 }
 
@@ -2943,17 +3114,52 @@ async function recordReport(args) {
   const { positionals, options } = parseOptions(args);
   const summary = positionals.join(" ").trim();
   if (!summary) {
-    throw new Error(`Usage: ${CLI_NAME} report "<summary>" [--kind bug|ux|adapter|docs|routing|orchestration|install|idea|success|other] [--run-id ID] [--command "COMMAND"] [--note "TEXT"]`);
+    throw new Error(`Usage: ${CLI_NAME} report "<summary>" [--kind bug|ux|adapter|docs|routing|orchestration|install|idea|success|other] [--run-id ID | --record --runner claude|codex|gemini | --no-run "REASON"] [--command "COMMAND"] [--note "TEXT"]`);
   }
 
   const cwd = resolveCwd(options);
   const kind = normalizeReportKind(String(options.kind ?? "bug"));
-  const runId = normalizeOptionalString(options["run-id"]);
+  const runIdOption = normalizeOptionalString(options["run-id"]);
+  const noRunReason = normalizeOptionalString(options["no-run"]);
+  const wantsRecord = options.record === true;
+  if (options["no-run"] === true) {
+    throw new Error(`report --no-run requires a reason, for example: ${CLI_NAME} report "${summary}" --kind ${kind} --no-run "external/manual outcome"`);
+  }
+  const linkCount = [Boolean(runIdOption), wantsRecord, Boolean(noRunReason)].filter(Boolean).length;
+  if (linkCount > 1) {
+    throw new Error("Use only one report linkage option: --run-id, --record, or --no-run.");
+  }
+  if (wantsRecord && !options.runner) {
+    throw new Error("report --record requires --runner claude, --runner codex, or --runner gemini.");
+  }
+  if (kind === "success" && linkCount === 0) {
+    throw new Error(`report --kind success requires --run-id ID, --record --runner claude|codex|gemini, or --no-run "REASON".`);
+  }
+
   const command = normalizeOptionalString(options.command);
   const note = normalizeOptionalString(options.note);
   const sourceRepo = resolve(String(options["source-repo"] ?? cwd));
-  const events = await readLedger(cwd);
-  const run = runId ? events.find((event) => event.type === "run" && event.id === runId) ?? null : null;
+  let runId = runIdOption;
+  let run = null;
+  if (wantsRecord) {
+    run = await createManualRun({
+      task: summary,
+      options,
+      extraNotes: ["Created inline by rux report --record."]
+    });
+    runId = run.id;
+  } else if (runId) {
+    const events = await readLedger(cwd);
+    run = events.find((event) => event.type === "run" && event.id === runId) ?? null;
+  } else if (!noRunReason) {
+    writeRuxProgress("nudge: this report is unlinked. Use --run-id, --record, or --no-run \"REASON\" when it describes shipped work.");
+  }
+  if (kind === "success" && runId && !run) {
+    throw new Error(`report --kind success requires an existing run. Run not found: ${runId}. Use --no-run "REASON" for externally verified success.`);
+  }
+  if (kind === "success" && run && run.status !== "ok") {
+    throw new Error(`report --kind success requires a successful run. Linked run ${run.id} has status ${run.status}/${run.status_reason ?? "unknown"}.`);
+  }
   const createdAt = new Date();
   const id = `report-${createRunId(createdAt)}`;
   const reportPath = await writeReport(cwd, id, formatReport({
@@ -2964,6 +3170,7 @@ async function recordReport(args) {
     command,
     runId,
     runFound: runId ? Boolean(run) : null,
+    noRunReason,
     sourceRepo,
     cwd,
     createdAt
@@ -2978,6 +3185,7 @@ async function recordReport(args) {
     command: command ?? "",
     run_id: runId,
     run_found: runId ? Boolean(run) : null,
+    no_run_reason: noRunReason ?? "",
     source_repo: sourceRepo,
     cwd,
     created_at: createdAt.toISOString(),
@@ -3012,11 +3220,13 @@ async function addCheck(args) {
   }
 
   const beforeStatus = gitStatusMap(cwd);
+  const beforeFingerprints = fingerprintStatusMap(cwd, beforeStatus);
   const beforeRepo = gitSnapshot(cwd, beforeStatus);
   const check = runCheckWithProgress(command, cwd);
   const afterStatus = gitStatusMap(cwd);
+  const afterFingerprints = fingerprintStatusMap(cwd, afterStatus);
   const afterRepo = gitSnapshot(cwd, afterStatus);
-  const changedFiles = gitChangedFilesBetween(beforeStatus, afterStatus);
+  const changedFiles = gitChangedFilesBetween(beforeStatus, afterStatus, cwd, beforeFingerprints, afterFingerprints);
   const event = {
     schema_version: SCHEMA_VERSION,
     type: "check",
@@ -3298,10 +3508,62 @@ function gitStatusMap(cwd) {
     if (!line.trim()) continue;
     const status = line.slice(0, 2);
     const file = line.slice(3).trim();
-    if (!file || file.startsWith(`${STORE_DIR}/`)) continue;
-    entries.set(file, status);
+    for (const expandedFile of expandGitStatusFile(cwd, file, status)) {
+      entries.set(expandedFile, status);
+    }
   }
   return entries;
+}
+
+function expandGitStatusFile(cwd, file, status) {
+  const normalized = normalizeGitStatusPath(file.includes(" -> ") ? file.split(" -> ").at(-1) : file);
+  if (!normalized || normalized === STORE_DIR || normalized.startsWith(`${STORE_DIR}/`) || normalized === ".git" || normalized.startsWith(".git/")) {
+    return [];
+  }
+
+  if (status === "??") {
+    return expandStatusPath(cwd, normalized);
+  }
+
+  return [normalized];
+}
+
+function normalizeGitStatusPath(file) {
+  return normalizeWriteScopeEntry(file).replace(/\/+$/, "");
+}
+
+function expandStatusPath(cwd, file) {
+  const fullPath = join(cwd, file);
+  try {
+    const info = lstatSync(fullPath);
+    if (info.isDirectory()) {
+      return listFilesRecursive(cwd, file);
+    }
+  } catch {
+    return [file];
+  }
+  return [file];
+}
+
+function listFilesRecursive(cwd, root) {
+  const results = [];
+  const walk = (relativePath) => {
+    const fullPath = join(cwd, relativePath);
+    const info = lstatSync(fullPath);
+    if (info.isDirectory() && !info.isSymbolicLink()) {
+      const entries = readdirSync(fullPath, { withFileTypes: true })
+        .filter((entry) => entry.name !== STORE_DIR && entry.name !== ".git")
+        .sort((left, right) => left.name.localeCompare(right.name));
+      for (const entry of entries) {
+        walk(`${relativePath}/${entry.name}`);
+      }
+      return;
+    }
+    results.push(normalizeGitStatusPath(relativePath));
+  };
+
+  walk(root);
+  return results.filter(Boolean).sort();
 }
 
 function assertProviderWorktreeReady({ cwd, runners, options, statusMap, context }) {
@@ -3324,9 +3586,131 @@ function assertProviderWorktreeReady({ cwd, runners, options, statusMap, context
   ].join(" "));
 }
 
-function gitChangedFilesBetween(beforeStatus, afterStatus) {
+function gitChangedFilesBetween(beforeStatus, afterStatus, cwd = null, beforeFingerprints = null, afterFingerprints = null) {
   const files = unique([...beforeStatus.keys(), ...afterStatus.keys()]);
-  return files.filter((file) => beforeStatus.get(file) !== afterStatus.get(file));
+  if (!cwd) {
+    return files.filter((file) => beforeStatus.get(file) !== afterStatus.get(file));
+  }
+
+  const beforeHashes = beforeFingerprints ?? fingerprintStatusMap(cwd, beforeStatus);
+  const afterHashes = afterFingerprints ?? fingerprintStatusMap(cwd, afterStatus);
+  return files.filter((file) => (
+    beforeStatus.get(file) !== afterStatus.get(file) ||
+    beforeHashes[file] !== afterHashes[file]
+  ));
+}
+
+async function resolveSessionBaseline(cwd) {
+  const events = await readLedger(cwd);
+  const usedBaselineIds = new Set(events
+    .filter((event) => event.type === "run" && event.session_baseline)
+    .flatMap((event) => [
+      event.session_baseline.id,
+      ...(Array.isArray(event.session_baseline.closed_baseline_ids) ? event.session_baseline.closed_baseline_ids : [])
+    ])
+    .filter(Boolean));
+  const openBaselines = events.filter((event) => (
+    event.type === "session_baseline" &&
+    event.id &&
+    !usedBaselineIds.has(event.id)
+  ));
+
+  if (openBaselines.length === 0) {
+    return {
+      baseline: null,
+      open_count: 0,
+      open_ids: [],
+      warning: null
+    };
+  }
+
+  const baseline = openBaselines.at(-1);
+  return {
+    baseline,
+    open_count: openBaselines.length,
+    open_ids: openBaselines.map((event) => event.id),
+    warning: openBaselines.length > 1
+      ? `warning: multiple open record baselines found; using newest ${baseline.id}.`
+      : null
+  };
+}
+
+function diffStatusAgainstBaseline(cwd, baseline, currentStatus) {
+  const baselineStatus = new Map(Object.entries(baseline.dirty_status ?? {}));
+  const baselineFingerprints = baseline.dirty_fingerprints ?? {};
+  const currentFingerprints = fingerprintStatusMap(
+    cwd,
+    new Map([...baselineStatus.keys()].map((file) => [file, currentStatus.get(file) ?? ""]))
+  );
+  const files = unique([...baselineStatus.keys(), ...currentStatus.keys()]);
+  const changedFiles = [];
+  const contaminatedFiles = [];
+
+  for (const file of files) {
+    const baselineState = baselineStatus.get(file);
+    const currentState = currentStatus.get(file);
+    const baselineFingerprint = baselineFingerprints[file] ?? null;
+    const currentFingerprint = currentFingerprints[file] ?? (currentState ? pathFingerprint(cwd, file) : null);
+    const changed = baselineState !== currentState || baselineFingerprint !== currentFingerprint;
+    if (!changed) continue;
+    changedFiles.push(file);
+    if (baselineState !== undefined) {
+      contaminatedFiles.push(file);
+    }
+  }
+
+  return {
+    changed_files: changedFiles.sort(),
+    contaminated_files: contaminatedFiles.sort()
+  };
+}
+
+function fingerprintStatusMap(cwd, statusMap) {
+  return Object.fromEntries([...statusMap.keys()]
+    .sort()
+    .map((file) => [file, pathFingerprint(cwd, file)]));
+}
+
+function pathFingerprint(cwd, file) {
+  const fullPath = join(cwd, file);
+  try {
+    return hashPath(fullPath, file);
+  } catch (error) {
+    if (error && error.code === "ENOENT") {
+      return "missing";
+    }
+    return `unreadable:${error?.code ?? "unknown"}`;
+  }
+}
+
+function hashPath(fullPath, label) {
+  const info = lstatSync(fullPath);
+  if (info.isSymbolicLink()) {
+    return digestParts(["symlink", label, readlinkSync(fullPath)]);
+  }
+  if (info.isDirectory()) {
+    const entries = readdirSync(fullPath, { withFileTypes: true })
+      .filter((entry) => entry.name !== STORE_DIR)
+      .sort((left, right) => left.name.localeCompare(right.name));
+    return digestParts([
+      "directory",
+      label,
+      ...entries.map((entry) => hashPath(join(fullPath, entry.name), `${label}/${entry.name}`))
+    ]);
+  }
+  if (info.isFile()) {
+    return digestParts(["file", label, readFileSync(fullPath)]);
+  }
+  return digestParts(["other", label, String(info.mode), String(info.size)]);
+}
+
+function digestParts(parts) {
+  const hash = createHash("sha256");
+  for (const part of parts) {
+    hash.update(part);
+    hash.update("\0");
+  }
+  return hash.digest("hex");
 }
 
 function evaluateWriteScope(options, changedFiles) {
@@ -3428,13 +3812,37 @@ function summarizeRun(run) {
     adapter: run.adapter ?? null,
     repo: run.repo ?? null,
     changed_files: run.changed_files,
+    session_baseline: run.session_baseline ?? null,
+    contaminated_files: Array.isArray(run.contaminated_files) ? run.contaminated_files : [],
     write_scope: run.write_scope ?? null,
     checks: run.checks.map((check) => ({
       source: check.source ?? "run_check",
       command: check.command,
-      exit_code: check.exit_code
+      exit_code: check.exit_code,
+      duration_ms: check.duration_ms ?? null,
+      repo: check.repo ?? null,
+      changed_files: Array.isArray(check.changed_files) ? check.changed_files : []
     })),
     cost_hint: run.cost_hint ?? null
+  };
+}
+
+function summarizeSessionBaseline(event) {
+  return {
+    id: event.id,
+    type: event.type,
+    source: event.source,
+    confidence: event.confidence,
+    task_kind: event.task_kind,
+    runner: event.runner,
+    model: event.model ?? null,
+    effort: event.effort ?? null,
+    cwd: event.cwd,
+    created_at: event.created_at,
+    repo: event.repo,
+    dirty_files: event.dirty_files,
+    replay: event.replay,
+    notes: event.notes
   };
 }
 
@@ -3601,6 +4009,22 @@ function lifecycleMarksByRun(events) {
     }
   }
   return marks;
+}
+
+function reportsByRunId(events) {
+  const reports = new Map();
+  for (const event of events) {
+    if (event.type === "report" && event.run_id) {
+      const current = reports.get(event.run_id) ?? [];
+      current.push(event);
+      reports.set(event.run_id, current);
+    }
+  }
+  return reports;
+}
+
+function reportsForRun(events, runId) {
+  return (reportsByRunId(events).get(runId) ?? []).map(formatLinkedReport);
 }
 
 function partitionRecommendationEvidence(runs, verdicts, marks) {
@@ -3976,6 +4400,7 @@ function outcomeRisks(run, children, verdict, marks = []) {
   if (run.status_reason === "provider_plan_only") risks.push("provider_plan_only");
   if (run.status_reason === "provider_plan_changed_files") risks.push("provider_plan_changed_files");
   if (run.status_reason === "write_scope_violation" || writeScopeViolations(run).length > 0) risks.push("write_scope_violation");
+  if (Array.isArray(run.contaminated_files) && run.contaminated_files.length > 0) risks.push("baseline_contaminated_files");
   if (checkChangedFiles(run).length > 0) risks.push("check_modified_files");
   if (Array.isArray(run.changed_files) && run.changed_files.length > 10) risks.push("large_change_surface");
   if (children.some((child) => child.status !== "ok")) risks.push("child_run_failed");
@@ -3998,6 +4423,20 @@ function formatLifecycleMark(mark) {
   };
 }
 
+function formatLinkedReport(report) {
+  return {
+    id: report.id,
+    kind: report.kind,
+    summary: report.summary,
+    note: report.note ?? "",
+    command: report.command ?? "",
+    no_run_reason: report.no_run_reason ?? "",
+    source_repo: report.source_repo ?? null,
+    report_path: report.report_path ?? null,
+    created_at: report.created_at
+  };
+}
+
 function isProviderSmokeEvidence(run) {
   return (
     run.purpose === "provider_smoke" &&
@@ -4009,9 +4448,10 @@ function isProviderSmokeEvidence(run) {
   );
 }
 
-function evaluateRunRecord(run, children, verdicts, marksByRun = new Map()) {
+function evaluateRunRecord(run, children, verdicts, marksByRun = new Map(), reportsByRun = new Map()) {
   const verdict = verdicts.get(run.id) ?? null;
   const marks = marksByRun.get(run.id) ?? [];
+  const reports = reportsByRun.get(run.id) ?? [];
   const latestMark = latestLifecycleMark(marks);
   const blockers = recommendationBlockers(run, verdict, marks);
   const checks = Array.isArray(run.checks) ? run.checks : [];
@@ -4057,11 +4497,14 @@ function evaluateRunRecord(run, children, verdicts, marksByRun = new Map()) {
       checks_failed: failedChecks.length,
       check_changed_files: changedByChecks.length,
       changed_files: Array.isArray(run.changed_files) ? run.changed_files.length : 0,
+      baseline_contaminated_files: Array.isArray(run.contaminated_files) ? run.contaminated_files.length : 0,
       write_scope_violations: writeScopeViolations(run).length,
       child_runs: children.length,
       child_failures: childFailures.length,
       child_checks_total: childChecks.length,
       marks_total: marks.length,
+      linked_reports_total: reports.length,
+      linked_success_reports: reports.filter((report) => report.kind === "success").length,
       reverted: hasLifecycleMark(marks, "reverted"),
       replayed: hasLifecycleMark(marks, "replayed"),
       accepted_downstream: hasLifecycleMark(marks, "accepted-downstream")
@@ -4251,7 +4694,7 @@ function formatProposal({ id, cwd, createdAt, runs, verdicts, release, findings 
   ].join("\n");
 }
 
-function formatReport({ id, kind, summary, note, command, runId, runFound, sourceRepo, cwd, createdAt }) {
+function formatReport({ id, kind, summary, note, command, runId, runFound, noRunReason, sourceRepo, cwd, createdAt }) {
   return [
     "# Rux Feedback Report",
     "",
@@ -4262,6 +4705,7 @@ function formatReport({ id, kind, summary, note, command, runId, runFound, sourc
     `Source repo: ${sourceRepo}`,
     `Run ID: ${runId ?? "none"}`,
     `Run found: ${runFound === null ? "not provided" : runFound ? "yes" : "no"}`,
+    `No-run reason: ${noRunReason ?? "none"}`,
     `Command: ${command ?? "not provided"}`,
     "",
     "## Summary",
@@ -4337,7 +4781,7 @@ function formatImportedTranscript({ from, runner, task, status, startedAt, ended
   ].join("\n");
 }
 
-function formatManualTranscript({ runner, task, note, check, changedFiles, startedAt, endedAt }) {
+function formatManualTranscript({ runner, task, note, check, changedFiles, sessionBaseline, contaminatedFiles, startedAt, endedAt }) {
   const lines = [
     `runner: ${runner}`,
     `source: manual`,
@@ -4352,6 +4796,16 @@ function formatManualTranscript({ runner, task, note, check, changedFiles, start
     "## changed files",
     ...(changedFiles.length > 0 ? changedFiles.map((file) => `- ${file}`) : ["none"])
   ];
+
+  if (sessionBaseline) {
+    lines.push(
+      "",
+      "## session baseline",
+      `id: ${sessionBaseline.id}`,
+      `created_at: ${sessionBaseline.created_at}`,
+      `contaminated_files: ${contaminatedFiles.length > 0 ? contaminatedFiles.join(", ") : "none"}`
+    );
+  }
 
   if (check) {
     lines.push(
