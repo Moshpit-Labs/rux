@@ -28,6 +28,7 @@ const knownOptionNames = new Set([
   "force",
   "from",
   "implementer-runner",
+  "include-probes",
   "include-transcripts",
   "kind",
   "limit",
@@ -37,6 +38,7 @@ const knownOptionNames = new Set([
   "note",
   "planner-runner",
   "provider-mode",
+  "purpose",
   "record",
   "repair-runner",
   "reviewer-runner",
@@ -57,6 +59,7 @@ const booleanOptionNames = new Set([
   "allow-dirty",
   "force",
   "include-transcripts",
+  "include-probes",
   "record",
   "start",
   "strict"
@@ -161,14 +164,14 @@ function printHelp() {
 Usage:
   ${CLI_NAME} runners
   ${CLI_NAME} init [--cwd PATH] [--force]
-  ${CLI_NAME} run "<task>" [--runner fake|claude|codex|gemini] [--roster solo|pair|repair|plan-code-review] [--provider-mode plan|write] [--model NAME] [--effort LEVEL] [--cost-hint USD] [--cwd PATH] [--check "COMMAND"] [--timeout-ms N] [--write-scope PATH[,PATH...]] [--allow-dirty]
-  ${CLI_NAME} record --start "<task>" --runner claude|codex|gemini [--cwd PATH] [--note "TEXT"] [--model NAME] [--effort LEVEL] [--cost-hint USD]
-  ${CLI_NAME} record "<task>" --runner claude|codex|gemini [--cwd PATH] [--check "COMMAND"] [--note "TEXT"] [--model NAME] [--effort LEVEL] [--cost-hint USD] [--write-scope PATH[,PATH...]]
+  ${CLI_NAME} run "<task>" [--runner fake|claude|codex|gemini] [--roster solo|pair|repair|plan-code-review] [--purpose task|probe] [--task-kind KIND] [--provider-mode plan|write] [--model NAME] [--effort LEVEL] [--cost-hint USD] [--cwd PATH] [--check "COMMAND"] [--timeout-ms N] [--write-scope PATH[,PATH...]] [--allow-dirty]
+  ${CLI_NAME} record --start "<task>" --runner claude|codex|gemini [--task-kind KIND] [--cwd PATH] [--note "TEXT"] [--model NAME] [--effort LEVEL] [--cost-hint USD]
+  ${CLI_NAME} record "<task>" --runner claude|codex|gemini [--task-kind KIND] [--cwd PATH] [--check "COMMAND"] [--note "TEXT"] [--model NAME] [--effort LEVEL] [--cost-hint USD] [--write-scope PATH[,PATH...]]
   ${CLI_NAME} provider-smoke --runner claude|codex|gemini [--model NAME] [--effort LEVEL] [--cwd PATH] [--timeout-ms N] [--allow-dirty]
   ${CLI_NAME} import --from PATH [--runner claude|codex|gemini|unknown] [--task "TEXT"] [--model NAME] [--effort LEVEL] [--cost-hint USD] [--cwd PATH]
   ${CLI_NAME} plan "<task>" [--runner fake|claude|codex|gemini] [--roster solo|pair|repair|plan-code-review] [--model NAME] [--effort LEVEL] [--cost-hint USD] [--cwd PATH] [--check "COMMAND"]
-  ${CLI_NAME} suggest "<task>" [--cwd PATH]
-  ${CLI_NAME} rank [--task-kind KIND] [--cwd PATH]
+  ${CLI_NAME} suggest "<task>" [--include-probes] [--cwd PATH]
+  ${CLI_NAME} rank [--task-kind KIND] [--include-probes] [--cwd PATH]
   ${CLI_NAME} status [--cwd PATH]
   ${CLI_NAME} export [--cwd PATH] [--limit N] [--run-id ID] [--include-transcripts]
   ${CLI_NAME} policy [--cwd PATH]
@@ -270,6 +273,14 @@ function metadataFromOptions(options) {
     model: normalizeOptionalString(options.model),
     effort: normalizeOptionalString(options.effort),
     cost_hint: parseCostHint(options["cost-hint"])
+  };
+}
+
+function mergeObservedMetadata(userMetadata, observedMetadata = {}) {
+  return {
+    model: userMetadata.model ?? observedMetadata.model ?? null,
+    effort: userMetadata.effort ?? observedMetadata.effort ?? null,
+    cost_hint: userMetadata.cost_hint ?? observedMetadata.cost_hint ?? null
   };
 }
 
@@ -461,6 +472,22 @@ function normalizeRoster(roster) {
     throw new Error(`Unknown roster: ${roster}. Use solo, pair, repair, or plan-code-review.`);
   }
   return roster;
+}
+
+function normalizeRunPurpose(value) {
+  const purpose = String(value ?? "task").trim();
+  if (purpose === "task" || purpose === "task_run") return "task_run";
+  if (purpose === "probe") return "probe";
+  throw new Error("--purpose requires task or probe");
+}
+
+function normalizeTaskKind(value) {
+  const kind = String(value ?? "").trim();
+  const allowed = new Set(["unspecified", "docs", "test", "bugfix", "refactor", "review", "feature", "general"]);
+  if (!allowed.has(kind)) {
+    throw new Error(`Unsupported task kind: ${value}. Use ${[...allowed].join(", ")}.`);
+  }
+  return kind;
 }
 
 function resolveRosterRunners(roster, primaryRunner, options) {
@@ -805,14 +832,18 @@ async function status(args) {
       );
       return {
         id: run.id,
+        purpose: run.purpose ?? "task_run",
         runner: run.runner,
         roster: run.roster,
+        provider_mode: run.provider_mode ?? inferProviderMode(run),
         status: run.status,
         effective_status: classification.status,
         effective_status_reason: classification.status_reason,
         classifier_version: classification.classifier_version,
         outcome: outcome.label,
         task_kind: run.task_kind ?? classifyTask(run.task ?? ""),
+        task_kind_source: run.task_kind_source ?? "legacy_inferred",
+        task_kind_suggestion: run.task_kind_suggestion ?? null,
         task_summary: formatListTask(run.task),
         task: run.task
       };
@@ -915,11 +946,14 @@ async function exportRunRecord({ cwd, run, children, verdicts, marks, reports, i
     confidence: run.confidence ?? "unknown",
     task: run.task,
     task_kind: run.task_kind ?? classifyTask(run.task ?? ""),
+    task_kind_source: run.task_kind_source ?? "legacy_inferred",
+    task_kind_suggestion: run.task_kind_suggestion ?? null,
     runner: run.runner,
     model: run.model ?? null,
     effort: run.effort ?? null,
     roster: run.roster,
     role: run.role ?? null,
+    provider_mode: run.provider_mode ?? inferProviderMode(run),
     replay: replayMetadataForRun(run),
     status: run.status,
     status_reason: run.status_reason ?? null,
@@ -987,6 +1021,7 @@ async function runCommand(args) {
   const cwd = resolveCwd(options);
   const runner = normalizeRunner(String(options.runner ?? "fake"));
   const roster = normalizeRoster(String(options.roster ?? "solo"));
+  const purpose = normalizeRunPurpose(options.purpose);
   const runnerByRole = resolveRosterRunners(roster, runner, options);
   const metadata = metadataFromOptions(options);
   ensureRunnersAvailable(Object.values(runnerByRole));
@@ -994,7 +1029,7 @@ async function runCommand(args) {
   await ensureStore(cwd);
 
   if (roster !== "solo") {
-    const run = await executeRoster({ roster, task, cwd, options, runnerByRole, metadata });
+    const run = await executeRoster({ roster, task, cwd, options, runnerByRole, metadata, purpose });
     console.log(JSON.stringify(summarizeRun(run), null, 2));
     return;
   }
@@ -1006,7 +1041,7 @@ async function runCommand(args) {
     cwd,
     options,
     checkCommand: options.check ? String(options.check) : null,
-    purpose: "task_run",
+    purpose,
     metadata,
     replay: recordedReplayMetadata(buildRunCommand({
       task,
@@ -1102,6 +1137,8 @@ async function createManualRun({ task, options, extraNotes = [] }) {
     ? diffStatusAgainstBaseline(cwd, sessionBaseline.baseline, recordedStatus)
     : null;
   const changedFiles = baselineDiff ? baselineDiff.changed_files : [...recordedStatus.keys()].sort();
+  const taskKind = taskKindMetadata(task, options, changedFiles);
+  maybeWarnUnspecifiedTaskKind(options);
   const check = options.check ? { source: "record_check", ...runCheckWithProgress(String(options.check), cwd) } : null;
   const afterCheckStatus = gitStatusMap(cwd);
   const afterCheckFingerprints = check ? fingerprintStatusMap(cwd, afterCheckStatus) : null;
@@ -1174,7 +1211,9 @@ async function createManualRun({ task, options, extraNotes = [] }) {
     source: "manual",
     confidence: "high",
     task,
-    task_kind: classifyTask(task),
+    task_kind: taskKind.task_kind,
+    task_kind_source: taskKind.task_kind_source,
+    task_kind_suggestion: taskKind.task_kind_suggestion,
     runner,
     model: metadata.model ?? null,
     effort: metadata.effort ?? null,
@@ -1184,6 +1223,7 @@ async function createManualRun({ task, options, extraNotes = [] }) {
     cwd,
     status,
     status_reason: statusReason,
+    provider_mode: "internal",
     started_at: startedAt.toISOString(),
     ended_at: endedAt.toISOString(),
     duration_ms: endedAt.getTime() - startedAt.getTime(),
@@ -1238,6 +1278,8 @@ async function recordSessionBaseline({ task, options }) {
   const statusMap = gitStatusMap(cwd);
   const repo = gitSnapshot(cwd, statusMap);
   const dirtyFiles = [...statusMap.keys()].sort();
+  const taskKind = taskKindMetadata(task, options, dirtyFiles);
+  maybeWarnUnspecifiedTaskKind(options);
   const event = {
     schema_version: SCHEMA_VERSION,
     type: "session_baseline",
@@ -1245,7 +1287,9 @@ async function recordSessionBaseline({ task, options }) {
     source: "manual",
     confidence: "high",
     task,
-    task_kind: classifyTask(task),
+    task_kind: taskKind.task_kind,
+    task_kind_source: taskKind.task_kind_source,
+    task_kind_suggestion: taskKind.task_kind_suggestion,
     runner,
     model: metadata.model ?? null,
     effort: metadata.effort ?? null,
@@ -1304,10 +1348,14 @@ async function captureRunAttempt({
   }
   const beforeRepo = gitSnapshot(cwd, beforeStatus);
   const transcript = await executeRunner({ runner, task, cwd, options, role, purpose });
+  const observedMetadata = transcript.observed_metadata ?? transcript.adapter?.observed_metadata ?? {};
+  const runMetadata = mergeObservedMetadata(metadata, observedMetadata);
   const providerAfterStatus = gitStatusMap(cwd);
   const providerAfterFingerprints = fingerprintStatusMap(cwd, providerAfterStatus);
   const providerAfterRepo = gitSnapshot(cwd, providerAfterStatus);
   const changedFiles = gitChangedFilesBetween(beforeStatus, providerAfterStatus, cwd, beforeFingerprints, providerAfterFingerprints);
+  const taskKind = taskKindMetadata(task, options, changedFiles);
+  maybeWarnUnspecifiedTaskKind(options);
   const check = checkCommand ? { source: "run_check", ...runCheckWithProgress(checkCommand, cwd) } : null;
   const afterStatus = check ? gitStatusMap(cwd) : providerAfterStatus;
   const afterFingerprints = check ? fingerprintStatusMap(cwd, afterStatus) : providerAfterFingerprints;
@@ -1370,16 +1418,19 @@ async function captureRunAttempt({
     source: "live",
     confidence: "high",
     task,
-    task_kind: classifyTask(task),
+    task_kind: taskKind.task_kind,
+    task_kind_source: taskKind.task_kind_source,
+    task_kind_suggestion: taskKind.task_kind_suggestion,
     runner,
-    model: metadata.model ?? null,
-    effort: metadata.effort ?? null,
+    model: runMetadata.model ?? null,
+    effort: runMetadata.effort ?? null,
     roster,
     parent_id: parentId,
     role,
     cwd,
     status,
     status_reason: statusReason,
+    provider_mode: executionMode,
     started_at: startedAt.toISOString(),
     ended_at: endedAt.toISOString(),
     duration_ms: endedAt.getTime() - startedAt.getTime(),
@@ -1395,9 +1446,9 @@ async function captureRunAttempt({
       violations: writeScope.violations
     } : null,
     checks: check ? [check] : [],
-    cost_hint: metadata.cost_hint ?? null,
+    cost_hint: runMetadata.cost_hint ?? null,
     output_signal: outputSignal,
-    adapter: buildAdapterRecord(transcript.adapter, metadata),
+    adapter: buildAdapterRecord(transcript.adapter, metadata, observedMetadata),
     replay,
     notes: runNotes
   };
@@ -1408,7 +1459,7 @@ async function captureRunAttempt({
   return run;
 }
 
-async function executeRoster({ roster, task, cwd, options, runnerByRole, metadata }) {
+async function executeRoster({ roster, task, cwd, options, runnerByRole, metadata, purpose = "task_run" }) {
   const parentStartedAt = new Date();
   const parentBeforeStatus = gitStatusMap(cwd);
   assertProviderWorktreeReady({
@@ -1440,6 +1491,7 @@ async function executeRoster({ roster, task, cwd, options, runnerByRole, metadat
       checkCommand: options.check ? String(options.check) : null,
       parentId,
       role: "implementer",
+      purpose,
       skipDirtyGuard: true,
       metadata,
       replay: childReplayMetadata(parentId, parentReplayCommand)
@@ -1453,6 +1505,7 @@ async function executeRoster({ roster, task, cwd, options, runnerByRole, metadat
       checkCommand: null,
       parentId,
       role: "reviewer",
+      purpose,
       skipDirtyGuard: true,
       metadata,
       replay: childReplayMetadata(parentId, parentReplayCommand)
@@ -1467,6 +1520,7 @@ async function executeRoster({ roster, task, cwd, options, runnerByRole, metadat
       checkCommand: options.check ? String(options.check) : null,
       parentId,
       role: "attempt",
+      purpose,
       skipDirtyGuard: true,
       metadata,
       replay: childReplayMetadata(parentId, parentReplayCommand)
@@ -1483,6 +1537,7 @@ async function executeRoster({ roster, task, cwd, options, runnerByRole, metadat
         checkCommand: options.check ? String(options.check) : null,
         parentId,
         role: "repairer",
+        purpose,
         skipDirtyGuard: true,
         metadata,
         replay: childReplayMetadata(parentId, parentReplayCommand)
@@ -1498,6 +1553,7 @@ async function executeRoster({ roster, task, cwd, options, runnerByRole, metadat
       checkCommand: null,
       parentId,
       role: "planner",
+      purpose,
       skipDirtyGuard: true,
       metadata,
       replay: childReplayMetadata(parentId, parentReplayCommand)
@@ -1511,6 +1567,7 @@ async function executeRoster({ roster, task, cwd, options, runnerByRole, metadat
       checkCommand: options.check ? String(options.check) : null,
       parentId,
       role: "coder",
+      purpose,
       skipDirtyGuard: true,
       metadata,
       replay: childReplayMetadata(parentId, parentReplayCommand)
@@ -1524,6 +1581,7 @@ async function executeRoster({ roster, task, cwd, options, runnerByRole, metadat
       checkCommand: null,
       parentId,
       role: "reviewer",
+      purpose,
       skipDirtyGuard: true,
       metadata,
       replay: childReplayMetadata(parentId, parentReplayCommand)
@@ -1536,6 +1594,9 @@ async function executeRoster({ roster, task, cwd, options, runnerByRole, metadat
   const parentAfterRepo = gitSnapshot(cwd, parentAfterStatus);
   const parentEndedAt = new Date();
   const parentStatus = aggregateRosterStatus(roster, children);
+  const parentChangedFiles = unique(children.flatMap((child) => child.changed_files));
+  const taskKind = taskKindMetadata(task, options, parentChangedFiles);
+  maybeWarnUnspecifiedTaskKind(options);
   const transcriptPath = await writeTranscript(cwd, parentId, formatRosterTranscript({
     roster,
     task,
@@ -1550,11 +1611,13 @@ async function executeRoster({ roster, task, cwd, options, runnerByRole, metadat
     schema_version: SCHEMA_VERSION,
     type: "run",
     id: parentId,
-    purpose: "roster_run",
+    purpose: purpose === "probe" ? "probe" : "roster_run",
     source: "live",
     confidence: "high",
     task,
-    task_kind: classifyTask(task),
+    task_kind: taskKind.task_kind,
+    task_kind_source: taskKind.task_kind_source,
+    task_kind_suggestion: taskKind.task_kind_suggestion,
     runner: runnerByRole.primary,
     model: metadata.model ?? null,
     effort: metadata.effort ?? null,
@@ -1564,6 +1627,7 @@ async function executeRoster({ roster, task, cwd, options, runnerByRole, metadat
     cwd,
     status: parentStatus,
     status_reason: classifyRosterStatus(children),
+    provider_mode: "internal",
     started_at: parentStartedAt.toISOString(),
     ended_at: parentEndedAt.toISOString(),
     duration_ms: parentEndedAt.getTime() - parentStartedAt.getTime(),
@@ -1572,7 +1636,7 @@ async function executeRoster({ roster, task, cwd, options, runnerByRole, metadat
       after: parentAfterRepo
     },
     transcript_path: relative(cwd, transcriptPath),
-    changed_files: unique(children.flatMap((child) => child.changed_files)),
+    changed_files: parentChangedFiles,
     checks: children.flatMap((child) => child.checks),
     cost_hint: metadata.cost_hint ?? null,
     adapter: {
@@ -1753,7 +1817,7 @@ async function executeClaudeRunner({ task, cwd, options, role, purpose }) {
     "--permission-mode",
     permissionMode,
     "--output-format",
-    "text",
+    "json",
     "-p",
     task
   ];
@@ -1765,11 +1829,13 @@ async function executeClaudeRunner({ task, cwd, options, role, purpose }) {
   const stdout = result.stdout ?? "";
   const stderr = result.stderr ?? "";
   const error = result.error ?? "";
+  const output = parseClaudeOutput(stdout);
 
   return {
     status,
-    stdout,
+    stdout: output.assistant_text || stdout,
     stderr,
+    observed_metadata: output.observed_metadata,
     adapter: buildAdapterInvocation({
       runner: "claude",
       command: "claude",
@@ -1778,7 +1844,8 @@ async function executeClaudeRunner({ task, cwd, options, role, purpose }) {
       timedOut,
       stdout,
       stderr,
-      error
+      error,
+      output
     }),
     text: [
       `runner: claude`,
@@ -1788,6 +1855,12 @@ async function executeClaudeRunner({ task, cwd, options, role, purpose }) {
       `ended_at: ${result.endedAt.toISOString()}`,
       `exit_code: ${exitCode ?? ""}`,
       `status: ${status}`,
+      "",
+      "## assistant text",
+      (output.assistant_text || "").trimEnd(),
+      "",
+      "## parsed output",
+      JSON.stringify(output.extract, null, 2),
       "",
       "## stdout",
       stdout.trimEnd(),
@@ -1812,6 +1885,7 @@ async function executeCodexRunner({ task, cwd, options, role, purpose }) {
     "exec",
     "--sandbox",
     sandboxMode,
+    "--json",
     "--color",
     "never",
     "-C",
@@ -1826,11 +1900,13 @@ async function executeCodexRunner({ task, cwd, options, role, purpose }) {
   const stdout = result.stdout ?? "";
   const stderr = result.stderr ?? "";
   const error = result.error ?? "";
+  const output = parseCodexOutput(stdout);
 
   return {
     status,
-    stdout,
+    stdout: output.assistant_text || stdout,
     stderr,
+    observed_metadata: output.observed_metadata,
     adapter: buildAdapterInvocation({
       runner: "codex",
       command: "codex",
@@ -1839,7 +1915,8 @@ async function executeCodexRunner({ task, cwd, options, role, purpose }) {
       timedOut,
       stdout,
       stderr,
-      error
+      error,
+      output
     }),
     text: [
       `runner: codex`,
@@ -1849,6 +1926,12 @@ async function executeCodexRunner({ task, cwd, options, role, purpose }) {
       `ended_at: ${result.endedAt.toISOString()}`,
       `exit_code: ${exitCode ?? ""}`,
       `status: ${status}`,
+      "",
+      "## assistant text",
+      (output.assistant_text || "").trimEnd(),
+      "",
+      "## parsed output",
+      JSON.stringify(output.extract, null, 2),
       "",
       "## stdout",
       stdout.trimEnd(),
@@ -1873,7 +1956,7 @@ async function executeGeminiRunner({ task, cwd, options, role, purpose }) {
     "--approval-mode",
     approvalMode,
     "--output-format",
-    "text",
+    "json",
     "--skip-trust",
     "-p",
     task
@@ -1886,11 +1969,13 @@ async function executeGeminiRunner({ task, cwd, options, role, purpose }) {
   const stdout = result.stdout ?? "";
   const stderr = result.stderr ?? "";
   const error = result.error ?? "";
+  const output = parseGeminiOutput(stdout);
 
   return {
     status,
-    stdout,
+    stdout: output.assistant_text || stdout,
     stderr,
+    observed_metadata: output.observed_metadata,
     adapter: buildAdapterInvocation({
       runner: "gemini",
       command: "gemini",
@@ -1899,7 +1984,8 @@ async function executeGeminiRunner({ task, cwd, options, role, purpose }) {
       timedOut,
       stdout,
       stderr,
-      error
+      error,
+      output
     }),
     text: [
       `runner: gemini`,
@@ -1909,6 +1995,12 @@ async function executeGeminiRunner({ task, cwd, options, role, purpose }) {
       `ended_at: ${result.endedAt.toISOString()}`,
       `exit_code: ${exitCode ?? ""}`,
       `status: ${status}`,
+      "",
+      "## assistant text",
+      (output.assistant_text || "").trimEnd(),
+      "",
+      "## parsed output",
+      JSON.stringify(output.extract, null, 2),
       "",
       "## stdout",
       stdout.trimEnd(),
@@ -2000,7 +2092,7 @@ function importedStatusReason(status) {
   return "imported_unverified";
 }
 
-function buildAdapterInvocation({ runner, command, args, exitCode, timedOut, stdout, stderr, error }) {
+function buildAdapterInvocation({ runner, command, args, exitCode, timedOut, stdout, stderr, error, output = null }) {
   return {
     runner,
     command,
@@ -2009,12 +2101,14 @@ function buildAdapterInvocation({ runner, command, args, exitCode, timedOut, std
     timed_out: Boolean(timedOut),
     stdout_bytes: byteLength(stdout),
     stderr_bytes: byteLength(stderr),
+    parsed_output: output?.extract ?? null,
+    observed_metadata: output?.observed_metadata ?? {},
     stderr_signal: classifyAdapterStderr({ exitCode, timedOut, stderr, error }),
     error: error || null
   };
 }
 
-function buildAdapterRecord(adapter, metadata) {
+function buildAdapterRecord(adapter, metadata, observedMetadata = {}) {
   return {
     ...(adapter ?? {
       runner: null,
@@ -2027,7 +2121,7 @@ function buildAdapterRecord(adapter, metadata) {
       stderr_signal: null,
       error: null
     }),
-    metadata_sources: metadataSources(metadata)
+    metadata_sources: metadataSources(metadata, observedMetadata)
   };
 }
 
@@ -2096,11 +2190,184 @@ function adapterStderrSignal(adapter) {
   });
 }
 
-function metadataSources(metadata) {
+function metadataSources(metadata, observedMetadata = {}) {
   return {
-    model: metadata.model ? "user_option" : "not_observed",
-    effort: metadata.effort ? "user_option" : "not_observed",
-    cost_hint: metadata.cost_hint ? "user_option" : "not_observed"
+    model: metadata.model ? "user_option" : observedMetadata.model ? "observed" : "not_observed",
+    effort: metadata.effort ? "user_option" : observedMetadata.effort ? "observed" : "not_observed",
+    cost_hint: metadata.cost_hint ? "user_option" : observedMetadata.cost_hint ? "observed" : "not_observed"
+  };
+}
+
+function parseClaudeOutput(stdout) {
+  return parseJsonProviderOutput(stdout, "claude-json");
+}
+
+function parseGeminiOutput(stdout) {
+  return parseJsonProviderOutput(stdout, "gemini-json");
+}
+
+function parseCodexOutput(stdout) {
+  const lines = String(stdout ?? "").split(/\r?\n/).filter((line) => line.trim());
+  const events = [];
+  for (const line of lines) {
+    try {
+      events.push(JSON.parse(line));
+    } catch {
+      return textFallbackExtract(stdout, "codex-jsonl", `unparseable JSONL line: ${line.slice(0, 80)}`);
+    }
+  }
+
+  if (events.length === 0) {
+    return textFallbackExtract(stdout, "codex-jsonl", "empty structured output");
+  }
+
+  const assistantText = unique(events.flatMap(extractAssistantTexts)).join("\n\n").trim();
+  const observedMetadata = extractObservedMetadata(events);
+  return {
+    assistant_text: assistantText,
+    observed_metadata: observedMetadata,
+    extract: {
+      format: "codex-jsonl",
+      parsed: true,
+      event_count: events.length,
+      event_types: unique(events.map((event) => String(event.type ?? event.event ?? "unknown"))),
+      assistant_text: trimOutput(assistantText),
+      metadata: observedMetadata
+    }
+  };
+}
+
+function parseJsonProviderOutput(stdout, format) {
+  const raw = String(stdout ?? "").trim();
+  if (!raw) {
+    return textFallbackExtract(stdout, format, "empty structured output");
+  }
+
+  let parsed;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    return textFallbackExtract(stdout, format, "unparseable JSON output");
+  }
+
+  const values = Array.isArray(parsed) ? parsed : [parsed];
+  const assistantText = unique(values.flatMap(extractAssistantTexts)).join("\n\n").trim();
+  const observedMetadata = extractObservedMetadata(values);
+  return {
+    assistant_text: assistantText,
+    observed_metadata: observedMetadata,
+    extract: {
+      format,
+      parsed: true,
+      event_count: values.length,
+      assistant_text: trimOutput(assistantText),
+      metadata: observedMetadata
+    }
+  };
+}
+
+function textFallbackExtract(stdout, format, reason) {
+  return {
+    assistant_text: String(stdout ?? "").trim(),
+    observed_metadata: {},
+    extract: {
+      format,
+      parsed: false,
+      fallback: "raw_text",
+      reason,
+      assistant_text: trimOutput(String(stdout ?? "").trim()),
+      metadata: {}
+    }
+  };
+}
+
+function extractAssistantTexts(value) {
+  if (value === null || value === undefined) return [];
+  if (typeof value === "string") return [value];
+  if (Array.isArray(value)) return value.flatMap(extractAssistantTexts);
+  if (typeof value !== "object") return [];
+
+  const direct = [];
+  for (const key of ["result", "response", "text", "message", "content", "output", "final", "summary"]) {
+    if (value[key] !== undefined) {
+      direct.push(...extractTextValue(value[key]));
+    }
+  }
+  for (const key of ["messages", "items", "events", "outputs", "choices"]) {
+    if (Array.isArray(value[key])) {
+      direct.push(...value[key].flatMap(extractAssistantTexts));
+    }
+  }
+  if (value.delta !== undefined && looksAssistantEvent(value)) {
+    direct.push(...extractTextValue(value.delta));
+  }
+  return direct.filter((text) => text.trim());
+}
+
+function extractTextValue(value) {
+  if (value === null || value === undefined) return [];
+  if (typeof value === "string") return [value];
+  if (Array.isArray(value)) return value.flatMap(extractTextValue);
+  if (typeof value !== "object") return [];
+  if (typeof value.text === "string") return [value.text];
+  if (typeof value.content === "string") return [value.content];
+  if (Array.isArray(value.content)) return value.content.flatMap(extractTextValue);
+  if (typeof value.message === "string") return [value.message];
+  if (value.message) return extractTextValue(value.message);
+  return [];
+}
+
+function looksAssistantEvent(value) {
+  const marker = String(value.type ?? value.event ?? value.role ?? value.kind ?? "").toLowerCase();
+  return /\b(assistant|message|response|completion|result|output)\b/.test(marker);
+}
+
+function extractObservedMetadata(values) {
+  const flat = Array.isArray(values) ? values : [values];
+  const model = firstMetadataValue(flat, ["model", "model_name", "modelName"]);
+  const effort = firstMetadataValue(flat, ["effort", "reasoning_effort", "reasoningEffort"]);
+  const cost = firstMetadataValue(flat, ["total_cost_usd", "cost_usd", "costUsd", "totalCostUsd"]);
+  return {
+    model: model ? String(model) : null,
+    effort: effort ? String(effort) : null,
+    cost_hint: normalizeObservedCost(cost)
+  };
+}
+
+function firstMetadataValue(values, keys) {
+  for (const value of values) {
+    const found = findMetadataValue(value, keys);
+    if (found !== undefined && found !== null && found !== "") return found;
+  }
+  return null;
+}
+
+function findMetadataValue(value, keys, seen = new Set()) {
+  if (value === null || value === undefined || typeof value !== "object") return null;
+  if (seen.has(value)) return null;
+  seen.add(value);
+  for (const key of keys) {
+    if (value[key] !== undefined && value[key] !== null && value[key] !== "") {
+      return value[key];
+    }
+  }
+  for (const child of Object.values(value)) {
+    if (child && typeof child === "object") {
+      const found = findMetadataValue(child, keys, seen);
+      if (found !== undefined && found !== null && found !== "") return found;
+    }
+  }
+  return null;
+}
+
+function normalizeObservedCost(value) {
+  if (value === null || value === undefined || value === "") return null;
+  const amount = Number(value);
+  if (!Number.isFinite(amount) || amount < 0) return null;
+  return {
+    amount,
+    currency: "USD",
+    source: "observed"
   };
 }
 
@@ -2388,6 +2655,9 @@ async function outcomeRun(args) {
     effort: run.effort ?? null,
     roster: run.roster,
     purpose: run.purpose ?? "task_run",
+    provider_mode: run.provider_mode ?? inferProviderMode(run),
+    task_kind_source: run.task_kind_source ?? "legacy_inferred",
+    task_kind_suggestion: run.task_kind_suggestion ?? null,
     status: run.status,
     status_reason: run.status_reason ?? null,
     effective_status: classification.status,
@@ -2407,15 +2677,17 @@ async function suggestRun(args) {
 
   const cwd = resolveCwd(options);
   const events = await readLedger(cwd);
-  console.log(JSON.stringify(buildRecommendation(task, events), null, 2));
+  console.log(JSON.stringify(buildRecommendation(task, events, {
+    includeProbes: options["include-probes"] === true
+  }), null, 2));
 }
 
-function buildRecommendation(task, events) {
+function buildRecommendation(task, events, { includeProbes = false } = {}) {
   const runs = topLevelRuns(runsWithAppendedChecks(events));
   const verdicts = latestVerdictByRun(events);
   const marks = lifecycleMarksByRun(events);
   const taskKind = classifyTask(task);
-  const eligibility = partitionRecommendationEvidence(runs, verdicts, marks);
+  const eligibility = partitionRecommendationEvidence(runs, verdicts, marks, { includeProbes });
   const sameKind = eligibility.eligible.filter((run) => (run.task_kind ?? classifyTask(run.task)) === taskKind);
   const evidencePool = sameKind.length > 0 ? sameKind : eligibility.eligible;
   const groups = summarizeEvidenceGroups(evidencePool, verdicts, marks);
@@ -2470,6 +2742,7 @@ function buildRecommendation(task, events) {
     evidence: {
       eligible_runs: eligibility.eligible.length,
       same_kind_runs: sameKind.length,
+      include_probes: includeProbes,
       ignored_runs: eligibility.ignored.length,
       ignored_reasons: countBy(eligibility.ignored.map((item) => item.reason)),
       maturity: summarizeEvidenceMaturity(eligibility.eligible, verdicts, marks)
@@ -2543,11 +2816,11 @@ function statusNextActions({ topRuns, liveProviderTaskRuns, eligibility, release
 }
 
 function isLiveProviderTaskRun(run) {
-  return run.source === "live" && run.runner !== "fake" && run.purpose !== "provider_smoke";
+  return run.source === "live" && run.runner !== "fake" && !["provider_smoke", "probe"].includes(run.purpose);
 }
 
 function isManualTaskRun(run) {
-  return run.source === "manual" && run.runner !== "fake" && run.purpose !== "provider_smoke";
+  return run.source === "manual" && run.runner !== "fake" && !["provider_smoke", "probe"].includes(run.purpose);
 }
 
 function isRecommendationSourceRun(run) {
@@ -2791,6 +3064,12 @@ function buildRunCommand({ task, runner, roster, options, model = null, effort =
       parts.push(`--${key}`, String(value));
     }
   }
+  if (options.purpose !== undefined && options.purpose !== true) {
+    parts.push("--purpose", String(options.purpose));
+  }
+  if (options["task-kind"] !== undefined && options["task-kind"] !== true) {
+    parts.push("--task-kind", String(options["task-kind"]));
+  }
   if (options["allow-dirty"] === true) {
     parts.push("--allow-dirty");
   }
@@ -2816,7 +3095,7 @@ function buildRecordCommand({ task, runner, options, model = null, effort = null
     parts.push("--effort", effort);
   }
 
-  for (const key of ["cost-hint", "check", "note", "write-scope"]) {
+  for (const key of ["cost-hint", "check", "note", "task-kind", "write-scope"]) {
     const value = options[key];
     if (value !== undefined && value !== true) {
       parts.push(`--${key}`, String(value));
@@ -2845,7 +3124,7 @@ function buildRecordStartCommand({ task, runner, options, model = null, effort =
     parts.push("--effort", effort);
   }
 
-  for (const key of ["cost-hint", "note"]) {
+  for (const key of ["cost-hint", "note", "task-kind"]) {
     const value = options[key];
     if (value !== undefined && value !== true) {
       parts.push(`--${key}`, String(value));
@@ -2947,11 +3226,24 @@ function withReplayMetadata(run) {
   const classification = readClassification(run);
   return {
     ...run,
+    provider_mode: run.provider_mode ?? inferProviderMode(run),
+    task_kind_source: run.task_kind_source ?? "legacy_inferred",
+    task_kind_suggestion: run.task_kind_suggestion ?? null,
     effective_status: classification.status,
     effective_status_reason: classification.status_reason,
     classifier_version: classification.classifier_version,
     replay: replayMetadataForRun(run)
   };
+}
+
+function inferProviderMode(run) {
+  if (run?.provider_mode) return run.provider_mode;
+  if (run?.source === "manual" || run?.runner === "fake") return "internal";
+  if (run?.purpose === "provider_smoke" || run?.role === "reviewer" || run?.role === "planner") return "plan";
+  const argv = Array.isArray(run?.adapter?.argv) ? run.adapter.argv : [];
+  if (argv.includes("workspace-write") || argv.includes("acceptEdits") || argv.includes("auto_edit")) return "write";
+  if (argv.includes("read-only") || argv.includes("plan")) return "plan";
+  return null;
 }
 
 function replayMetadataForRun(run) {
@@ -3050,7 +3342,8 @@ async function rankRuns(args) {
   const runs = topLevelRuns(runsWithAppendedChecks(events));
   const verdicts = latestVerdictByRun(events);
   const marks = lifecycleMarksByRun(events);
-  const eligibility = partitionRecommendationEvidence(runs, verdicts, marks);
+  const includeProbes = options["include-probes"] === true;
+  const eligibility = partitionRecommendationEvidence(runs, verdicts, marks, { includeProbes });
   const eligible = taskKindFilter
     ? eligibility.eligible.filter((run) => (run.task_kind ?? classifyTask(run.task)) === taskKindFilter)
     : eligibility.eligible;
@@ -3069,6 +3362,7 @@ async function rankRuns(args) {
     task_kind: taskKindFilter,
     evidence: {
       eligible_runs: eligible.length,
+      include_probes: includeProbes,
       ignored_runs: eligibility.ignored.length,
       ignored_reasons: countBy(eligibility.ignored.map((item) => item.reason)),
       maturity: summarizeEvidenceMaturity(eligible, verdicts, marks)
@@ -3828,11 +4122,14 @@ function summarizeRun(run) {
     source: run.source,
     confidence: run.confidence,
     task_kind: run.task_kind,
+    task_kind_source: run.task_kind_source ?? "legacy_inferred",
+    task_kind_suggestion: run.task_kind_suggestion ?? null,
     runner: run.runner,
     model: run.model ?? null,
     effort: run.effort ?? null,
     roster: run.roster,
     role: run.role,
+    provider_mode: run.provider_mode ?? inferProviderMode(run),
     parent_id: run.parent_id,
     child_run_ids: run.child_run_ids ?? [],
     transcript_path: run.transcript_path,
@@ -3864,6 +4161,8 @@ function summarizeSessionBaseline(event) {
     source: event.source,
     confidence: event.confidence,
     task_kind: event.task_kind,
+    task_kind_source: event.task_kind_source ?? "legacy_inferred",
+    task_kind_suggestion: event.task_kind_suggestion ?? null,
     runner: event.runner,
     model: event.model ?? null,
     effort: event.effort ?? null,
@@ -3938,6 +4237,7 @@ function formatCheckEvent(event) {
     stderr: event.stderr ?? "",
     repo: event.repo ?? null,
     changed_files: Array.isArray(event.changed_files) ? event.changed_files : [],
+    vacuous: event.vacuous === true,
     note: event.note ?? ""
   };
 }
@@ -4017,6 +4317,44 @@ function classifyTask(task) {
   if (/\b(review|audit|critique|inspect)\b/.test(lower)) return "review";
   if (/\b(add|build|implement|create|feature|support)\b/.test(lower)) return "feature";
   return "general";
+}
+
+function taskKindMetadata(task, options, changedFiles = []) {
+  if (options["task-kind"] !== undefined && options["task-kind"] !== true) {
+    const taskKind = normalizeTaskKind(options["task-kind"]);
+    return {
+      task_kind: taskKind,
+      task_kind_source: "user",
+      task_kind_suggestion: null
+    };
+  }
+
+  return {
+    task_kind: "unspecified",
+    task_kind_source: "unspecified",
+    task_kind_suggestion: suggestTaskKind(task, changedFiles)
+  };
+}
+
+function maybeWarnUnspecifiedTaskKind(options) {
+  if (options["task-kind"] === undefined) {
+    writeRuxProgress("nudge: no --task-kind supplied; recording task_kind=unspecified with a non-authoritative suggestion.");
+  }
+}
+
+function suggestTaskKind(task, changedFiles = []) {
+  const files = Array.isArray(changedFiles) ? changedFiles : [];
+  if (files.length === 0) {
+    return classifyTask(task ?? "");
+  }
+
+  const docs = files.filter((file) => /\.(md|mdx|txt)$/i.test(file) || file.startsWith("docs/")).length;
+  const tests = files.filter((file) => /(^|\/)(test|tests|spec|__tests__)(\/|$)|\.(test|spec)\.[cm]?[jt]sx?$/i.test(file)).length;
+  const code = files.filter((file) => /\.(mjs|cjs|js|jsx|ts|tsx|go|rs|py|rb|java|kt|swift|css|scss)$/i.test(file)).length;
+  if (tests > 0 && tests >= code) return "test";
+  if (docs === files.length) return "docs";
+  if (code > 0) return classifyTask(task ?? "") === "bugfix" ? "bugfix" : "feature";
+  return classifyTask(task ?? "");
 }
 
 function latestVerdictByRun(events) {
@@ -4120,13 +4458,13 @@ function readClassification(run) {
   };
 }
 
-function partitionRecommendationEvidence(runs, verdicts, marks) {
+function partitionRecommendationEvidence(runs, verdicts, marks, { includeProbes = false } = {}) {
   const eligible = [];
   const ignored = [];
 
   for (const run of runs) {
     const verdict = verdicts.get(run.id);
-    const reason = recommendationBlocker(run, verdict, marks.get(run.id) ?? []);
+    const reason = recommendationBlocker(run, verdict, marks.get(run.id) ?? [], { includeProbes });
     if (reason) {
       ignored.push({ id: run.id, reason });
     } else {
@@ -4137,15 +4475,16 @@ function partitionRecommendationEvidence(runs, verdicts, marks) {
   return { eligible, ignored };
 }
 
-function recommendationBlocker(run, verdict, marks = []) {
-  return recommendationBlockers(run, verdict, marks)[0] ?? null;
+function recommendationBlocker(run, verdict, marks = [], options = {}) {
+  return recommendationBlockers(run, verdict, marks, options)[0] ?? null;
 }
 
-function recommendationBlockers(run, verdict, marks = []) {
+function recommendationBlockers(run, verdict, marks = [], { includeProbes = false } = {}) {
   const blockers = [];
   const classification = readClassification(run);
   if (run.parent_id) blockers.push("child_run");
   if (run.purpose === "provider_smoke") blockers.push("provider_smoke");
+  if (run.purpose === "probe" && !includeProbes) blockers.push("probe_run");
   if (!isRecommendationSourceRun(run)) blockers.push("not_live");
   if (run.confidence !== "high") blockers.push("not_high_confidence");
   if (run.runner === "fake") blockers.push("fake_runner");
@@ -4610,6 +4949,9 @@ function evaluateRunRecord(run, children, verdicts, marksByRun = new Map(), repo
     roster: run.roster,
     role: run.role ?? null,
     task_kind: run.task_kind ?? classifyTask(run.task ?? ""),
+    task_kind_source: run.task_kind_source ?? "legacy_inferred",
+    task_kind_suggestion: run.task_kind_suggestion ?? null,
+    provider_mode: run.provider_mode ?? inferProviderMode(run),
     status: run.status,
     status_reason: run.status_reason ?? null,
     effective_status: classification.status,

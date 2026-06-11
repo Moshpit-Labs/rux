@@ -315,6 +315,51 @@ try {
   const smokeOnlyReleaseCheck = JSON.parse(run("node", [cliPath, "release-check", "--cwd", smokeOnlyRoot]).stdout);
   assert(smokeOnlyReleaseCheck.gates.find((gate) => gate.name === "real_provider_task_evidence")?.ok === false, "release-check should not treat provider-smoke as task evidence");
 
+  const probeOnlyRoot = join(tempRoot, "probe-only");
+  await mkdir(probeOnlyRoot, { recursive: true });
+  run("git", ["init"], probeOnlyRoot);
+  await writeFile(join(probeOnlyRoot, "README.md"), "# Probe Only\n", "utf8");
+  run("git", ["add", "README.md"], probeOnlyRoot);
+  run("git", ["commit", "-m", "initial"], probeOnlyRoot, {
+    GIT_AUTHOR_NAME: "Rux Smoke",
+    GIT_AUTHOR_EMAIL: "smoke@example.com",
+    GIT_COMMITTER_NAME: "Rux Smoke",
+    GIT_COMMITTER_EMAIL: "smoke@example.com"
+  });
+  await writeFile(join(probeOnlyRoot, "rux.policy.json"), JSON.stringify({
+    schema_version: 1,
+    preferred_runner_order: ["codex", "gemini", "claude"],
+    default_roster: "solo",
+    parallel_provider_cli_runs: false,
+    provider_auth: "inherit_cli_environment",
+    transcript_export_default: "omit",
+    self_modification: "proposal_only"
+  }, null, 2), "utf8");
+  const probeOnlyRun = spawnSync("node", [
+    cliPath,
+    "run",
+    "probe-only release guard",
+    "--runner",
+    "codex",
+    "--allow-dirty",
+    "--purpose",
+    "probe",
+    "--check",
+    "node --version",
+    "--cwd",
+    probeOnlyRoot
+  ], {
+    encoding: "utf8",
+    env: { ...process.env, PATH: `${tempBin}:${process.env.PATH ?? ""}` }
+  });
+  assert(probeOnlyRun.status === 0, "probe-only mocked codex run should complete");
+  const probeOnlyStatus = JSON.parse(run("node", [cliPath, "status", "--cwd", probeOnlyRoot], repoRoot, {
+    PATH: `${tempBin}:${process.env.PATH ?? ""}`
+  }).stdout);
+  assert(probeOnlyStatus.evidence.eligible_runs === 0, "probe-only status should ignore probes as task evidence by default");
+  const probeOnlyReleaseCheck = JSON.parse(run("node", [cliPath, "release-check", "--cwd", probeOnlyRoot]).stdout);
+  assert(probeOnlyReleaseCheck.gates.find((gate) => gate.name === "real_provider_task_evidence")?.ok === false, "release-check should not treat probes as task evidence by default");
+
   const mutatingOnlyRoot = join(tempRoot, "mutating-only");
   await mkdir(mutatingOnlyRoot, { recursive: true });
   run("git", ["init"], mutatingOnlyRoot);
@@ -1072,6 +1117,8 @@ try {
   assert(claudeSummary.adapter.argv.includes("--permission-mode"), "mocked claude adapter should expose argv");
   assert(claudeSummary.adapter.stdout_bytes > 0, "mocked claude adapter should expose stdout byte count");
   assert(claudeSummary.adapter.stderr_signal.level === "none", "mocked claude adapter should classify empty stderr");
+  assert(claudeSummary.adapter.parsed_output.format === "claude-json", "mocked claude adapter should parse representative JSON output");
+  assert(claudeSummary.adapter.parsed_output.parsed === true, "mocked claude adapter should avoid raw text fallback for JSON output");
   assert(claudeSummary.model === "claude-sonnet-smoke", "mocked claude run should capture model metadata");
   assert(claudeSummary.effort === "high", "mocked claude run should capture effort metadata");
   assert(claudeSummary.cost_hint.amount === 0.42, "mocked claude run should capture numeric cost hint");
@@ -1085,7 +1132,7 @@ try {
 
   const claudeTranscript = await readFile(join(tempRoot, claudeSummary.transcript_path), "utf8");
   assert(claudeTranscript.includes("--permission-mode plan"), "claude runner should use plan permission mode");
-  assert(claudeTranscript.includes("mock claude received"), "claude transcript should capture stdout");
+  assert(claudeTranscript.includes("mock claude structured response"), "claude transcript should capture parsed assistant text");
   const claudeWriteRun = spawnSync("node", [
     cliPath,
     "run",
@@ -1103,6 +1150,7 @@ try {
   });
   assert(claudeWriteRun.status === 0, "mocked claude write-mode runner should complete");
   const claudeWriteSummary = JSON.parse(claudeWriteRun.stdout);
+  assert(claudeWriteSummary.provider_mode === "write", "write-mode claude summaries should expose provider_mode");
   const claudeWriteTranscript = await readFile(join(tempRoot, claudeWriteSummary.transcript_path), "utf8");
   assert(claudeWriteTranscript.includes("--permission-mode acceptEdits"), "claude write mode should accept edits instead of plan mode");
   run("node", [
@@ -1136,8 +1184,16 @@ try {
   const codexSummary = JSON.parse(codexRun.stdout);
   assert(codexSummary.runner === "codex", "mocked codex run should use codex runner");
   assert(codexSummary.status === "ok", "mocked codex run should be ok");
+  assert(codexSummary.provider_mode === "plan", "default codex summaries should expose plan provider_mode");
+  assert(codexSummary.task_kind === "unspecified", "runs without --task-kind should record unspecified task_kind");
+  assert(codexSummary.task_kind_source === "unspecified", "runs without --task-kind should record unspecified task kind source");
+  assert(codexSummary.task_kind_suggestion === "general", "runs without --task-kind should store a non-authoritative suggestion");
   assert(codexSummary.adapter.argv.includes("--sandbox"), "mocked codex adapter should expose sandbox argv");
   assert(codexSummary.adapter.stderr_signal.level === "diagnostic", "mocked codex adapter should classify successful stderr as diagnostic");
+  assert(codexSummary.adapter.parsed_output.format === "codex-jsonl", "mocked codex adapter should parse representative JSONL output");
+  assert(codexSummary.adapter.parsed_output.event_types.includes("message"), "mocked codex adapter should expose JSONL event types");
+  assert(codexSummary.model === "codex-mock-jsonl", "mocked codex JSONL should populate observed model metadata");
+  assert(codexSummary.adapter.metadata_sources.model === "observed", "mocked codex JSONL should mark model metadata as observed");
   const codexEval = JSON.parse(run("node", [cliPath, "eval", codexSummary.id, "--cwd", tempRoot]).stdout);
   assert(codexEval.signals.adapter_stderr_signal === "diagnostic", "eval should expose diagnostic stderr without treating it as failure");
   const codexOutcome = JSON.parse(run("node", [cliPath, "outcome", codexSummary.id, "--cwd", tempRoot]).stdout);
@@ -1177,7 +1233,7 @@ try {
 
   const codexTranscript = await readFile(join(tempRoot, codexSummary.transcript_path), "utf8");
   assert(codexTranscript.includes("exec --sandbox read-only"), "codex runner should use read-only sandbox");
-  assert(codexTranscript.includes("mock codex received"), "codex transcript should capture stdout");
+  assert(codexTranscript.includes("mock codex structured response"), "codex transcript should capture parsed assistant text");
   const codexWriteRun = spawnSync("node", [
     cliPath,
     "run",
@@ -1195,8 +1251,25 @@ try {
   });
   assert(codexWriteRun.status === 0, "mocked codex write-mode runner should complete");
   const codexWriteSummary = JSON.parse(codexWriteRun.stdout);
+  assert(codexWriteSummary.provider_mode === "write", "write-mode codex summaries should expose provider_mode");
   const codexWriteTranscript = await readFile(join(tempRoot, codexWriteSummary.transcript_path), "utf8");
   assert(codexWriteTranscript.includes("exec --sandbox workspace-write"), "codex write mode should use workspace-write sandbox");
+
+  const typedTaskKindRun = JSON.parse(run("node", [
+    cliPath,
+    "run",
+    "typed task kind guard",
+    "--runner",
+    "fake",
+    "--task-kind",
+    "review",
+    "--cwd",
+    tempRoot
+  ]).stdout);
+  assert(typedTaskKindRun.task_kind === "review", "--task-kind user path should record the user task_kind");
+  assert(typedTaskKindRun.task_kind_source === "user", "--task-kind user path should record source user");
+  assert(typedTaskKindRun.task_kind_suggestion === null, "--task-kind user path should not store a suggestion");
+  assert(typedTaskKindRun.provider_mode === "internal", "fake run summaries should expose internal provider_mode");
 
   const geminiRun = spawnSync("node", [cliPath, "run", "gemini guard", "--runner", "gemini", "--allow-dirty", "--cwd", tempRoot], {
     encoding: "utf8",
@@ -1206,11 +1279,16 @@ try {
   const geminiSummary = JSON.parse(geminiRun.stdout);
   assert(geminiSummary.runner === "gemini", "mocked gemini run should use gemini runner");
   assert(geminiSummary.status === "ok", "mocked gemini run should be ok");
+  assert(geminiSummary.provider_mode === "plan", "default gemini summaries should expose plan provider_mode");
+  assert(geminiSummary.adapter.parsed_output.format === "gemini-json", "mocked gemini adapter should parse representative JSON output");
+  assert(geminiSummary.adapter.parsed_output.parsed === true, "mocked gemini adapter should avoid raw text fallback for JSON output");
+  assert(geminiSummary.model === "gemini-mock-json", "mocked gemini JSON should populate observed model metadata");
+  assert(geminiSummary.adapter.metadata_sources.model === "observed", "mocked gemini JSON should mark model metadata as observed");
 
   const geminiTranscript = await readFile(join(tempRoot, geminiSummary.transcript_path), "utf8");
   assert(geminiTranscript.includes("--approval-mode plan"), "gemini runner should use plan approval mode");
   assert(geminiTranscript.includes("--skip-trust"), "gemini runner should skip workspace trust prompts for headless runs");
-  assert(geminiTranscript.includes("mock gemini received"), "gemini transcript should capture stdout");
+  assert(geminiTranscript.includes("mock gemini structured response"), "gemini transcript should capture parsed assistant text");
   const geminiWriteRun = spawnSync("node", [
     cliPath,
     "run",
@@ -1228,6 +1306,7 @@ try {
   });
   assert(geminiWriteRun.status === 0, "mocked gemini write-mode runner should complete");
   const geminiWriteSummary = JSON.parse(geminiWriteRun.stdout);
+  assert(geminiWriteSummary.provider_mode === "write", "write-mode gemini summaries should expose provider_mode");
   const geminiWriteTranscript = await readFile(join(tempRoot, geminiWriteSummary.transcript_path), "utf8");
   assert(geminiWriteTranscript.includes("--approval-mode auto_edit"), "gemini write mode should use auto_edit approval mode");
 
@@ -1698,6 +1777,27 @@ try {
   assert(postSmokeList.includes("Rux provider smoke for claude. Do not edit files."), "ls should keep provider-smoke tasks readable");
   assert(!postSmokeList.includes("\nDo not edit files."), "ls should collapse multi-line task text");
 
+  const probeRun = spawnSync("node", [
+    cliPath,
+    "run",
+    "probe guard",
+    "--runner",
+    "codex",
+    "--allow-dirty",
+    "--purpose",
+    "probe",
+    "--check",
+    "node --version",
+    "--cwd",
+    tempRoot
+  ], {
+    encoding: "utf8",
+    env: { ...process.env, PATH: `${tempBin}:${process.env.PATH ?? ""}` }
+  });
+  assert(probeRun.status === 0, "mocked probe run should complete");
+  const probeSummary = JSON.parse(probeRun.stdout);
+  assert(probeSummary.purpose === "probe", "--purpose probe runs should record probe purpose");
+
   const suggestResult = run("node", [cliPath, "suggest", "guard", "--cwd", tempRoot]);
   const suggestion = JSON.parse(suggestResult.stdout);
   assert(suggestion.recommendation.runner === "claude", "suggest should choose accepted live claude evidence");
@@ -1712,8 +1812,9 @@ try {
   assert(suggestion.evidence.ignored_reasons.unlabeled >= 1, "suggest should ignore unlabeled provider runs");
   assert(suggestion.evidence.ignored_reasons.check_modified_files >= 1, "suggest should ignore runs with mutating checks");
   assert(suggestion.evidence.ignored_reasons.provider_smoke >= 3, "suggest should ignore provider-smoke runs");
+  assert(suggestion.evidence.ignored_reasons.probe_run >= 1, "suggest should ignore probe runs by default");
 
-  const rankResult = run("node", [cliPath, "rank", "--task-kind", "general", "--cwd", tempRoot]);
+  const rankResult = run("node", [cliPath, "rank", "--task-kind", "unspecified", "--cwd", tempRoot]);
   const ranking = JSON.parse(rankResult.stdout);
   assert(ranking.evidence.eligible_runs === 4, "rank should use eligible live provider runs for the scope");
   assert(ranking.rankings[0]?.candidates[0]?.runner === "claude", "rank should put accepted claude evidence first");
@@ -1726,6 +1827,11 @@ try {
   assert(ranking.evidence.ignored_reasons.fake_runner >= 1, "rank should ignore fake runner history");
   assert(ranking.evidence.ignored_reasons.check_modified_files >= 1, "rank should ignore runs with mutating checks");
   assert(ranking.evidence.ignored_reasons.provider_smoke >= 3, "rank should ignore provider-smoke runs");
+  assert(ranking.evidence.ignored_reasons.probe_run >= 1, "rank should ignore probe runs by default");
+  const rankWithProbes = JSON.parse(run("node", [cliPath, "rank", "--task-kind", "unspecified", "--include-probes", "--cwd", tempRoot]).stdout);
+  assert(rankWithProbes.evidence.include_probes === true, "rank --include-probes should mark probe inclusion");
+  assert(rankWithProbes.evidence.eligible_runs === ranking.evidence.eligible_runs + 1, "rank --include-probes should include checked probe evidence");
+  assert(!rankWithProbes.evidence.ignored_reasons.probe_run, "rank --include-probes should not ignore probes as probes");
 
   const evidencePlanRun = spawnSync("node", [cliPath, "plan", "guard", "--cwd", tempRoot], {
     encoding: "utf8",
@@ -2010,9 +2116,13 @@ async function installMockClaude(binDir) {
     mockPath,
     [
       "#!/bin/sh",
-      "printf 'mock claude received:'",
-      "for arg in \"$@\"; do printf ' [%s]' \"$arg\"; done",
-      "printf '\\n'",
+      "case \" $* \" in",
+      "  *\"--output-format json\"*)",
+      "    printf '%s\\n' '{\"type\":\"result\",\"result\":\"mock claude structured response\",\"model\":\"claude-mock-json\",\"usage\":{\"input_tokens\":12,\"output_tokens\":4}}'",
+      "    exit 0",
+      "    ;;",
+      "esac",
+      "printf 'mock claude text fallback\\n'",
       ""
     ].join("\n"),
     "utf8"
@@ -2028,9 +2138,14 @@ async function installMockCodex(binDir) {
     [
       "#!/bin/sh",
       "printf 'mock codex diagnostic\\n' >&2",
-      "printf 'mock codex received:'",
-      "for arg in \"$@\"; do printf ' [%s]' \"$arg\"; done",
-      "printf '\\n'",
+      "case \" $* \" in",
+      "  *\" --json \"*)",
+      "    printf '%s\\n' '{\"type\":\"message\",\"message\":{\"content\":[{\"type\":\"output_text\",\"text\":\"mock codex structured response\"}]}}'",
+      "    printf '%s\\n' '{\"type\":\"final\",\"summary\":\"mock codex final summary\",\"model\":\"codex-mock-jsonl\"}'",
+      "    exit 0",
+      "    ;;",
+      "esac",
+      "printf 'mock codex text fallback\\n'",
       ""
     ].join("\n"),
     "utf8"
@@ -2105,9 +2220,13 @@ async function installMockGemini(binDir) {
       "    exit 0",
       "    ;;",
       "esac",
-      "printf 'mock gemini received:'",
-      "for arg in \"$@\"; do printf ' [%s]' \"$arg\"; done",
-      "printf '\\n'",
+      "case \" $* \" in",
+      "  *\"--output-format json\"*)",
+      "    printf '%s\\n' '{\"response\":\"mock gemini structured response\",\"model\":\"gemini-mock-json\",\"usage\":{\"input_tokens\":10,\"output_tokens\":5}}'",
+      "    exit 0",
+      "    ;;",
+      "esac",
+      "printf 'mock gemini text fallback\\n'",
       ""
     ].join("\n"),
     "utf8"
