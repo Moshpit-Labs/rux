@@ -4,7 +4,7 @@ Last updated: 2026-06-11
 
 ## One-Line Summary
 
-Rux is a public coding-agent run ledger that records real outcomes first, then uses that evidence to recommend agent rosters. The first public package is live, and the release posture is still test first: local verification before every publish.
+Rux is a public coding-agent run ledger that records real outcomes first, then uses that evidence to recommend agent rosters. The current npm release is `@moshpits/rux@0.2.0`, and the release posture is still test first: local verification before every publish.
 
 ## Decisions
 
@@ -13,6 +13,7 @@ Rux is a public coding-agent run ledger that records real outcomes first, then u
 - Do not use Vane as the release name; it conflicts with the popular [ItzCrazyKns/Vane](https://github.com/ItzCrazyKns/Vane) AI answering-engine project.
 - Keep runtime naming centralized in `src/identity.mjs`.
 - NPM org created: `moshpits` (`https://www.npmjs.com/org/moshpits`). Public package metadata lives under `@moshpits/rux`. The unscoped `rux` npm package is already occupied by an old, unrelated React/observable package; use the scoped package plus `rux` bin.
+- `@moshpits/rux@0.2.0` is published on npm with the `latest` dist-tag.
 - Package privacy has been deliberately removed for public release after local smoke, real provider smoke, and first routing-eligible provider task evidence passed.
 - Keep the npm package lean. The package allowlist includes runtime source and the default policy file; internal docs, tests, and agent instructions stay repo-only.
 - Local smoke now verifies the npm tarball contents, installs the packed tarball into a temporary prefix, and runs the installed `rux` bin.
@@ -120,4 +121,4 @@ Local Moshpit learnings:
 
 ## Next Action
 
-The v0.1 package is public. Wave 2 core is complete and exited: capture attribution, read-time classification, schema v2, adapter metadata, probe/task taxonomy, TTY output, headless verdicts, provider-smoke attempts, mark nudges, and the README quickstart are implemented, verified, and pushed. `npm run release:verify` passed on the clean tree at final Wave 2 exit. The landing page is cut, not pending. Next highest-leverage work is dogfood evidence: run the new capture loop on real tasks, attach verdicts and lifecycle marks, broaden observed provider metadata beyond mocks, and only promote `rank`/`suggest` claims at the maturity level the local ledger can defend.
+The `0.2.0` package is public. Wave 2 core is complete, exited, and released: capture attribution, read-time classification, schema v2, adapter metadata, probe/task taxonomy, TTY output, headless verdicts, provider-smoke attempts, mark nudges, and the README quickstart are implemented, verified, pushed, and published. `npm run release:verify` passed on the clean release tree. The landing page is cut, not pending. Next highest-leverage work is dogfood evidence: run the new capture loop on real tasks, attach verdicts and lifecycle marks, broaden observed provider metadata beyond mocks, and only promote `rank`/`suggest` claims at the maturity level the local ledger can defend.
