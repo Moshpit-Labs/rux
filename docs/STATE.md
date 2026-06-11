@@ -1,6 +1,6 @@
 # Current State
 
-Last updated: 2026-06-09
+Last updated: 2026-06-11
 
 ## One-Line Summary
 
@@ -110,4 +110,4 @@ Local Moshpit learnings:
 
 ## Next Action
 
-The v0.1 package is public. Next useful work is broader evidence from real implementation, repair, and review tasks, then richer routing and roster selection only where the ledger supports it.
+The v0.1 package is public. A cross-repo dogfood analysis (2026-06-11, four `.rux` stores, 60 runs, 28 reports) found the next wave: close the session-capture leak, fix misleading status/check labels, and observe provider metadata instead of discarding it. The evidence-cited plan is `docs/sprint-2026-06.md` (temporary planning artifact; sticky outcomes graduate into the permanent docs at wave exit).
