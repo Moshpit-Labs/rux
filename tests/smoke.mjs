@@ -369,6 +369,43 @@ try {
   assert(coldExport.include_transcripts === false, "export should omit transcripts by default");
   assert(!existsSync(join(tempRoot, ".rux")), "export should remain read-only before the first run");
 
+  const reclassificationRoot = join(tempRoot, "reclassification-fixtures");
+  await mkdir(join(reclassificationRoot, ".rux", "ledger"), { recursive: true });
+  const reclassificationCases = (await readFile(join(repoRoot, "tests", "fixtures", "reclassification.jsonl"), "utf8"))
+    .split("\n")
+    .filter((line) => line.trim())
+    .map((line) => JSON.parse(line));
+  await writeFile(
+    join(reclassificationRoot, ".rux", "ledger", "2026-06-10.jsonl"),
+    `${reclassificationCases.map((fixture) => JSON.stringify(fixture.run)).join("\n")}\n`,
+    "utf8"
+  );
+  for (const fixture of reclassificationCases) {
+    const evalResult = JSON.parse(run("node", [cliPath, "eval", fixture.run.id, "--cwd", reclassificationRoot]).stdout);
+    assert(fixture.run.schema_version === 1, `${fixture.case} should be a v1 compatibility fixture`);
+    assert(evalResult.status === fixture.run.status, `${fixture.case} should preserve stored status`);
+    assert(evalResult.status_reason === fixture.run.status_reason, `${fixture.case} should preserve stored status reason`);
+    assert(evalResult.classifier_version === "read-classifier-2026-06-11", `${fixture.case} should expose classifier version`);
+    assert(evalResult.effective_status === fixture.expected.effective_status, `${fixture.case} effective status should match fixture expectation`);
+    assert(evalResult.effective_status_reason === fixture.expected.effective_status_reason, `${fixture.case} effective status reason should match fixture expectation`);
+    assert(evalResult.routing.eligible === fixture.expected.routing_eligible, `${fixture.case} routing eligibility should use effective status`);
+    if (fixture.expected.vacuous_check !== undefined) {
+      assert(evalResult.signals.vacuous_checks === (fixture.expected.vacuous_check ? 1 : 0), `${fixture.case} should expose vacuous check count`);
+      assert(evalResult.routing.blockers.includes("vacuous_check") === fixture.expected.vacuous_check, `${fixture.case} routing blockers should expose vacuous checks`);
+    }
+  }
+  const reclassifiedShow = JSON.parse(run("node", [cliPath, "show", "20260610T100302Z-c99e1c12", "--cwd", reclassificationRoot]).stdout);
+  assert(reclassifiedShow.run.status === "blocked", "show should keep stored status on the run object");
+  assert(reclassifiedShow.run.effective_status === "ok", "show should expose effective status next to stored status");
+  assert(reclassifiedShow.evaluation.signals.classifier_changed === true, "show evaluation should flag read-time reclassification");
+  const reclassifiedExport = JSON.parse(run("node", [cliPath, "export", "--cwd", reclassificationRoot, "--run-id", "20260610T100302Z-c99e1c12"]).stdout);
+  assert(reclassifiedExport.runs[0].status === "blocked", "export should preserve stored status");
+  assert(reclassifiedExport.runs[0].effective_status === "ok", "export should expose effective status");
+  const reclassificationRank = JSON.parse(run("node", [cliPath, "rank", "--cwd", reclassificationRoot]).stdout);
+  assert(reclassificationRank.evidence.eligible_runs === 4, "rank should count the four changed-files provider_needs_input fixtures as eligible");
+  const reclassificationSuggestion = JSON.parse(run("node", [cliPath, "suggest", "implement a feature", "--cwd", reclassificationRoot]).stdout);
+  assert(reclassificationSuggestion.evidence.eligible_runs === 4, "suggest should consume effective labels for recommendation evidence");
+
   const runResult = run("node", [
     cliPath,
     "run",
@@ -381,6 +418,7 @@ try {
     "node --version"
   ]);
   const summary = JSON.parse(runResult.stdout);
+  assert(summary.schema_version === undefined, "run summaries should stay compact and not expose raw schema version");
   assert(summary.status === "ok", "fake run should be ok");
   assert(summary.status_reason === "completed", "fake run should classify completed status");
   assert(summary.runner === "fake", "fake run should use fake runner");
@@ -642,6 +680,8 @@ try {
   const showResult = run("node", [cliPath, "show", summary.id, "--cwd", tempRoot]);
   const shown = JSON.parse(showResult.stdout);
   assert(shown.run.id === summary.id, "show should return the run");
+  assert(shown.run.schema_version === 2, "new run records should use schema version 2");
+  assert(!Object.hasOwn(shown.run, "human_verdict"), "new run records should not write dead inline human_verdict fields");
   assert(shown.run.replay.command === summary.replay.command, "show should expose replay metadata");
   assert(shown.run.adapter.command === "(built-in)", "show should expose adapter metadata");
   assert(shown.verdicts[0]?.verdict === "accepted", "show should include verdict");

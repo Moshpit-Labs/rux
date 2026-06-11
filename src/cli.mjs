@@ -12,7 +12,8 @@ const TRANSCRIPT_DIR = "transcripts";
 const PROPOSAL_DIR = "proposals";
 const REPORT_DIR = "reports";
 const POLICY_FILE = "rux.policy.json";
-const SCHEMA_VERSION = 1;
+const SCHEMA_VERSION = 2;
+const CLASSIFIER_VERSION = "read-classifier-2026-06-11";
 const rosterDefinitions = new Set(["solo", "pair", "repair", "plan-code-review"]);
 const lifecycleMarkDefinitions = new Set(["reverted", "replayed", "accepted-downstream"]);
 const reportKindDefinitions = new Set(["bug", "ux", "adapter", "docs", "routing", "orchestration", "install", "idea", "success", "other"]);
@@ -795,6 +796,7 @@ async function status(args) {
       next_actions: release.next_actions
     },
     latest_runs: newestRuns(topRuns).slice(0, 5).map((run) => {
+      const classification = readClassification(run);
       const outcome = summarizeOutcome(
         run,
         runs.filter((candidate) => candidate.parent_id === run.id),
@@ -806,6 +808,9 @@ async function status(args) {
         runner: run.runner,
         roster: run.roster,
         status: run.status,
+        effective_status: classification.status,
+        effective_status_reason: classification.status_reason,
+        classifier_version: classification.classifier_version,
         outcome: outcome.label,
         task_kind: run.task_kind ?? classifyTask(run.task ?? ""),
         task_summary: formatListTask(run.task),
@@ -901,6 +906,7 @@ async function exportRunRecord({ cwd, run, children, verdicts, marks, reports, i
   const verdict = verdicts.get(run.id) ?? null;
   const runMarks = marks.get(run.id) ?? [];
   const runReports = reports.get(run.id) ?? [];
+  const classification = readClassification(run);
   const evaluation = evaluateRunRecord(run, children, verdicts, marks, reports);
   const record = {
     id: run.id,
@@ -917,6 +923,9 @@ async function exportRunRecord({ cwd, run, children, verdicts, marks, reports, i
     replay: replayMetadataForRun(run),
     status: run.status,
     status_reason: run.status_reason ?? null,
+    effective_status: classification.status,
+    effective_status_reason: classification.status_reason,
+    classifier_version: classification.classifier_version,
     started_at: run.started_at,
     ended_at: run.ended_at,
     duration_ms: run.duration_ms,
@@ -933,7 +942,8 @@ async function exportRunRecord({ cwd, run, children, verdicts, marks, reports, i
       exit_code: check.exit_code,
       duration_ms: check.duration_ms ?? null,
       repo: check.repo ?? null,
-      changed_files: Array.isArray(check.changed_files) ? check.changed_files : []
+      changed_files: Array.isArray(check.changed_files) ? check.changed_files : [],
+      vacuous: check.vacuous === true || isVacuousCheckForRun(run, check)
     })) : [],
     verdict: verdict ? {
       verdict: verdict.verdict,
@@ -1198,13 +1208,13 @@ async function createManualRun({ task, options, extraNotes = [] }) {
       violations: writeScope.violations
     } : null,
     checks: check ? [check] : [],
-    human_verdict: null,
     cost_hint: metadata.cost_hint ?? null,
     output_signal: outputSignal,
     adapter: buildManualAdapterRecord(runner, metadata),
     replay: manualReplayMetadata(replayCommand),
     notes
   };
+  stampVacuousChecks(run);
 
   await appendLedger(cwd, run);
   writeRuxProgress(`recorded manual run ${run.id} status=${run.status} reason=${run.status_reason}`);
@@ -1385,13 +1395,13 @@ async function captureRunAttempt({
       violations: writeScope.violations
     } : null,
     checks: check ? [check] : [],
-    human_verdict: null,
     cost_hint: metadata.cost_hint ?? null,
     output_signal: outputSignal,
     adapter: buildAdapterRecord(transcript.adapter, metadata),
     replay,
     notes: runNotes
   };
+  stampVacuousChecks(run);
 
   await appendLedger(cwd, run);
   writeRuxProgress(`recorded run ${run.id} status=${run.status} reason=${run.status_reason ?? "unknown"}`);
@@ -1564,7 +1574,6 @@ async function executeRoster({ roster, task, cwd, options, runnerByRole, metadat
     transcript_path: relative(cwd, transcriptPath),
     changed_files: unique(children.flatMap((child) => child.changed_files)),
     checks: children.flatMap((child) => child.checks),
-    human_verdict: null,
     cost_hint: metadata.cost_hint ?? null,
     adapter: {
       runner: runnerByRole.primary,
@@ -2112,7 +2121,9 @@ async function listRuns(args) {
     const verdict = verdictByRun.get(run.id) ?? "-";
     const mark = latestLifecycleMark(marks.get(run.id) ?? [])?.mark ?? "-";
     const source = `${run.source ?? "live"}:${run.confidence ?? "unknown"}`;
-    console.log(`${run.id}  ${run.status.padEnd(7)}  ${run.runner.padEnd(7)}  ${source.padEnd(13)}  verdict=${verdict}  mark=${mark}  ${formatListTask(run.task)}`);
+    const classification = readClassification(run);
+    const statusText = classification.changed ? `${run.status}->${classification.status}` : run.status;
+    console.log(`${run.id}  ${statusText.padEnd(12)}  ${run.runner.padEnd(7)}  ${source.padEnd(13)}  verdict=${verdict}  mark=${mark}  ${formatListTask(run.task)}`);
   }
 }
 
@@ -2184,7 +2195,6 @@ async function importRun(args) {
     transcript_path: relative(cwd, transcriptPath),
     changed_files: [],
     checks: [],
-    human_verdict: null,
     cost_hint: metadata.cost_hint ?? null,
     adapter: {
       runner,
@@ -2369,6 +2379,7 @@ async function outcomeRun(args) {
   const children = runs.filter((event) => event.type === "run" && event.parent_id === id);
   const latestVerdicts = latestVerdictByRun(events);
   const lifecycleMarks = lifecycleMarksByRun(events);
+  const classification = readClassification(run);
   console.log(JSON.stringify({
     run_id: run.id,
     task_kind: run.task_kind ?? classifyTask(run.task ?? ""),
@@ -2377,6 +2388,11 @@ async function outcomeRun(args) {
     effort: run.effort ?? null,
     roster: run.roster,
     purpose: run.purpose ?? "task_run",
+    status: run.status,
+    status_reason: run.status_reason ?? null,
+    effective_status: classification.status,
+    effective_status_reason: classification.status_reason,
+    classifier_version: classification.classifier_version,
     marks: (lifecycleMarks.get(run.id) ?? []).map(formatLifecycleMark),
     outcome: summarizeOutcome(run, children, latestVerdicts.get(run.id) ?? null, lifecycleMarks.get(run.id) ?? [])
   }, null, 2));
@@ -2928,8 +2944,12 @@ function unavailableReplayMetadata(reason) {
 }
 
 function withReplayMetadata(run) {
+  const classification = readClassification(run);
   return {
     ...run,
+    effective_status: classification.status,
+    effective_status_reason: classification.status_reason,
+    classifier_version: classification.classifier_version,
     replay: replayMetadataForRun(run)
   };
 }
@@ -3157,8 +3177,9 @@ async function recordReport(args) {
   if (kind === "success" && runId && !run) {
     throw new Error(`report --kind success requires an existing run. Run not found: ${runId}. Use --no-run "REASON" for externally verified success.`);
   }
-  if (kind === "success" && run && run.status !== "ok") {
-    throw new Error(`report --kind success requires a successful run. Linked run ${run.id} has status ${run.status}/${run.status_reason ?? "unknown"}.`);
+  if (kind === "success" && run && readClassification(run).status !== "ok") {
+    const classification = readClassification(run);
+    throw new Error(`report --kind success requires a successful run. Linked run ${run.id} has effective status ${classification.status}/${classification.status_reason ?? "unknown"}.`);
   }
   const createdAt = new Date();
   const id = `report-${createRunId(createdAt)}`;
@@ -3242,6 +3263,10 @@ async function addCheck(args) {
     changed_files: changedFiles,
     ...check
   };
+  event.vacuous = isVacuousCheckForRun({
+    ...run,
+    checks: [...(Array.isArray(run.checks) ? run.checks : []), event]
+  }, event);
 
   await appendLedger(cwd, event);
   console.log(JSON.stringify(event, null, 2));
@@ -3791,11 +3816,15 @@ function trimOutput(value) {
 }
 
 function summarizeRun(run) {
+  const classification = readClassification(run);
   return {
     id: run.id,
     purpose: run.purpose,
     status: run.status,
     status_reason: run.status_reason ?? null,
+    effective_status: classification.status,
+    effective_status_reason: classification.status_reason,
+    classifier_version: classification.classifier_version,
     source: run.source,
     confidence: run.confidence,
     task_kind: run.task_kind,
@@ -3821,7 +3850,8 @@ function summarizeRun(run) {
       exit_code: check.exit_code,
       duration_ms: check.duration_ms ?? null,
       repo: check.repo ?? null,
-      changed_files: Array.isArray(check.changed_files) ? check.changed_files : []
+      changed_files: Array.isArray(check.changed_files) ? check.changed_files : [],
+      vacuous: check.vacuous === true || isVacuousCheckForRun(run, check)
     })),
     cost_hint: run.cost_hint ?? null
   };
@@ -4027,6 +4057,69 @@ function reportsForRun(events, runId) {
   return (reportsByRunId(events).get(runId) ?? []).map(formatLinkedReport);
 }
 
+function readClassification(run) {
+  const storedStatus = run.status ?? "unknown";
+  const storedStatusReason = run.status_reason ?? null;
+  const changedFiles = Array.isArray(run.changed_files) ? run.changed_files : [];
+  const checks = Array.isArray(run.checks) ? run.checks : [];
+  const checksPassed = checks.length > 0 && checks.every((check) => check.exit_code === 0);
+  const checksFailed = checks.some((check) => check.exit_code !== 0);
+  const hasCheckMutations = checkChangedFiles(run).length > 0;
+  const hasScopeViolations = writeScopeViolations(run).length > 0;
+  if (hasScopeViolations) {
+    return {
+      classifier_version: CLASSIFIER_VERSION,
+      status: "failed",
+      status_reason: "write_scope_violation",
+      changed: storedStatus !== "failed" || storedStatusReason !== "write_scope_violation",
+      notes: [
+        "Write-scope violations outrank provider output classification at read time."
+      ]
+    };
+  }
+
+  if (storedStatus === "blocked" && storedStatusReason === "provider_needs_input" && checksFailed) {
+    return {
+      classifier_version: CLASSIFIER_VERSION,
+      status: "failed",
+      status_reason: "check_failed",
+      changed: true,
+      notes: [
+        "Failed checks outrank provider_needs_input at read time."
+      ]
+    };
+  }
+
+  const reclassifyCompleted = (
+    storedStatus === "blocked" &&
+    storedStatusReason === "provider_needs_input" &&
+    changedFiles.length > 0 &&
+    checksPassed &&
+    !hasCheckMutations &&
+    !hasScopeViolations
+  );
+
+  if (reclassifyCompleted) {
+    return {
+      classifier_version: CLASSIFIER_VERSION,
+      status: "ok",
+      status_reason: "completed",
+      changed: true,
+      notes: [
+        "Stored provider_needs_input was reclassified because the run changed files and all captured checks passed."
+      ]
+    };
+  }
+
+  return {
+    classifier_version: CLASSIFIER_VERSION,
+    status: storedStatus,
+    status_reason: storedStatusReason,
+    changed: false,
+    notes: []
+  };
+}
+
 function partitionRecommendationEvidence(runs, verdicts, marks) {
   const eligible = [];
   const ignored = [];
@@ -4050,14 +4143,16 @@ function recommendationBlocker(run, verdict, marks = []) {
 
 function recommendationBlockers(run, verdict, marks = []) {
   const blockers = [];
+  const classification = readClassification(run);
   if (run.parent_id) blockers.push("child_run");
   if (run.purpose === "provider_smoke") blockers.push("provider_smoke");
   if (!isRecommendationSourceRun(run)) blockers.push("not_live");
   if (run.confidence !== "high") blockers.push("not_high_confidence");
   if (run.runner === "fake") blockers.push("fake_runner");
-  if (run.status !== "ok") blockers.push("run_not_ok");
+  if (classification.status !== "ok") blockers.push("run_not_ok");
   if (hasLifecycleMark(marks, "reverted")) blockers.push("reverted_downstream");
   if (checkChangedFiles(run).length > 0) blockers.push("check_modified_files");
+  if (vacuousChecks(run).length > 0) blockers.push("vacuous_check");
   if (writeScopeViolations(run).length > 0) blockers.push("write_scope_violation");
   if (run.purpose !== "provider_smoke" && !verdict && (!Array.isArray(run.checks) || run.checks.length === 0)) blockers.push("unlabeled");
   return blockers;
@@ -4066,6 +4161,34 @@ function recommendationBlockers(run, verdict, marks = []) {
 function checkChangedFiles(run) {
   const checks = Array.isArray(run.checks) ? run.checks : [];
   return unique(checks.flatMap((check) => Array.isArray(check.changed_files) ? check.changed_files : []));
+}
+
+function vacuousChecks(run) {
+  const checks = Array.isArray(run.checks) ? run.checks : [];
+  return checks.filter((check) => check.vacuous === true || isVacuousCheckForRun(run, check));
+}
+
+function stampVacuousChecks(run) {
+  if (!Array.isArray(run.checks)) return run;
+  for (const check of run.checks) {
+    check.vacuous = isVacuousCheckForRun(run, check);
+  }
+  return run;
+}
+
+function isVacuousCheckForRun(run, check) {
+  if (!check || check.exit_code !== 0) return false;
+  const classification = readClassification(run);
+  if (classification.status !== "ok") return true;
+  const changedFiles = Array.isArray(run.changed_files) ? run.changed_files : [];
+  const taskKind = run.task_kind ?? classifyTask(run.task ?? "");
+  return changedFiles.length === 0 && isChangeLikeTaskKind(taskKind, run.task ?? "");
+}
+
+function isChangeLikeTaskKind(taskKind, task = "") {
+  if (["feature", "bugfix", "refactor", "test"].includes(taskKind)) return true;
+  if (["review", "docs", "general"].includes(taskKind)) return false;
+  return isChangeLikeTask(task);
 }
 
 function writeScopeViolations(run) {
@@ -4198,27 +4321,29 @@ function maturityRank(level) {
 
 function outcomeWeight(run, verdict, marks = []) {
   const sourceMultiplier = run.source === "manual" ? 0.5 : 1;
+  const classification = readClassification(run);
   let weight = 0;
   if (hasLifecycleMark(marks, "reverted")) return 0;
   if (hasLifecycleMark(marks, "accepted-downstream")) weight = 1;
   else if (verdict?.verdict === "accepted") weight = 1;
   else if (verdict?.verdict === "partial") weight = 0.5;
   else if (verdict?.verdict === "rejected") weight = 0;
-  else if (Array.isArray(run.checks) && run.checks.length > 0 && run.checks.every((check) => check.exit_code === 0) && run.status === "ok") {
+  else if (Array.isArray(run.checks) && run.checks.length > 0 && run.checks.every((check) => check.exit_code === 0) && classification.status === "ok") {
     weight = 0.75;
   }
   return weight * sourceMultiplier;
 }
 
 function summarizeOutcome(run, children, verdict, marks = []) {
-  const checks = Array.isArray(run.checks) ? run.checks : [];
+  const classification = readClassification(run);
+  const checks = decorateChecksForRun(run);
   const failedChecks = checks.filter((check) => check.exit_code !== 0);
   const childChecks = children.flatMap((child) => Array.isArray(child.checks) ? child.checks : []);
   const failedChildChecks = childChecks.filter((check) => check.exit_code !== 0);
   const childFailures = children.filter((child) => child.status !== "ok");
   const providerSmokeEvidence = isProviderSmokeEvidence(run);
   const changedFiles = Array.isArray(run.changed_files) ? run.changed_files : [];
-  const checkLabel = checks.length > 0 && (run.status === "ok" || failedChecks.length > 0)
+  const checkLabel = checks.length > 0 && (classification.status === "ok" || failedChecks.length > 0)
     ? failedChecks.length === 0 ? "checks_passed" : "checks_failed"
     : null;
 
@@ -4325,13 +4450,13 @@ function summarizeOutcome(run, children, verdict, marks = []) {
     };
   }
 
-  if (run.status === "blocked") {
+  if (classification.status === "blocked") {
     return {
       label: "blocked_for_input",
       confidence: "high",
       source: "run_status",
       score: 0,
-      reason: run.status_reason === "provider_needs_input"
+      reason: classification.status_reason === "provider_needs_input"
         ? "Provider asked for confirmation or more input before completing the task."
         : "Provider produced a plan/proposal instead of completing the task.",
       verdict: null,
@@ -4342,13 +4467,13 @@ function summarizeOutcome(run, children, verdict, marks = []) {
     };
   }
 
-  if (run.status !== "ok") {
+  if (classification.status !== "ok") {
     return {
       label: "run_failed",
       confidence: "high",
       source: "run_status",
       score: 0,
-      reason: `Run status is ${run.status}.`,
+      reason: `Effective run status is ${classification.status}.`,
       verdict: null,
       marks: marks.map(formatLifecycleMark),
       checks: outcomeCheckSummary(checks, failedChecks, childChecks, failedChildChecks),
@@ -4371,6 +4496,14 @@ function summarizeOutcome(run, children, verdict, marks = []) {
   };
 }
 
+function decorateChecksForRun(run) {
+  const checks = Array.isArray(run.checks) ? run.checks : [];
+  return checks.map((check) => ({
+    ...check,
+    vacuous: check.vacuous === true || isVacuousCheckForRun(run, check)
+  }));
+}
+
 function outcomeCheckSummary(checks, failedChecks, childChecks, failedChildChecks) {
   return {
     total: checks.length,
@@ -4379,13 +4512,15 @@ function outcomeCheckSummary(checks, failedChecks, childChecks, failedChildCheck
     child_failed: failedChildChecks.length,
     commands: checks.map((check) => ({
       command: check.command,
-      exit_code: check.exit_code
+      exit_code: check.exit_code,
+      vacuous: check.vacuous === true
     }))
   };
 }
 
 function outcomeRisks(run, children, verdict, marks = []) {
   const risks = [];
+  const classification = readClassification(run);
   if (!verdict && (!Array.isArray(run.checks) || run.checks.length === 0) && run.purpose !== "provider_smoke") {
     risks.push("missing_verdict_or_check");
   }
@@ -4395,13 +4530,14 @@ function outcomeRisks(run, children, verdict, marks = []) {
   if (run.source === "manual") risks.push("manual_capture");
   if (run.confidence !== "high") risks.push("not_high_confidence");
   if (run.runner === "fake") risks.push("fake_runner");
-  if (run.status === "blocked") risks.push("blocked_run");
-  if (run.status_reason === "provider_needs_input") risks.push("provider_needs_input");
-  if (run.status_reason === "provider_plan_only") risks.push("provider_plan_only");
-  if (run.status_reason === "provider_plan_changed_files") risks.push("provider_plan_changed_files");
-  if (run.status_reason === "write_scope_violation" || writeScopeViolations(run).length > 0) risks.push("write_scope_violation");
+  if (classification.status === "blocked") risks.push("blocked_run");
+  if (classification.status_reason === "provider_needs_input") risks.push("provider_needs_input");
+  if (classification.status_reason === "provider_plan_only") risks.push("provider_plan_only");
+  if (classification.status_reason === "provider_plan_changed_files") risks.push("provider_plan_changed_files");
+  if (classification.status_reason === "write_scope_violation" || writeScopeViolations(run).length > 0) risks.push("write_scope_violation");
   if (Array.isArray(run.contaminated_files) && run.contaminated_files.length > 0) risks.push("baseline_contaminated_files");
   if (checkChangedFiles(run).length > 0) risks.push("check_modified_files");
+  if (vacuousChecks(run).length > 0) risks.push("vacuous_check");
   if (Array.isArray(run.changed_files) && run.changed_files.length > 10) risks.push("large_change_surface");
   if (children.some((child) => child.status !== "ok")) risks.push("child_run_failed");
   return risks;
@@ -4452,11 +4588,13 @@ function evaluateRunRecord(run, children, verdicts, marksByRun = new Map(), repo
   const verdict = verdicts.get(run.id) ?? null;
   const marks = marksByRun.get(run.id) ?? [];
   const reports = reportsByRun.get(run.id) ?? [];
+  const classification = readClassification(run);
   const latestMark = latestLifecycleMark(marks);
   const blockers = recommendationBlockers(run, verdict, marks);
-  const checks = Array.isArray(run.checks) ? run.checks : [];
+  const checks = decorateChecksForRun(run);
   const failedChecks = checks.filter((check) => check.exit_code !== 0);
   const changedByChecks = checkChangedFiles(run);
+  const vacuous = vacuousChecks(run);
   const childChecks = children.flatMap((child) => Array.isArray(child.checks) ? child.checks : []);
   const childFailures = children.filter((child) => child.status !== "ok");
   const score = blockers.length === 0 ? outcomeWeight(run, verdict, marks) : 0;
@@ -4474,6 +4612,9 @@ function evaluateRunRecord(run, children, verdicts, marksByRun = new Map(), repo
     task_kind: run.task_kind ?? classifyTask(run.task ?? ""),
     status: run.status,
     status_reason: run.status_reason ?? null,
+    effective_status: classification.status,
+    effective_status_reason: classification.status_reason,
+    classifier_version: classification.classifier_version,
     latest_verdict: verdict ? {
       verdict: verdict.verdict,
       note: verdict.note,
@@ -4483,6 +4624,8 @@ function evaluateRunRecord(run, children, verdicts, marksByRun = new Map(), repo
     signals: {
       source: run.source ?? "live",
       confidence: run.confidence ?? "unknown",
+      classifier_changed: classification.changed,
+      classifier_notes: classification.notes,
       adapter_exit_code: run.adapter?.exit_code ?? null,
       adapter_timed_out: run.adapter?.timed_out ?? false,
       adapter_stdout_bytes: run.adapter?.stdout_bytes ?? null,
@@ -4496,6 +4639,7 @@ function evaluateRunRecord(run, children, verdicts, marksByRun = new Map(), repo
       checks_total: checks.length,
       checks_failed: failedChecks.length,
       check_changed_files: changedByChecks.length,
+      vacuous_checks: vacuous.length,
       changed_files: Array.isArray(run.changed_files) ? run.changed_files.length : 0,
       baseline_contaminated_files: Array.isArray(run.contaminated_files) ? run.contaminated_files.length : 0,
       write_scope_violations: writeScopeViolations(run).length,
@@ -4533,6 +4677,7 @@ function evaluateRunRecord(run, children, verdicts, marksByRun = new Map(), repo
 
 function scoreBasis(run, verdict, blockers, marks = []) {
   const prefix = run.source === "manual" ? "manual:" : "";
+  const classification = readClassification(run);
   if (blockers.length > 0) {
     return `blocked:${blockers.join(",")}`;
   }
@@ -4542,7 +4687,7 @@ function scoreBasis(run, verdict, blockers, marks = []) {
   if (verdict?.verdict) {
     return `${prefix}human_verdict:${verdict.verdict}`;
   }
-  if (Array.isArray(run.checks) && run.checks.length > 0 && run.checks.every((check) => check.exit_code === 0) && run.status === "ok") {
+  if (Array.isArray(run.checks) && run.checks.length > 0 && run.checks.every((check) => check.exit_code === 0) && classification.status === "ok") {
     return `${prefix}checks_passed`;
   }
   if (Array.isArray(run.checks) && run.checks.length > 0 && run.checks.some((check) => check.exit_code !== 0)) {
@@ -4565,7 +4710,7 @@ function buildProposalFindings(runs, verdicts, marks, release = null) {
   const liveProviderRuns = runs.filter((run) => run.source === "live" && run.runner !== "fake" && run.purpose !== "provider_smoke");
   const importedRuns = runs.filter((run) => run.source === "imported");
   const unlabeledRuns = liveProviderRuns.filter((run) => !verdicts.has(run.id) && (!Array.isArray(run.checks) || run.checks.length === 0));
-  const failedRuns = runs.filter((run) => run.status === "failed" || (Array.isArray(run.checks) && run.checks.some((check) => check.exit_code !== 0)) || hasLifecycleMark(marks.get(run.id) ?? [], "reverted"));
+  const failedRuns = runs.filter((run) => readClassification(run).status === "failed" || (Array.isArray(run.checks) && run.checks.some((check) => check.exit_code !== 0)) || hasLifecycleMark(marks.get(run.id) ?? [], "reverted"));
   const positiveProviderRuns = liveProviderRuns.filter((run) => outcomeWeight(run, verdicts.get(run.id), marks.get(run.id) ?? []) > 0);
   const releaseBlockers = release?.gates?.filter((gate) => !gate.ok) ?? [];
 
