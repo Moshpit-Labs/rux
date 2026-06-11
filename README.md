@@ -8,6 +8,32 @@ It helps a developer or team answer one practical question:
 
 It is not a model gateway. It does not proxy API calls, hide provider auth, or replace Claude Code, Codex, Gemini CLI, Cursor, Zed, VS Code, or other tools. It wraps the tools people already use, records what happened, and uses that evidence to recommend better runs over time.
 
+## Five-Minute Quickstart
+
+```sh
+npm install -g @moshpits/rux
+rux init
+rux status
+```
+
+Rux uses the Claude, Codex, and Gemini CLIs already installed and authenticated on your machine. It does not store provider credentials.
+
+Try one recorded loop:
+
+```sh
+rux run "review the navigation code" --runner gemini
+rux show <run-id>
+rux verdict <run-id> accepted --note "Useful review"
+```
+
+When the current Codex/Claude/Gemini session already did the work, record it without starting a nested provider run:
+
+```sh
+rux record "implemented the stats filters in the current Codex session" --runner codex --check "npm test" --verdict accepted
+```
+
+In an interactive terminal, Rux prints readable output. When stdout is piped or redirected, Rux keeps JSON for scripts. Use `--json` any time you want JSON explicitly.
+
 ## First Product
 
 The first useful version is intentionally small:
@@ -63,8 +89,6 @@ npm install -g @moshpits/rux
 rux --help
 ```
 
-Rux uses provider CLIs already installed and authenticated on your machine. It does not store provider credentials.
-
 Basic flow:
 
 ```sh
@@ -77,7 +101,7 @@ rux record "implemented the stats filters in the current Codex session" --runner
 rux report "Gemini surfaced a question but the terminal flow was unclear" --kind ux --command "rux run ..." --note "The question appeared in the transcript but was easy to miss."
 ```
 
-`rux run` keeps stdout as JSON for scripts. Provider output and Rux progress are mirrored to stderr while the provider runs, so questions, start/finish state, checks, and quiet long-running work are visible in the terminal. The default provider mode is `plan`; use `--provider-mode write` when you want the wrapped provider to edit files. Real provider runs refuse dirty worktrees by default; commit, stash, or revert existing changes first, or pass `--allow-dirty` only when those changes are intentionally part of the provider context. Use `--write-scope` to declare the files or directories a provider is allowed to change; Rux records out-of-scope edits as failed runs. If a provider asks for input, Rux records the run as `blocked`. If a provider changes files while Rux asked for plan mode, Rux records the run as `failed`.
+Provider output and Rux progress are mirrored to stderr while the provider runs, so questions, start/finish state, checks, and quiet long-running work are visible in the terminal without corrupting script output. The default provider mode is `plan`; use `--provider-mode write` when you want the wrapped provider to edit files. Real provider runs refuse dirty worktrees by default; commit, stash, or revert existing changes first, or pass `--allow-dirty` only when those changes are intentionally part of the provider context. Use `--write-scope` to declare the files or directories a provider is allowed to change; Rux records out-of-scope edits as failed runs. If a provider asks for input, Rux records the run as `blocked`. If a provider changes files while Rux asked for plan mode, Rux records the run as `failed`.
 
 Use `rux record` when the current agent session already did the work and you do not want to spawn a nested Claude/Codex/Gemini process just to satisfy the ledger. Manual records can help local recommendations when they have checks or verdicts, but they are down-weighted, labeled as manual evidence, and do not replace real provider-smoke or adapter-run evidence in the release gate. `--write-scope` applies to manual records too.
 

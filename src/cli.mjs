@@ -5,6 +5,7 @@ import { existsSync, lstatSync, readFileSync, readdirSync, readlinkSync } from "
 import { basename, join, relative, resolve } from "node:path";
 import { spawn, spawnSync } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
+import { createInterface } from "node:readline/promises";
 import { CLI_NAME, NPM_ORG, PRODUCT_NAME, STORE_DIR } from "./identity.mjs";
 
 const LEDGER_DIR = "ledger";
@@ -16,6 +17,7 @@ const SCHEMA_VERSION = 2;
 const CLASSIFIER_VERSION = "read-classifier-2026-06-11";
 const rosterDefinitions = new Set(["solo", "pair", "repair", "plan-code-review"]);
 const lifecycleMarkDefinitions = new Set(["reverted", "replayed", "accepted-downstream"]);
+const verdictDefinitions = new Set(["accepted", "rejected", "partial", "unknown"]);
 const reportKindDefinitions = new Set(["bug", "ux", "adapter", "docs", "routing", "orchestration", "install", "idea", "success", "other"]);
 const knownOptionNames = new Set([
   "allow-dirty",
@@ -30,6 +32,7 @@ const knownOptionNames = new Set([
   "implementer-runner",
   "include-probes",
   "include-transcripts",
+  "json",
   "kind",
   "limit",
   "mode",
@@ -53,6 +56,7 @@ const knownOptionNames = new Set([
   "task",
   "task-kind",
   "timeout-ms",
+  "verdict",
   "write-scope"
 ]);
 const booleanOptionNames = new Set([
@@ -60,6 +64,7 @@ const booleanOptionNames = new Set([
   "force",
   "include-transcripts",
   "include-probes",
+  "json",
   "record",
   "start",
   "strict"
@@ -99,7 +104,7 @@ async function main() {
 
   switch (command) {
     case "runners":
-      return printRunners();
+      return printRunners(args);
     case "init":
       return initRepo(args);
     case "run":
@@ -164,16 +169,16 @@ function printHelp() {
 Usage:
   ${CLI_NAME} runners
   ${CLI_NAME} init [--cwd PATH] [--force]
-  ${CLI_NAME} run "<task>" [--runner fake|claude|codex|gemini] [--roster solo|pair|repair|plan-code-review] [--purpose task|probe] [--task-kind KIND] [--provider-mode plan|write] [--model NAME] [--effort LEVEL] [--cost-hint USD] [--cwd PATH] [--check "COMMAND"] [--timeout-ms N] [--write-scope PATH[,PATH...]] [--allow-dirty]
-  ${CLI_NAME} record --start "<task>" --runner claude|codex|gemini [--task-kind KIND] [--cwd PATH] [--note "TEXT"] [--model NAME] [--effort LEVEL] [--cost-hint USD]
-  ${CLI_NAME} record "<task>" --runner claude|codex|gemini [--task-kind KIND] [--cwd PATH] [--check "COMMAND"] [--note "TEXT"] [--model NAME] [--effort LEVEL] [--cost-hint USD] [--write-scope PATH[,PATH...]]
+  ${CLI_NAME} run "<task>" [--runner fake|claude|codex|gemini] [--roster solo|pair|repair|plan-code-review] [--purpose task|probe] [--task-kind KIND] [--provider-mode plan|write] [--model NAME] [--effort LEVEL] [--cost-hint USD] [--cwd PATH] [--check "COMMAND"] [--timeout-ms N] [--write-scope PATH[,PATH...]] [--allow-dirty] [--json]
+  ${CLI_NAME} record --start "<task>" --runner claude|codex|gemini [--task-kind KIND] [--cwd PATH] [--note "TEXT"] [--model NAME] [--effort LEVEL] [--cost-hint USD] [--json]
+  ${CLI_NAME} record "<task>" --runner claude|codex|gemini [--task-kind KIND] [--cwd PATH] [--check "COMMAND"] [--verdict accepted|rejected|partial|unknown] [--note "TEXT"] [--model NAME] [--effort LEVEL] [--cost-hint USD] [--write-scope PATH[,PATH...]] [--json]
   ${CLI_NAME} provider-smoke --runner claude|codex|gemini [--model NAME] [--effort LEVEL] [--cwd PATH] [--timeout-ms N] [--allow-dirty]
   ${CLI_NAME} import --from PATH [--runner claude|codex|gemini|unknown] [--task "TEXT"] [--model NAME] [--effort LEVEL] [--cost-hint USD] [--cwd PATH]
   ${CLI_NAME} plan "<task>" [--runner fake|claude|codex|gemini] [--roster solo|pair|repair|plan-code-review] [--model NAME] [--effort LEVEL] [--cost-hint USD] [--cwd PATH] [--check "COMMAND"]
-  ${CLI_NAME} suggest "<task>" [--include-probes] [--cwd PATH]
-  ${CLI_NAME} rank [--task-kind KIND] [--include-probes] [--cwd PATH]
-  ${CLI_NAME} status [--cwd PATH]
-  ${CLI_NAME} export [--cwd PATH] [--limit N] [--run-id ID] [--include-transcripts]
+  ${CLI_NAME} suggest "<task>" [--include-probes] [--cwd PATH] [--json]
+  ${CLI_NAME} rank [--task-kind KIND] [--include-probes] [--cwd PATH] [--json]
+  ${CLI_NAME} status [--cwd PATH] [--json]
+  ${CLI_NAME} export [--cwd PATH] [--limit N] [--run-id ID] [--include-transcripts] [--json]
   ${CLI_NAME} policy [--cwd PATH]
   ${CLI_NAME} doctor [--cwd PATH]
   ${CLI_NAME} release-check [--cwd PATH] [--strict]
@@ -184,7 +189,7 @@ Usage:
   ${CLI_NAME} show <run-id> [--cwd PATH]
   ${CLI_NAME} eval <run-id> [--cwd PATH]
   ${CLI_NAME} outcome <run-id> [--cwd PATH]
-  ${CLI_NAME} check <run-id> --command "COMMAND" [--note "TEXT"] [--cwd PATH]
+  ${CLI_NAME} check <run-id> --command "COMMAND" [--verdict accepted|rejected|partial|unknown] [--note "TEXT"] [--cwd PATH] [--json]
   ${CLI_NAME} verdict <run-id> accepted|rejected|partial|unknown [--note "TEXT"] [--cwd PATH]
   ${CLI_NAME} mark <run-id> reverted|replayed|accepted-downstream [--note "TEXT"] [--cwd PATH]
 `);
@@ -193,6 +198,209 @@ Usage:
 async function printVersion() {
   const packageJson = await readJsonIfExists(new URL("../package.json", import.meta.url));
   console.log(`${CLI_NAME} ${packageJson?.version ?? "unknown"}`);
+}
+
+function emitResult(options, payload, humanFormatter = formatHumanResult) {
+  if (shouldEmitJson(options)) {
+    console.log(JSON.stringify(payload, null, 2));
+    return;
+  }
+  console.log(humanFormatter(payload));
+}
+
+function shouldEmitJson(options) {
+  return options.json === true || !stdoutIsHumanTty();
+}
+
+function stdoutIsHumanTty() {
+  if (process.env.RUX_FORCE_TTY === "1") return true;
+  return process.stdout.isTTY === true;
+}
+
+function formatHumanResult(payload) {
+  if (Array.isArray(payload)) {
+    return [
+      `${PRODUCT_NAME} result`,
+      ...payload.slice(0, 12).map((item) => `- ${formatHumanSummaryLine(item)}`)
+    ].join("\n");
+  }
+
+  const lines = [`${PRODUCT_NAME} result`];
+  if (payload?.id) lines.push(`ID: ${payload.id}`);
+  if (payload?.run_id) lines.push(`Run: ${payload.run_id}`);
+  if (payload?.type) lines.push(`Type: ${payload.type}`);
+  if (payload?.runner) lines.push(`Runner: ${payload.runner}`);
+  if (payload?.roster) lines.push(`Roster: ${payload.roster}`);
+  if (payload?.status) lines.push(`Status: ${payload.status}${payload.status_reason ? ` (${payload.status_reason})` : ""}`);
+  if (payload?.effective_status && payload.effective_status !== payload.status) {
+    lines.push(`Effective: ${payload.effective_status}${payload.effective_status_reason ? ` (${payload.effective_status_reason})` : ""}`);
+  }
+  if (payload?.verdict) lines.push(`Verdict: ${payload.verdict}`);
+  if (payload?.verdict_recorded?.verdict) lines.push(`Verdict recorded: ${payload.verdict_recorded.verdict}`);
+  if (payload?.task) lines.push(`Task: ${formatListTask(payload.task)}`);
+  if (Array.isArray(payload?.changed_files)) lines.push(`Changed files: ${payload.changed_files.length}`);
+  if (Array.isArray(payload?.checks)) lines.push(`Checks: ${payload.checks.length}`);
+  if (Array.isArray(payload?.mark_nudges) && payload.mark_nudges.length > 0) {
+    lines.push("Mark nudges:");
+    lines.push(...payload.mark_nudges.slice(0, 3).map((nudge) => `- ${nudge.action}`));
+  }
+  if (payload?.replay?.command) lines.push(`Replay: ${payload.replay.command}`);
+  return lines.join("\n");
+}
+
+function formatHumanSummaryLine(item) {
+  if (item && typeof item === "object") {
+    return [item.name, item.id, item.runner, item.status, item.task].filter(Boolean).join(" ");
+  }
+  return String(item);
+}
+
+function formatStatusHuman(status) {
+  const lines = [
+    `${PRODUCT_NAME} status`,
+    `Repo: ${status.cwd}`,
+    `Runs: ${status.ledger.runs} (${status.ledger.top_level_runs} top-level)`,
+    `Evidence: ${status.evidence.eligible_runs} eligible, maturity ${status.evidence.maturity.strongest_level}`,
+    `Release: ${status.release.ready ? "ready" : `blocked (${status.release.blockers.join(", ")})`}`
+  ];
+
+  const statements = topEvidenceStatements(status).slice(0, 3);
+  if (statements.length > 0) {
+    lines.push("", "Evidence");
+    lines.push(...statements.map((statement) => `- ${statement}`));
+  }
+
+  if (Array.isArray(status.mark_nudges) && status.mark_nudges.length > 0) {
+    lines.push("", "Mark Nudges");
+    lines.push(...status.mark_nudges.slice(0, 3).map((nudge) => `- ${nudge.action}`));
+  }
+
+  if (Array.isArray(status.next_actions) && status.next_actions.length > 0) {
+    lines.push("", "Next");
+    lines.push(...status.next_actions.slice(0, 5).map((action) => `- ${action}`));
+  }
+
+  return lines.join("\n");
+}
+
+function topEvidenceStatements(status) {
+  const rankings = status?.evidence?.rankings ?? [];
+  return rankings.flatMap((ranking) => {
+    const top = ranking.top?.[0];
+    if (!top) return [];
+    const runs = top.evidence_runs ?? [];
+    return `${ranking.task_kind}: ${top.runner}/${top.roster} ${top.model ?? "default-model"} ${top.effort ?? "default-effort"} score=${top.score} from ${top.total} run(s): ${runs.join(", ")}`;
+  });
+}
+
+function formatReleaseHuman(result) {
+  return [
+    `${PRODUCT_NAME} release-check`,
+    `Ready: ${result.ready ? "yes" : "no"}`,
+    `Package: ${result.package?.name ?? "unknown"} ${result.package?.version ?? ""}`.trim(),
+    result.blocker_summary.total === 0
+      ? "Blockers: none"
+      : `Blockers: ${result.gates.filter((gate) => !gate.ok).map((gate) => gate.name).join(", ")}`
+  ].join("\n");
+}
+
+function normalizeVerdictOption(value) {
+  if (value === undefined) return null;
+  if (value === true) {
+    throw new Error("--verdict requires accepted, rejected, partial, or unknown.");
+  }
+  const verdict = String(value).trim();
+  if (!verdictDefinitions.has(verdict)) {
+    throw new Error("--verdict must be one of accepted, rejected, partial, or unknown.");
+  }
+  return verdict;
+}
+
+function formatVerdictEvent(event) {
+  return {
+    verdict: event.verdict,
+    note: event.note ?? "",
+    created_at: event.created_at
+  };
+}
+
+async function createVerdictEvent({ cwd, runId, verdict, note = "" }) {
+  const normalized = normalizeVerdictOption(verdict);
+  if (!normalized) {
+    throw new Error("--verdict requires accepted, rejected, partial, or unknown.");
+  }
+
+  const events = await readLedger(cwd);
+  const run = events.find((event) => event.type === "run" && event.id === runId);
+  if (!run) {
+    throw new Error(`Run not found: ${runId}`);
+  }
+  if (run.purpose === "provider_smoke") {
+    throw new Error("Provider-smoke runs prove adapter readiness only; do not attach human verdicts to them.");
+  }
+
+  const event = {
+    schema_version: SCHEMA_VERSION,
+    type: "verdict",
+    id: randomUUID(),
+    run_id: runId,
+    verdict: normalized,
+    note,
+    created_at: new Date().toISOString()
+  };
+  await appendLedger(cwd, event);
+  return event;
+}
+
+async function maybeAttachRunVerdict({ cwd, run, options }) {
+  const explicitVerdict = normalizeVerdictOption(options.verdict);
+  if (explicitVerdict) {
+    return createVerdictEvent({
+      cwd,
+      runId: run.id,
+      verdict: explicitVerdict,
+      note: options.note ? String(options.note) : ""
+    });
+  }
+
+  if (!shouldPromptForVerdict(options, run)) return null;
+  const prompted = await promptForVerdict(run);
+  if (!prompted) return null;
+  return createVerdictEvent({
+    cwd,
+    runId: run.id,
+    verdict: prompted.verdict,
+    note: prompted.note
+  });
+}
+
+function shouldPromptForVerdict(options, run) {
+  return (
+    run?.purpose !== "provider_smoke" &&
+    !shouldEmitJson(options) &&
+    process.stdin.isTTY === true &&
+    stdoutIsHumanTty()
+  );
+}
+
+async function promptForVerdict(run) {
+  const rl = createInterface({
+    input: process.stdin,
+    output: process.stderr,
+    terminal: true
+  });
+  try {
+    const answer = (await rl.question(`Verdict for ${run.id} [accepted/rejected/partial/unknown/skip]: `)).trim().toLowerCase();
+    if (!answer || answer === "skip") return null;
+    if (!verdictDefinitions.has(answer)) {
+      writeRuxProgress("verdict skipped: expected accepted, rejected, partial, unknown, or skip.");
+      return null;
+    }
+    const note = (await rl.question("Verdict note (optional): ")).trim();
+    return { verdict: answer, note };
+  } finally {
+    rl.close();
+  }
 }
 
 function parseOptions(args) {
@@ -429,7 +637,7 @@ async function initRepo(args) {
     actions.push(".gitignore already ignores store");
   }
 
-  console.log(JSON.stringify({
+  emitResult(options, {
     product: PRODUCT_NAME,
     cwd,
     policy: {
@@ -448,7 +656,7 @@ async function initRepo(args) {
       "init does not call providers.",
       `${STORE_DIR}/ stores local run transcripts and ledger files and should stay out of git.`
     ]
-  }, null, 2));
+  });
 }
 
 function normalizeRunner(runner) {
@@ -531,7 +739,8 @@ function ensureRunnersAvailable(runners) {
   }
 }
 
-async function printRunners() {
+async function printRunners(args) {
+  const { options } = parseOptions(args);
   const rows = Object.entries(runnerDefinitions).map(([name, definition]) => {
     const available = definition.available === true || commandExists(definition.command);
     return {
@@ -542,7 +751,7 @@ async function printRunners() {
     };
   });
 
-  console.log(JSON.stringify(rows, null, 2));
+  emitResult(options, rows);
 }
 
 async function doctor(args) {
@@ -563,7 +772,7 @@ async function doctor(args) {
     notes: definition.notes
   }));
 
-  console.log(JSON.stringify({
+  emitResult(options, {
     product: PRODUCT_NAME,
     cli: CLI_NAME,
     schema_version: SCHEMA_VERSION,
@@ -589,14 +798,14 @@ async function doctor(args) {
       "doctor is read-only and does not call provider services.",
       "Provider availability only means the CLI binary is on PATH; auth and live behavior still require provider-smoke."
     ]
-  }, null, 2));
+  });
 }
 
 async function releaseCheck(args) {
   const { options } = parseOptions(args);
   const cwd = resolveCwd(options);
   const result = await buildReleaseCheck(cwd);
-  console.log(JSON.stringify(result, null, 2));
+  emitResult(options, result, formatReleaseHuman);
   if (options.strict === true && !result.ready) {
     process.exitCode = 1;
   }
@@ -613,6 +822,7 @@ async function buildReleaseCheck(cwd) {
   const eligibility = partitionRecommendationEvidence(topRuns, verdicts, marks);
   const git = gitDoctor(cwd);
   const packageFilesScoped = packageFilesAreReleaseScoped(packageJson);
+  const providerSmoke = ["claude", "codex", "gemini"].map((runner) => providerSmokeStatus(topRuns, runner));
   const gates = [
     releaseGate("package_json", Boolean(packageJson), "package.json exists.", { lifecycle: "permanent", category: "package" }),
     releaseGate("package_scope_matches_npm_org", packageNameUsesNpmOrg(packageJson), `package name uses the @${NPM_ORG}/ npm org scope.`, { lifecycle: "permanent", category: "package" }),
@@ -629,9 +839,9 @@ async function buildReleaseCheck(cwd) {
     releaseGate("check_script", Boolean(packageJson?.scripts?.check), "Syntax/check script exists.", { lifecycle: "permanent", category: "verification" }),
     releaseGate("prepublish_release_guard", packageScriptsHaveReleaseGuard(packageJson), "npm prepublishOnly runs release verification with strict release-check.", { lifecycle: "permanent", category: "verification" }),
     releaseGate("worktree_clean", git.available && git.inside_work_tree && git.dirty_entries === 0, "Git worktree has no uncommitted changes outside .rux/.", { lifecycle: "permanent", category: "repo_hygiene" }),
-    releaseGate("claude_smoke_evidence", hasProviderSmoke(topRuns, "claude"), "Ledger contains a successful Claude provider-smoke run with no file changes.", { lifecycle: "release", category: "provider_evidence" }),
-    releaseGate("codex_smoke_evidence", hasProviderSmoke(topRuns, "codex"), "Ledger contains a successful Codex provider-smoke run with no file changes.", { lifecycle: "release", category: "provider_evidence" }),
-    releaseGate("gemini_smoke_evidence", hasProviderSmoke(topRuns, "gemini"), "Ledger contains a successful Gemini provider-smoke run with no file changes.", { lifecycle: "release", category: "provider_evidence" }),
+    releaseGate("claude_smoke_evidence", providerSmoke.find((item) => item.runner === "claude")?.ok === true, "Ledger contains a successful Claude provider-smoke run with no file changes.", { lifecycle: "release", category: "provider_evidence" }),
+    releaseGate("codex_smoke_evidence", providerSmoke.find((item) => item.runner === "codex")?.ok === true, "Ledger contains a successful Codex provider-smoke run with no file changes.", { lifecycle: "release", category: "provider_evidence" }),
+    releaseGate("gemini_smoke_evidence", providerSmoke.find((item) => item.runner === "gemini")?.ok === true, "Ledger contains a successful Gemini provider-smoke run with no file changes.", { lifecycle: "release", category: "provider_evidence" }),
     releaseGate("real_provider_task_evidence", eligibility.eligible.some(isLiveProviderTaskRun), "Ledger contains at least one routing-eligible live provider task with a check or human verdict.", { lifecycle: "one_time", category: "provider_evidence" }),
     releaseGate("no_local_only_language", !(await hasLocalOnlyLanguage(cwd)), "Docs do not describe the product as local-only.", { lifecycle: "one_time", category: "docs" })
   ];
@@ -649,6 +859,7 @@ async function buildReleaseCheck(cwd) {
       license: packageJson.license
     } : null,
     identity,
+    provider_smoke: providerSmoke,
     gates,
     blocker_summary: summarizeReleaseBlockers(blockers),
     next_actions: blockers.map((gate) => gate.action)
@@ -735,6 +946,7 @@ async function status(args) {
   const liveProviderTaskRuns = topRuns.filter(isLiveProviderTaskRun);
   const manualTaskRuns = topRuns.filter(isManualTaskRun);
   const providerSmokeRuns = topRuns.filter((run) => run.purpose === "provider_smoke");
+  const markNudges = markNudgesForStatus(topRuns, marks);
   const outcomes = topRuns.map((run) => summarizeOutcome(
     run,
     runs.filter((candidate) => candidate.parent_id === run.id),
@@ -759,7 +971,7 @@ async function status(args) {
     packageJson
   });
 
-  console.log(JSON.stringify({
+  emitResult(options, {
     product: PRODUCT_NAME,
     cli: CLI_NAME,
     identity: release.identity,
@@ -807,10 +1019,7 @@ async function status(args) {
       maturity: summarizeEvidenceMaturity(eligibility.eligible, verdicts, marks),
       rankings
     },
-    provider_smoke: ["claude", "codex", "gemini"].map((runner) => ({
-      runner,
-      ok: hasProviderSmoke(topRuns, runner)
-    })),
+    provider_smoke: ["claude", "codex", "gemini"].map((runner) => providerSmokeStatus(topRuns, runner)),
     runners: Object.entries(runnerDefinitions).map(([name, definition]) => ({
       name,
       available: definition.available === true || commandExists(definition.command),
@@ -848,20 +1057,21 @@ async function status(args) {
         task: run.task
       };
     }),
+    mark_nudges: markNudges,
     next_capture: nextCapture,
     next_actions: nextActions,
     notes: [
       "status is read-only and does not call providers.",
       "Provider-smoke evidence proves adapter readiness, not task quality."
     ]
-  }, null, 2));
+  }, formatStatusHuman);
 }
 
 async function showPolicy(args) {
   const { options } = parseOptions(args);
   const cwd = resolveCwd(options);
   const policy = await loadPolicy(cwd);
-  console.log(JSON.stringify({
+  emitResult(options, {
     product: PRODUCT_NAME,
     cwd,
     path: relative(cwd, policy.path),
@@ -872,7 +1082,7 @@ async function showPolicy(args) {
       "policy is read-only and does not call providers.",
       "A committed policy file lets teams review local runner safety defaults before a hosted layer exists."
     ]
-  }, null, 2));
+  });
 }
 
 async function exportRuns(args) {
@@ -908,7 +1118,7 @@ async function exportRuns(args) {
     }));
   }
 
-  console.log(JSON.stringify({
+  emitResult(options, {
     product: PRODUCT_NAME,
     cli: CLI_NAME,
     schema_version: SCHEMA_VERSION,
@@ -930,7 +1140,7 @@ async function exportRuns(args) {
         ? "Transcript text is included because --include-transcripts was provided. Review before sharing."
         : "Transcript text is omitted by default. Use --include-transcripts only after reviewing sensitivity."
     ]
-  }, null, 2));
+  });
 }
 
 async function exportRunRecord({ cwd, run, children, verdicts, marks, reports, includeTranscripts }) {
@@ -1024,13 +1234,15 @@ async function runCommand(args) {
   const purpose = normalizeRunPurpose(options.purpose);
   const runnerByRole = resolveRosterRunners(roster, runner, options);
   const metadata = metadataFromOptions(options);
+  normalizeVerdictOption(options.verdict);
   ensureRunnersAvailable(Object.values(runnerByRole));
 
   await ensureStore(cwd);
 
   if (roster !== "solo") {
     const run = await executeRoster({ roster, task, cwd, options, runnerByRole, metadata, purpose });
-    console.log(JSON.stringify(summarizeRun(run), null, 2));
+    const verdict = await maybeAttachRunVerdict({ cwd, run, options });
+    emitResult(options, await summarizeRecordedRun({ cwd, run, verdict }));
     return;
   }
 
@@ -1057,7 +1269,8 @@ async function runCommand(args) {
     })
   });
 
-  console.log(JSON.stringify(summarizeRun(run), null, 2));
+  const verdict = await maybeAttachRunVerdict({ cwd, run, options });
+  emitResult(options, await summarizeRecordedRun({ cwd, run, verdict }));
 }
 
 async function providerSmoke(args) {
@@ -1073,6 +1286,16 @@ async function providerSmoke(args) {
   }
   ensureRunnersAvailable([runner]);
   await ensureStore(cwd);
+  const previousAttempts = providerSmokeAttempts(topLevelRuns(runsWithAppendedChecks(await readLedger(cwd))), runner);
+  const oldestAttempt = previousAttempts.at(-1) ?? null;
+  const latestAttempt = previousAttempts[0] ?? null;
+  const attempt = {
+    kind: "provider_smoke",
+    group_id: `provider-smoke:${runner}`,
+    number: previousAttempts.length + 1,
+    previous_run_id: latestAttempt?.id ?? null,
+    root_run_id: oldestAttempt?.id ?? null
+  };
 
   const run = await captureRunAttempt({
     runner,
@@ -1082,6 +1305,7 @@ async function providerSmoke(args) {
     options,
     checkCommand: null,
     purpose: "provider_smoke",
+    attempt,
     metadata,
     failOnChangedFiles: true,
     replay: recordedReplayMetadata(buildProviderSmokeCommand({
@@ -1100,18 +1324,20 @@ async function providerSmoke(args) {
     ]
   });
 
-  console.log(JSON.stringify(summarizeRun(run), null, 2));
+  emitResult(options, summarizeRun(run));
 }
 
 async function recordManualRun(args) {
   const { positionals, options } = parseOptions(args);
   const task = positionals.join(" ").trim();
+  normalizeVerdictOption(options.verdict);
   if (options.start === true) {
     return recordSessionBaseline({ task, options });
   }
 
   const run = await createManualRun({ task, options });
-  console.log(JSON.stringify(summarizeRun(run), null, 2));
+  const verdict = await maybeAttachRunVerdict({ cwd: run.cwd, run, options });
+  emitResult(options, await summarizeRecordedRun({ cwd: run.cwd, run, verdict }));
 }
 
 async function createManualRun({ task, options, extraNotes = [] }) {
@@ -1266,8 +1492,8 @@ async function recordSessionBaseline({ task, options }) {
     throw new Error(`Usage: ${CLI_NAME} record --start "<task>" --runner claude|codex|gemini [--cwd PATH] [--note "TEXT"]`);
   }
 
-  if (options.check !== undefined || options["write-scope"] !== undefined) {
-    throw new Error("record --start captures a baseline only; run checks and write-scope validation on the later record.");
+  if (options.check !== undefined || options["write-scope"] !== undefined || options.verdict !== undefined) {
+    throw new Error("record --start captures a baseline only; run checks, verdicts, and write-scope validation on the later record.");
   }
 
   const cwd = resolveCwd(options);
@@ -1315,7 +1541,7 @@ async function recordSessionBaseline({ task, options }) {
 
   await appendLedger(cwd, event);
   writeRuxProgress(`recorded manual baseline ${event.id} dirty_files=${dirtyFiles.length}`);
-  console.log(JSON.stringify(summarizeSessionBaseline(event), null, 2));
+  emitResult(options, summarizeSessionBaseline(event));
 }
 
 async function captureRunAttempt({
@@ -1332,6 +1558,7 @@ async function captureRunAttempt({
   skipDirtyGuard = false,
   notes = [],
   metadata = {},
+  attempt = null,
   replay = null
 }) {
   const startedAt = new Date();
@@ -1408,6 +1635,7 @@ async function captureRunAttempt({
     runNotes.push(outputSignal.note);
   }
   const id = createRunId(startedAt);
+  const runAttempt = attempt ? { ...attempt, root_run_id: attempt.root_run_id ?? id } : null;
   const transcriptPath = await writeTranscript(cwd, id, transcript.text);
 
   const run = {
@@ -1449,6 +1677,7 @@ async function captureRunAttempt({
     cost_hint: runMetadata.cost_hint ?? null,
     output_signal: outputSignal,
     adapter: buildAdapterRecord(transcript.adapter, metadata, observedMetadata),
+    attempt: runAttempt,
     replay,
     notes: runNotes
   };
@@ -2384,20 +2613,38 @@ async function listRuns(args) {
   const verdictByRun = new Map(verdicts.map((event) => [event.run_id, event.verdict]));
   const marks = lifecycleMarksByRun(events);
 
-  for (const run of runs) {
+  const rows = runs.map((run) => {
     const verdict = verdictByRun.get(run.id) ?? "-";
     const mark = latestLifecycleMark(marks.get(run.id) ?? [])?.mark ?? "-";
     const source = `${run.source ?? "live"}:${run.confidence ?? "unknown"}`;
     const classification = readClassification(run);
     const statusText = classification.changed ? `${run.status}->${classification.status}` : run.status;
-    console.log(`${run.id}  ${statusText.padEnd(12)}  ${run.runner.padEnd(7)}  ${source.padEnd(13)}  verdict=${verdict}  mark=${mark}  ${formatListTask(run.task)}`);
+    return {
+      id: run.id,
+      status: statusText,
+      runner: run.runner,
+      source,
+      verdict,
+      mark,
+      task: formatListTask(run.task)
+    };
+  });
+
+  if (options.json === true) {
+    emitResult(options, rows, formatListRunsHuman);
+    return;
   }
+  console.log(formatListRunsHuman(rows));
 }
 
 function formatListTask(task) {
   const singleLine = String(task ?? "").replace(/\s+/g, " ").trim();
   if (singleLine.length <= 96) return singleLine;
   return `${singleLine.slice(0, 93)}...`;
+}
+
+function formatListRunsHuman(rows) {
+  return rows.map((run) => `${run.id}  ${run.status.padEnd(12)}  ${run.runner.padEnd(7)}  ${run.source.padEnd(13)}  verdict=${run.verdict}  mark=${run.mark}  ${run.task}`).join("\n");
 }
 
 async function importRun(args) {
@@ -2484,7 +2731,7 @@ async function importRun(args) {
   };
 
   await appendLedger(cwd, run);
-  console.log(JSON.stringify(summarizeRun(run), null, 2));
+  emitResult(options, summarizeRun(run));
 }
 
 async function showRun(args) {
@@ -2509,14 +2756,14 @@ async function showRun(args) {
   const latestVerdicts = latestVerdictByRun(events);
   const lifecycleMarks = lifecycleMarksByRun(events);
   const reportsByRun = reportsByRunId(events);
-  console.log(JSON.stringify({
+  emitResult(options, {
     run: withReplayMetadata(run),
     children: children.map(withReplayMetadata),
     verdicts,
     marks,
     reports,
     evaluation: evaluateRunRecord(run, children, latestVerdicts, lifecycleMarks, reportsByRun)
-  }, null, 2));
+  });
 }
 
 async function planRun(args) {
@@ -2560,7 +2807,7 @@ async function planRun(args) {
   });
   const repo = gitDoctor(cwd);
 
-  console.log(JSON.stringify({
+  emitResult(options, {
     product: PRODUCT_NAME,
     dry_run: true,
     would_execute: false,
@@ -2603,7 +2850,7 @@ async function planRun(args) {
       "plan is dry-run only; it does not call providers and does not write the ledger.",
       "Generated rosters are sequential. Parallel provider fanout is not enabled in v0."
     ]
-  }, null, 2));
+  });
 }
 
 async function evaluateRunCommand(args) {
@@ -2625,7 +2872,7 @@ async function evaluateRunCommand(args) {
   const latestVerdicts = latestVerdictByRun(events);
   const lifecycleMarks = lifecycleMarksByRun(events);
   const reportsByRun = reportsByRunId(events);
-  console.log(JSON.stringify(evaluateRunRecord(run, children, latestVerdicts, lifecycleMarks, reportsByRun), null, 2));
+  emitResult(options, evaluateRunRecord(run, children, latestVerdicts, lifecycleMarks, reportsByRun));
 }
 
 async function outcomeRun(args) {
@@ -2647,7 +2894,7 @@ async function outcomeRun(args) {
   const latestVerdicts = latestVerdictByRun(events);
   const lifecycleMarks = lifecycleMarksByRun(events);
   const classification = readClassification(run);
-  console.log(JSON.stringify({
+  emitResult(options, {
     run_id: run.id,
     task_kind: run.task_kind ?? classifyTask(run.task ?? ""),
     runner: run.runner,
@@ -2665,7 +2912,7 @@ async function outcomeRun(args) {
     classifier_version: classification.classifier_version,
     marks: (lifecycleMarks.get(run.id) ?? []).map(formatLifecycleMark),
     outcome: summarizeOutcome(run, children, latestVerdicts.get(run.id) ?? null, lifecycleMarks.get(run.id) ?? [])
-  }, null, 2));
+  });
 }
 
 async function suggestRun(args) {
@@ -2677,9 +2924,9 @@ async function suggestRun(args) {
 
   const cwd = resolveCwd(options);
   const events = await readLedger(cwd);
-  console.log(JSON.stringify(buildRecommendation(task, events, {
+  emitResult(options, buildRecommendation(task, events, {
     includeProbes: options["include-probes"] === true
-  }), null, 2));
+  }));
 }
 
 function buildRecommendation(task, events, { includeProbes = false } = {}) {
@@ -2813,6 +3060,78 @@ function statusNextActions({ topRuns, liveProviderTaskRuns, eligibility, release
     if (!actions.includes(action)) actions.push(action);
   }
   return actions.slice(0, 6);
+}
+
+async function summarizeRecordedRun({ cwd, run, verdict = null }) {
+  const summary = summarizeRun(run);
+  if (verdict) {
+    summary.verdict_recorded = formatVerdictEvent(verdict);
+  }
+  const events = await readLedger(cwd);
+  const runs = topLevelRuns(runsWithAppendedChecks(events));
+  const marks = lifecycleMarksByRun(events);
+  const nudges = markNudgesForRun(run, runs, marks);
+  if (nudges.length > 0) {
+    summary.mark_nudges = nudges;
+  }
+  return summary;
+}
+
+function markNudgesForStatus(topRuns, marks) {
+  const nudges = [];
+  const seen = new Set();
+  for (const run of newestRuns(topRuns).slice(0, 10)) {
+    for (const nudge of markNudgesForRun(run, topRuns, marks)) {
+      const key = `${nudge.run_id}:${nudge.current_run_id}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      nudges.push(nudge);
+      if (nudges.length >= 5) return nudges;
+    }
+  }
+  return nudges;
+}
+
+function markNudgesForRun(run, topRuns, marks) {
+  if (!isMarkNudgeRun(run)) return [];
+  const changed = changedFilesForMarkNudge(run);
+  if (changed.length === 0) return [];
+  const changedSet = new Set(changed);
+  const currentTime = runTimestamp(run);
+  return newestRuns(topRuns)
+    .filter((candidate) => candidate.id !== run.id)
+    .filter(isMarkNudgeRun)
+    .filter((candidate) => runTimestamp(candidate) <= currentTime)
+    .filter((candidate) => (marks.get(candidate.id) ?? []).length === 0)
+    .map((candidate) => {
+      const overlapFiles = changedFilesForMarkNudge(candidate).filter((file) => changedSet.has(file));
+      return { candidate, overlapFiles };
+    })
+    .filter((item) => item.overlapFiles.length > 0)
+    .slice(0, 3)
+    .map(({ candidate, overlapFiles }) => ({
+      run_id: candidate.id,
+      current_run_id: run.id,
+      overlap_count: overlapFiles.length,
+      overlap_files: overlapFiles.slice(0, 10),
+      action: `Review overlap with ${candidate.id}; if this run replaced, replayed, or validated that work, run ${CLI_NAME} mark ${candidate.id} reverted|replayed|accepted-downstream --note "..."`
+    }));
+}
+
+function isMarkNudgeRun(run) {
+  return (
+    run?.type === "run" &&
+    !run.parent_id &&
+    !["provider_smoke", "probe"].includes(run.purpose) &&
+    (run.source === "live" || run.source === "manual")
+  );
+}
+
+function changedFilesForMarkNudge(run) {
+  return unique((Array.isArray(run.changed_files) ? run.changed_files : [])
+    .map((file) => String(file).replace(/\\/g, "/"))
+    .filter(Boolean))
+    .sort();
 }
 
 function isLiveProviderTaskRun(run) {
@@ -3357,7 +3676,7 @@ async function rankRuns(args) {
     )
   }));
 
-  console.log(JSON.stringify({
+  emitResult(options, {
     generated_at: new Date().toISOString(),
     task_kind: taskKindFilter,
     evidence: {
@@ -3371,7 +3690,7 @@ async function rankRuns(args) {
     notes: eligible.length === 0
       ? ["No recommendation-eligible live runs for this scope yet."]
       : []
-  }, null, 2));
+  });
 }
 
 async function proposeImprovements(args) {
@@ -3407,7 +3726,7 @@ async function proposeImprovements(args) {
   };
 
   await appendLedger(cwd, event);
-  console.log(JSON.stringify({
+  emitResult(options, {
     id,
     proposal_path: relative(cwd, proposalPath),
     release: {
@@ -3421,7 +3740,7 @@ async function proposeImprovements(args) {
       run_ids: finding.run_ids
     })),
     cited_run_ids: citedRunIds
-  }, null, 2));
+  });
 }
 
 async function recordReport(args) {
@@ -3511,7 +3830,7 @@ async function recordReport(args) {
   };
 
   await appendLedger(cwd, event);
-  console.log(JSON.stringify(event, null, 2));
+  emitResult(options, event);
 }
 
 async function addCheck(args) {
@@ -3523,6 +3842,7 @@ async function addCheck(args) {
   if (!runId || !command) {
     throw new Error(`Usage: ${CLI_NAME} check <run-id> --command "COMMAND" [--note TEXT]`);
   }
+  const verdict = normalizeVerdictOption(options.verdict);
 
   const cwd = resolveCwd(options);
   const events = await readLedger(cwd);
@@ -3563,39 +3883,33 @@ async function addCheck(args) {
   }, event);
 
   await appendLedger(cwd, event);
-  console.log(JSON.stringify(event, null, 2));
+  let verdictEvent = null;
+  if (verdict) {
+    verdictEvent = await createVerdictEvent({
+      cwd,
+      runId,
+      verdict,
+      note: options.note ? String(options.note) : ""
+    });
+  }
+  emitResult(options, verdictEvent ? { ...event, verdict_recorded: formatVerdictEvent(verdictEvent) } : event);
 }
 
 async function addVerdict(args) {
   const { positionals, options } = parseOptions(args);
   const [runId, verdict] = positionals;
-  const allowed = new Set(["accepted", "rejected", "partial", "unknown"]);
-  if (!runId || !allowed.has(verdict)) {
+  if (!runId || !verdictDefinitions.has(verdict)) {
     throw new Error("Usage: rux verdict <run-id> accepted|rejected|partial|unknown [--note TEXT]");
   }
 
   const cwd = resolveCwd(options);
-  const events = await readLedger(cwd);
-  const run = events.find((event) => event.type === "run" && event.id === runId);
-  if (!run) {
-    throw new Error(`Run not found: ${runId}`);
-  }
-  if (run.purpose === "provider_smoke") {
-    throw new Error("Provider-smoke runs prove adapter readiness only; do not attach human verdicts to them.");
-  }
-
-  const event = {
-    schema_version: SCHEMA_VERSION,
-    type: "verdict",
-    id: randomUUID(),
-    run_id: runId,
+  const event = await createVerdictEvent({
+    cwd,
+    runId,
     verdict,
-    note: options.note ? String(options.note) : "",
-    created_at: new Date().toISOString()
-  };
-
-  await appendLedger(cwd, event);
-  console.log(JSON.stringify(event, null, 2));
+    note: options.note ? String(options.note) : ""
+  });
+  emitResult(options, event);
 }
 
 async function addLifecycleMark(args) {
@@ -3626,7 +3940,7 @@ async function addLifecycleMark(args) {
   };
 
   await appendLedger(cwd, event);
-  console.log(JSON.stringify(event, null, 2));
+  emitResult(options, event);
 }
 
 async function ensureStore(cwd) {
@@ -3786,6 +4100,45 @@ function hasProviderSmoke(runs, runner) {
     Array.isArray(run.changed_files) &&
     run.changed_files.length === 0
   ));
+}
+
+function providerSmokeAttempts(runs, runner) {
+  return newestRuns(runs.filter((run) => (
+    run.purpose === "provider_smoke" &&
+    run.source === "live" &&
+    run.confidence === "high" &&
+    run.runner === runner
+  )));
+}
+
+function providerSmokeStatus(runs, runner) {
+  const attempts = providerSmokeAttempts(runs, runner);
+  const passing = attempts.find(isProviderSmokeEvidence) ?? null;
+  const latest = attempts[0] ?? null;
+  const chain = latest ? providerSmokeAttemptChain(attempts, latest.id) : [];
+  return {
+    runner,
+    ok: Boolean(passing),
+    latest_attempt_run_id: latest?.id ?? null,
+    latest_attempt_status: latest ? readClassification(latest).status : null,
+    latest_attempt_status_reason: latest ? readClassification(latest).status_reason : null,
+    passing_run_id: passing?.id ?? null,
+    attempt_chain: chain.map((run) => run.id),
+    attempt_history: attempts.map((run) => run.id)
+  };
+}
+
+function providerSmokeAttemptChain(attempts, latestId) {
+  const byId = new Map(attempts.map((run) => [run.id, run]));
+  const chain = [];
+  let current = byId.get(latestId) ?? null;
+  while (current) {
+    chain.push(current);
+    const previousId = current.attempt?.previous_run_id ?? null;
+    if (!previousId || chain.some((run) => run.id === previousId)) break;
+    current = byId.get(previousId) ?? null;
+  }
+  return chain;
 }
 
 async function hasLocalOnlyLanguage(cwd) {
@@ -4134,6 +4487,7 @@ function summarizeRun(run) {
     child_run_ids: run.child_run_ids ?? [],
     transcript_path: run.transcript_path,
     replay: replayMetadataForRun(run),
+    attempt: run.attempt ?? null,
     output_signal: run.output_signal ?? null,
     adapter: run.adapter ?? null,
     repo: run.repo ?? null,

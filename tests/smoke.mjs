@@ -312,6 +312,12 @@ try {
   assert(smokeOnlyStatus.next_capture.command.includes("--runner codex"), "smoke-only status should include a provider task command template");
   assert(smokeOnlyStatus.next_actions.some((action) => action.includes("first routing-eligible real provider task")), "smoke-only status should ask for real provider task evidence");
   assert(smokeOnlyStatus.latest_runs[0].task_summary && !smokeOnlyStatus.latest_runs[0].task_summary.includes("\n"), "status latest runs should include one-line task summary");
+  const smokeOnlyCodexStatus = smokeOnlyStatus.provider_smoke.find((smoke) => smoke.runner === "codex");
+  const smokeOnlyGeminiStatus = smokeOnlyStatus.provider_smoke.find((smoke) => smoke.runner === "gemini");
+  assert(smokeOnlyCodexStatus.latest_attempt_run_id === smokeOnlyCodexSummary.id, "status should expose the latest codex provider-smoke attempt run id");
+  assert(smokeOnlyGeminiStatus.latest_attempt_run_id === smokeOnlyGeminiSummary.id, "status should expose the latest gemini provider-smoke attempt run id");
+  assert(smokeOnlyCodexStatus.attempt_chain.includes(smokeOnlyCodexSummary.id), "status should expose the codex provider-smoke attempt chain");
+  assert(smokeOnlyGeminiStatus.attempt_chain.includes(smokeOnlyGeminiSummary.id), "status should expose the gemini provider-smoke attempt chain");
   const smokeOnlyReleaseCheck = JSON.parse(run("node", [cliPath, "release-check", "--cwd", smokeOnlyRoot]).stdout);
   assert(smokeOnlyReleaseCheck.gates.find((gate) => gate.name === "real_provider_task_evidence")?.ok === false, "release-check should not treat provider-smoke as task evidence");
 
@@ -481,6 +487,61 @@ try {
   assert(summary.replay.command.includes("--check 'node --version'"), "run replay command should include captured check command");
   assert(summary.replay.provider_call_required === false, "fake run replay should not imply a provider call");
   assert(existsSync(join(tempRoot, summary.transcript_path)), "transcript should exist");
+
+  const forcedTtyStatus = spawnSync("node", [
+    cliPath,
+    "status",
+    "--cwd",
+    tempRoot
+  ], {
+    encoding: "utf8",
+    env: { ...process.env, RUX_FORCE_TTY: "1", PATH: `${tempBin}:${process.env.PATH ?? ""}` }
+  });
+  assert(forcedTtyStatus.status === 0, "forced TTY status should complete");
+  assert(!isJsonOutput(forcedTtyStatus.stdout), "forced TTY status should print human-readable output by default");
+  assert(forcedTtyStatus.stdout.includes("Rux"), "forced TTY status should identify the Rux status surface");
+  const forcedTtyJsonStatus = JSON.parse(run("node", [
+    cliPath,
+    "status",
+    "--cwd",
+    tempRoot,
+    "--json"
+  ], repoRoot, {
+    RUX_FORCE_TTY: "1",
+    PATH: `${tempBin}:${process.env.PATH ?? ""}`
+  }).stdout);
+  assert(forcedTtyJsonStatus.ledger.runs >= 1, "--json should force JSON output even when the TTY seam is enabled");
+  const forcedTtyJsonRun = JSON.parse(run("node", [
+    cliPath,
+    "run",
+    "forced tty json run",
+    "--runner",
+    "fake",
+    "--cwd",
+    tempRoot,
+    "--json"
+  ], repoRoot, {
+    RUX_FORCE_TTY: "1"
+  }).stdout);
+  assert(forcedTtyJsonRun.runner === "fake", "run --json should force JSON output when the TTY seam is enabled");
+  const forcedTtyJsonRunners = JSON.parse(run("node", [
+    cliPath,
+    "runners",
+    "--json"
+  ], repoRoot, {
+    RUX_FORCE_TTY: "1"
+  }).stdout);
+  assert(forcedTtyJsonRunners.some((item) => item.name === "fake"), "runners --json should force JSON output when the TTY seam is enabled");
+  const forcedTtyJsonList = JSON.parse(run("node", [
+    cliPath,
+    "ls",
+    "--cwd",
+    tempRoot,
+    "--json"
+  ], repoRoot, {
+    RUX_FORCE_TTY: "1"
+  }).stdout);
+  assert(forcedTtyJsonList.some((item) => item.id === summary.id), "ls --json should force structured output when the TTY seam is enabled");
 
   const inlineMutatingCheckRun = JSON.parse(run("node", [
     cliPath,
@@ -797,6 +858,76 @@ try {
   assert(manualStatus.evidence.live_provider_task_runs === 0, "status should keep manual separate from live provider task runs");
   const manualReleaseCheck = JSON.parse(run("node", [cliPath, "release-check", "--cwd", manualRecordRoot]).stdout);
   assert(manualReleaseCheck.gates.find((gate) => gate.name === "real_provider_task_evidence")?.ok === false, "manual records should not satisfy release provider task evidence");
+
+  const manualVerdictRoot = join(tempRoot, "manual-record-verdict");
+  await mkdir(manualVerdictRoot, { recursive: true });
+  run("git", ["init"], manualVerdictRoot);
+  await writeFile(join(manualVerdictRoot, "README.md"), "# Manual Record Verdict\n", "utf8");
+  run("git", ["add", "README.md"], manualVerdictRoot);
+  run("git", ["commit", "-m", "initial"], manualVerdictRoot, {
+    GIT_AUTHOR_NAME: "Rux Smoke",
+    GIT_AUTHOR_EMAIL: "smoke@example.com",
+    GIT_COMMITTER_NAME: "Rux Smoke",
+    GIT_COMMITTER_EMAIL: "smoke@example.com"
+  });
+  await writeFile(join(manualVerdictRoot, "verdict-change.txt"), "manual verdict\n", "utf8");
+  const manualRecordWithVerdict = JSON.parse(run("node", [
+    cliPath,
+    "record",
+    "manual record with inline verdict",
+    "--runner",
+    "codex",
+    "--cwd",
+    manualVerdictRoot,
+    "--check",
+    "node --version",
+    "--verdict",
+    "partial"
+  ]).stdout);
+  assert(manualRecordWithVerdict.source === "manual", "record --verdict should still return the manual record summary");
+  const manualVerdictShow = JSON.parse(run("node", [cliPath, "show", manualRecordWithVerdict.id, "--cwd", manualVerdictRoot]).stdout);
+  assert(manualVerdictShow.verdicts[0]?.verdict === "partial", "record --verdict should append a verdict event");
+  assert(manualVerdictShow.evaluation.latest_verdict.verdict === "partial", "record --verdict should make the verdict visible to eval/show");
+
+  const markNudgeRoot = join(tempRoot, "mark-nudge");
+  await mkdir(markNudgeRoot, { recursive: true });
+  run("git", ["init"], markNudgeRoot);
+  await writeFile(join(markNudgeRoot, "README.md"), "# Mark Nudge\n", "utf8");
+  run("git", ["add", "README.md"], markNudgeRoot);
+  run("git", ["commit", "-m", "initial"], markNudgeRoot, {
+    GIT_AUTHOR_NAME: "Rux Smoke",
+    GIT_AUTHOR_EMAIL: "smoke@example.com",
+    GIT_COMMITTER_NAME: "Rux Smoke",
+    GIT_COMMITTER_EMAIL: "smoke@example.com"
+  });
+  await writeFile(join(markNudgeRoot, "shared.txt"), "first overlap\n", "utf8");
+  const firstOverlapRecord = JSON.parse(run("node", [
+    cliPath,
+    "record",
+    "first overlapping current-session work",
+    "--runner",
+    "codex",
+    "--cwd",
+    markNudgeRoot,
+    "--check",
+    "node --version"
+  ]).stdout);
+  await writeFile(join(markNudgeRoot, "shared.txt"), "second overlap\n", "utf8");
+  const secondOverlapRecord = JSON.parse(run("node", [
+    cliPath,
+    "record",
+    "second overlapping current-session work",
+    "--runner",
+    "codex",
+    "--cwd",
+    markNudgeRoot,
+    "--check",
+    "node --version"
+  ]).stdout);
+  assert(secondOverlapRecord.mark_nudges[0]?.run_id === firstOverlapRecord.id, "record should nudge when changed files overlap a recent unmarked run");
+  assert(secondOverlapRecord.mark_nudges[0]?.overlap_files.includes("shared.txt"), "record mark nudge should name overlapping files");
+  const markNudgeStatus = JSON.parse(run("node", [cliPath, "status", "--cwd", markNudgeRoot]).stdout);
+  assert(markNudgeStatus.mark_nudges.some((nudge) => nudge.run_id === firstOverlapRecord.id), "status should surface changed-file overlap mark nudges");
 
   const manualUntrackedDirRoot = join(tempRoot, "manual-untracked-dir");
   await mkdir(manualUntrackedDirRoot, { recursive: true });
@@ -1230,6 +1361,80 @@ try {
   assert(checkedCodexEval.signals.checks_total === 1, "eval should count post-run checks");
   assert(checkedCodexEval.signals.check_changed_files === 0, "eval should expose check-time file changes");
   assert(checkedCodexEval.routing.score_basis === "checks_passed", "post-run checked provider run should score from checks");
+
+  const checkVerdictRoot = join(tempRoot, "check-verdict-root");
+  await mkdir(checkVerdictRoot, { recursive: true });
+  run("git", ["init"], checkVerdictRoot);
+  await writeFile(join(checkVerdictRoot, "README.md"), "# Check Verdict\n", "utf8");
+  run("git", ["add", "README.md"], checkVerdictRoot);
+  run("git", ["commit", "-m", "initial"], checkVerdictRoot, {
+    GIT_AUTHOR_NAME: "Rux Smoke",
+    GIT_AUTHOR_EMAIL: "smoke@example.com",
+    GIT_COMMITTER_NAME: "Rux Smoke",
+    GIT_COMMITTER_EMAIL: "smoke@example.com"
+  });
+  const codexCheckVerdictRun = spawnSync("node", [
+    cliPath,
+    "run",
+    "codex check verdict guard",
+    "--runner",
+    "codex",
+    "--allow-dirty",
+    "--cwd",
+    checkVerdictRoot
+  ], {
+    encoding: "utf8",
+    env: { ...process.env, PATH: `${tempBin}:${process.env.PATH ?? ""}` }
+  });
+  assert(codexCheckVerdictRun.status === 0, "mocked codex run for check --verdict should complete");
+  const codexCheckVerdictSummary = JSON.parse(codexCheckVerdictRun.stdout);
+  const checkWithVerdict = JSON.parse(run("node", [
+    cliPath,
+    "check",
+    codexCheckVerdictSummary.id,
+    "--command",
+    "node --version",
+    "--verdict",
+    "accepted",
+    "--cwd",
+    checkVerdictRoot
+  ]).stdout);
+  assert(checkWithVerdict.type === "check", "check --verdict should still return the check event");
+  const checkVerdictShow = JSON.parse(run("node", [cliPath, "show", codexCheckVerdictSummary.id, "--cwd", checkVerdictRoot]).stdout);
+  assert(checkVerdictShow.verdicts[0]?.verdict === "accepted", "check --verdict should append a verdict event");
+  assert(checkVerdictShow.evaluation.latest_verdict.verdict === "accepted", "check --verdict should make the verdict visible to eval/show");
+  const invalidRunVerdict = spawnSync("node", [
+    cliPath,
+    "run",
+    "invalid verdict should not write",
+    "--runner",
+    "codex",
+    "--allow-dirty",
+    "--verdict",
+    "shipit",
+    "--cwd",
+    checkVerdictRoot
+  ], {
+    encoding: "utf8",
+    env: { ...process.env, PATH: `${tempBin}:${process.env.PATH ?? ""}` }
+  });
+  assert(invalidRunVerdict.status !== 0, "invalid run --verdict should fail before capture");
+  assert(invalidRunVerdict.stderr.includes("--verdict must be one of"), "invalid run --verdict should explain allowed values");
+  assert(!invalidRunVerdict.stderr.includes("recorded run"), "invalid run --verdict should not write a run before failing");
+  const baselineVerdict = spawnSync("node", [
+    cliPath,
+    "record",
+    "--start",
+    "baseline verdict guard",
+    "--runner",
+    "codex",
+    "--verdict",
+    "accepted",
+    "--cwd",
+    checkVerdictRoot
+  ], { encoding: "utf8" });
+  assert(baselineVerdict.status !== 0, "record --start should reject --verdict");
+  assert(baselineVerdict.stderr.includes("baseline only"), "record --start verdict rejection should explain the boundary");
 
   const codexTranscript = await readFile(join(tempRoot, codexSummary.transcript_path), "utf8");
   assert(codexTranscript.includes("exec --sandbox read-only"), "codex runner should use read-only sandbox");
@@ -2106,6 +2311,15 @@ function run(command, args, cwd = repoRoot, extraEnv = {}) {
 function assert(condition, message) {
   if (!condition) {
     throw new Error(message);
+  }
+}
+
+function isJsonOutput(value) {
+  try {
+    JSON.parse(value);
+    return true;
+  } catch {
+    return false;
   }
 }
 

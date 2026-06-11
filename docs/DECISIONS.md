@@ -18,12 +18,13 @@ This is the lightweight decision log for Rux. Add entries when a choice would ot
 - Consequence: Provider credentials are not stored in Rux, and adapter flags must be verified against installed CLIs.
 - Revisit when: a hosted runner layer exists and needs a separate auth/security model.
 
-## RUX-003: stdout Is Machine Output, stderr Is Human/Progress Output
+## RUX-003: stdout Is Machine Output Unless The Terminal Is Interactive
 
 - Date: 2026-06-08
-- Decision: Rux keeps JSON on stdout and sends provider output, progress, checks, and diagnostics to stderr.
-- Reason: Scripts need parseable output, while humans need to see long-running provider behavior and prompts.
-- Consequence: Provider questions and Rux heartbeats must be visible without corrupting JSON stdout.
+- Amended: 2026-06-11
+- Decision: Rux keeps JSON on stdout when output is piped or redirected, but prints concise human-readable output when stdout is an interactive TTY. `--json` always forces JSON. Provider output, progress, checks, prompts, and diagnostics stay on stderr.
+- Reason: Scripts need parseable output, while the default terminal experience should be readable without requiring users to pipe through `jq`.
+- Consequence: New command surfaces must support the same contract: TTY human output, piped JSON, and explicit `--json` override. Provider questions and Rux heartbeats must remain visible without corrupting machine output.
 - Revisit when: an interactive TUI or protocol transport becomes the primary interface.
 
 ## RUX-004: Safety Failures Stay Failed
