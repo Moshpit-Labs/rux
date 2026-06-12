@@ -304,6 +304,145 @@ function formatReleaseHuman(result) {
   ].join("\n");
 }
 
+function formatDoctorHuman(result) {
+  const availableRunners = (result.runners ?? []).filter((runner) => runner.available).map((runner) => runner.name);
+  return [
+    `${PRODUCT_NAME} doctor`,
+    `Repo: ${result.cwd}`,
+    `Node: ${result.node?.version ?? "unknown"} ${result.node?.ok ? "ok" : "not ok"}`,
+    `Git: ${result.git?.inside_work_tree ? "worktree" : "not a worktree"}, dirty=${result.git?.dirty_entries ?? "unknown"}`,
+    `Store: ${result.store?.exists ? "present" : "missing"} (${result.store?.runs ?? 0} runs, ${result.store?.verdicts ?? 0} verdicts, ${result.store?.marks ?? 0} marks)`,
+    `Runners: ${availableRunners.length > 0 ? availableRunners.join(", ") : "none available"}`,
+    "",
+    "Notes",
+    ...((result.notes ?? []).map((note) => `- ${note}`))
+  ].join("\n");
+}
+
+function formatPlanHuman(result) {
+  const recommendation = result.recommendation ?? {};
+  const maturity = recommendation.maturity ?? {};
+  const lines = [
+    `${PRODUCT_NAME} plan`,
+    `Task: ${formatListTask(result.task)}`,
+    `Kind: ${result.task_kind ?? "unspecified"}`,
+    `Runner: ${recommendation.runner ?? "none"} (${result.runner_source ?? "unknown source"})`,
+    `Roster: ${recommendation.roster ?? "none"} (${recommendation.agents ?? 0} agent${recommendation.agents === 1 ? "" : "s"}, ${recommendation.execution ?? "unknown"})`,
+    `Evidence: ${recommendation.confidence ?? "unknown"}, maturity ${maturity.level ?? "unknown"} from ${maturity.runs ?? 0} run(s)`,
+    `Reason: ${recommendation.reason ?? "No reason recorded."}`
+  ];
+
+  if (recommendation.one_agent_not_enough) {
+    lines.push(`Why not one agent: ${recommendation.one_agent_not_enough}`);
+  }
+
+  if (Array.isArray(recommendation.roles) && recommendation.roles.length > 0) {
+    lines.push("", "Roles");
+    lines.push(...recommendation.roles.map((role) => `- ${role.role}: ${role.runner} - ${role.purpose}`));
+  }
+
+  if (result.command) {
+    lines.push("", "Command", result.command);
+  }
+
+  if (Array.isArray(result.next_actions) && result.next_actions.length > 0) {
+    lines.push("", "Next");
+    lines.push(...result.next_actions.map((action) => `- ${action}`));
+  }
+
+  return lines.join("\n");
+}
+
+function formatSuggestHuman(result) {
+  const recommendation = result.recommendation ?? {};
+  const maturity = recommendation.maturity ?? {};
+  const lines = [
+    `${PRODUCT_NAME} suggest`,
+    `Task: ${formatListTask(result.task)}`,
+    `Kind: ${result.task_kind ?? "unspecified"}`
+  ];
+
+  if (recommendation.runner) {
+    lines.push(
+      `Recommendation: ${recommendation.runner}/${recommendation.roster ?? "solo"} ${recommendation.model ?? "default-model"} ${recommendation.effort ?? "default-effort"}`,
+      `Confidence: ${recommendation.confidence ?? "unknown"}, maturity ${maturity.level ?? "unknown"} from ${maturity.runs ?? 0} run(s)`,
+      `Reason: ${recommendation.reason ?? "No reason recorded."}`
+    );
+  } else {
+    lines.push(
+      "Recommendation: none yet",
+      `Confidence: ${recommendation.confidence ?? "cold_start"}`,
+      `Reason: ${recommendation.reason ?? "No eligible evidence yet."}`
+    );
+  }
+
+  if (Array.isArray(recommendation.evidence_runs) && recommendation.evidence_runs.length > 0) {
+    lines.push(`Evidence runs: ${recommendation.evidence_runs.slice(0, 5).join(", ")}`);
+  }
+
+  const stats = recommendation.stats ?? {};
+  lines.push(
+    `Stats: ${stats.labeled_runs ?? 0} labeled, ${stats.adapter_observed_runs ?? 0} adapter-observed, ${stats.manual_runs ?? 0} manual`,
+    `Ignored: ${result.evidence?.ignored_runs ?? 0} run(s)`
+  );
+
+  return lines.join("\n");
+}
+
+function formatRankHuman(result) {
+  const lines = [
+    `${PRODUCT_NAME} rank`,
+    `Evidence: ${result.evidence?.eligible_runs ?? 0} eligible, maturity ${result.evidence?.maturity?.strongest_level ?? "unknown"}`
+  ];
+
+  if (result.task_kind) {
+    lines.push(`Scope: ${result.task_kind}`);
+  }
+
+  for (const ranking of result.rankings ?? []) {
+    lines.push("", `${ranking.task_kind}`);
+    if (!Array.isArray(ranking.candidates) || ranking.candidates.length === 0) {
+      lines.push("- no candidates");
+      continue;
+    }
+    for (const candidate of ranking.candidates.slice(0, 3)) {
+      const runs = (candidate.evidence_runs ?? []).slice(0, 3).join(", ");
+      lines.push(`- ${candidate.runner}/${candidate.roster} ${candidate.model ?? "default-model"} ${candidate.effort ?? "default-effort"} score=${candidate.score} maturity=${candidate.maturity?.level ?? "unknown"} runs=${candidate.total}${runs ? ` (${runs})` : ""}`);
+    }
+  }
+
+  if (Array.isArray(result.notes) && result.notes.length > 0) {
+    lines.push("", "Notes");
+    lines.push(...result.notes.map((note) => `- ${note}`));
+  }
+
+  return lines.join("\n");
+}
+
+function formatExportHuman(result) {
+  const lines = [
+    `${PRODUCT_NAME} export`,
+    `Scope: ${result.scope}`,
+    `Runs: ${result.counts?.exported_runs ?? 0} exported of ${result.counts?.total_runs ?? 0}`,
+    `Transcripts: ${result.include_transcripts ? "included" : "omitted"}`
+  ];
+
+  if (Array.isArray(result.runs) && result.runs.length > 0) {
+    lines.push("", "Runs");
+    lines.push(...result.runs.slice(0, 10).map((run) => {
+      const verdict = run.verdict?.verdict ? ` verdict=${run.verdict.verdict}` : "";
+      return `- ${run.id} ${run.effective_status ?? run.status} ${run.runner}/${run.roster} ${run.outcome?.label ?? "unlabeled"}${verdict} - ${formatListTask(run.task)}`;
+    }));
+  }
+
+  if (Array.isArray(result.notes) && result.notes.length > 0) {
+    lines.push("", "Notes");
+    lines.push(...result.notes.map((note) => `- ${note}`));
+  }
+
+  return lines.join("\n");
+}
+
 function normalizeVerdictOption(value) {
   if (value === undefined) return null;
   if (value === true) {
@@ -798,7 +937,7 @@ async function doctor(args) {
       "doctor is read-only and does not call provider services.",
       "Provider availability only means the CLI binary is on PATH; auth and live behavior still require provider-smoke."
     ]
-  });
+  }, formatDoctorHuman);
 }
 
 async function releaseCheck(args) {
@@ -1140,7 +1279,7 @@ async function exportRuns(args) {
         ? "Transcript text is included because --include-transcripts was provided. Review before sharing."
         : "Transcript text is omitted by default. Use --include-transcripts only after reviewing sensitivity."
     ]
-  });
+  }, formatExportHuman);
 }
 
 async function exportRunRecord({ cwd, run, children, verdicts, marks, reports, includeTranscripts }) {
@@ -2850,7 +2989,7 @@ async function planRun(args) {
       "plan is dry-run only; it does not call providers and does not write the ledger.",
       "Generated rosters are sequential. Parallel provider fanout is not enabled in v0."
     ]
-  });
+  }, formatPlanHuman);
 }
 
 async function evaluateRunCommand(args) {
@@ -2926,7 +3065,7 @@ async function suggestRun(args) {
   const events = await readLedger(cwd);
   emitResult(options, buildRecommendation(task, events, {
     includeProbes: options["include-probes"] === true
-  }));
+  }), formatSuggestHuman);
 }
 
 function buildRecommendation(task, events, { includeProbes = false } = {}) {
@@ -3690,7 +3829,7 @@ async function rankRuns(args) {
     notes: eligible.length === 0
       ? ["No recommendation-eligible live runs for this scope yet."]
       : []
-  });
+  }, formatRankHuman);
 }
 
 async function proposeImprovements(args) {

@@ -34,35 +34,47 @@ rux record "implemented the stats filters in the current Codex session" --runner
 
 In an interactive terminal, Rux prints readable output. When stdout is piped or redirected, Rux keeps JSON for scripts. Use `--json` any time you want JSON explicitly.
 
-## First Product
+Example terminal output:
 
-The first useful version is intentionally small:
+```text
+Rux plan
+Task: fix the failing auth test
+Kind: test
+Runner: codex (evidence)
+Roster: solo (1 agent, sequential)
+Evidence: local_evidence, maturity directional from 3 run(s)
+Command
+rux run 'fix the failing auth test' --runner codex --roster solo
+```
 
-- Detect local agent CLIs.
-- Initialize repo-local policy and ignore rules.
-- Plan a small sequential runner/roster before execution.
-- Run a task through one selected agent.
-- Run explicit provider smoke checks before release.
-- Run fixed sequential rosters: `solo`, `pair`, `repair`, and `plan-code-review`.
-- Record the prompt, runner, model, effort, transcript, adapter invocation, status reason, repo state, changed files, outcome, and cost hints in a local ledger.
-- Capture tests/checks during or after a run, explicit human verdicts, and downstream lifecycle marks.
-- Record current-session work without nesting another provider run.
-- Store replay metadata so captured runs can explain how they were invoked.
-- Explain the outcome signal behind each run.
-- Explain why a run does or does not count as routing evidence.
-- Import selected old session artifacts as low-confidence history.
-- Rank runner/model/effort/roster evidence by task kind.
-- Suggest a runner only when local labeled evidence supports it.
-- Write proposal-only improvement notes that cite run IDs.
-- Capture local feedback reports for bugs, confusing UX, adapter issues, ideas, and useful wins.
-- Export shareable run evidence for review.
-- Keep repo-level runner safety defaults in a committed policy file.
-- Check local readiness and release gates before publishing.
-- Block accidental npm publish attempts with strict release verification.
-- Show a clean project status for the current repo.
-- Show a clean history of what ran and what happened.
+## What Rux Records
 
-After the record is trustworthy, Rux can make richer routing decisions, then earn more dynamic roster design.
+Rux keeps a repo-local evidence trail for AI coding work:
+
+- the task, runner, roster, provider mode, task kind, model, effort, and cost hints,
+- the provider invocation, transcript reference, output signal, status, and effective status,
+- repo state before and after, changed files, write-scope violations, and replay metadata,
+- inline checks, post-run checks, human verdicts, lifecycle marks, and feedback reports,
+- provider-smoke attempts for release readiness,
+- manual current-session records when the active agent already did the work.
+
+That record powers `show`, `eval`, `outcome`, `status`, `export`, `rank`, `suggest`, `plan`, `propose`, and `report`.
+
+## What Rux Recommends
+
+Rux recommends cautiously. `rank`, `suggest`, and `plan` use only eligible local evidence: checked or reviewed runs with enough provenance to be useful. Imported history, probe runs, provider-smoke runs, fake runs, failed safety runs, and vacuous checks do not quietly become routing proof.
+
+Every recommendation carries an evidence maturity label:
+
+- `none`: no usable local evidence yet,
+- `thin`: useful for the next attempt, not a team standard,
+- `directional`: enough to prefer, still keep review,
+- `strong`: repeated positive local evidence,
+- `mixed`: enough history exists, but outcomes disagree.
+
+## What Rux Does Not Do
+
+Rux does not replace your coding agent, store provider credentials, proxy model API calls, run a SaaS backend, add telemetry by default, or silently modify its own source. It wraps the tools you already use, records what happened, and proposes improvements with evidence. Humans decide what to run and what to change.
 
 ## Why Now
 
@@ -78,22 +90,11 @@ The gap is local decision memory for coding work:
 
 That memory starts with capture. If the record is weak, routing is theater.
 
-## Current State
-
-This repo has the first v0.1 capture spine: a CLI with repo init, a fake runner, Claude plan-mode capture, Codex read-only capture, Gemini plan-mode capture, explicit provider smoke checks, fixed sequential rosters, dry-run roster planning, repo policy, explicit file import for old sessions, current-session manual records, model/effort/cost metadata, JSONL ledger, transcript capture, repo-state capture, changed-file capture, inline and post-run check capture, `ls`, `show`, `outcome`, `eval`, `rank`, `suggest`, `plan`, `status`, `export`, `policy`, `propose`, `report`, `doctor`, `release-check`, human verdict events, downstream lifecycle marks, and local feedback reports.
-
-## Install
+## Useful Commands
 
 ```sh
-npm install -g @moshpits/rux
-rux --help
-```
-
-Basic flow:
-
-```sh
-rux init
 rux runners
+rux plan "fix the failing auth test"
 rux run "review the navigation code" --runner gemini
 rux run "update the navigation code" --runner gemini --provider-mode write --check "npm run typecheck"
 rux run "update only the stats filters" --runner codex --provider-mode write --write-scope "lib/stats/filters.ts,test/stats-filters.test.ts" --check "npm test"
@@ -101,7 +102,7 @@ rux record "implemented the stats filters in the current Codex session" --runner
 rux report "Gemini surfaced a question but the terminal flow was unclear" --kind ux --command "rux run ..." --note "The question appeared in the transcript but was easy to miss."
 ```
 
-Provider output and Rux progress are mirrored to stderr while the provider runs, so questions, start/finish state, checks, and quiet long-running work are visible in the terminal without corrupting script output. The default provider mode is `plan`; use `--provider-mode write` when you want the wrapped provider to edit files. Real provider runs refuse dirty worktrees by default; commit, stash, or revert existing changes first, or pass `--allow-dirty` only when those changes are intentionally part of the provider context. Use `--write-scope` to declare the files or directories a provider is allowed to change; Rux records out-of-scope edits as failed runs. If a provider asks for input, Rux records the run as `blocked`. If a provider changes files while Rux asked for plan mode, Rux records the run as `failed`.
+Provider output and Rux progress are mirrored to stderr while the provider runs, so questions, start/finish state, checks, and quiet long-running work are visible in the terminal without corrupting script output. The default provider mode is `plan`; use `--provider-mode write` when you want the wrapped provider to edit files. Real provider runs refuse dirty worktrees by default; commit, stash, or revert existing changes first, or pass `--allow-dirty` only when those changes are intentionally part of the provider context. Use `--write-scope` to declare the files or directories a provider is allowed to change; Rux records out-of-scope edits as failed runs.
 
 Use `rux record` when the current agent session already did the work and you do not want to spawn a nested Claude/Codex/Gemini process just to satisfy the ledger. Manual records can help local recommendations when they have checks or verdicts, but they are down-weighted, labeled as manual evidence, and do not replace real provider-smoke or adapter-run evidence in the release gate. `--write-scope` applies to manual records too.
 

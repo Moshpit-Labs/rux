@@ -1,6 +1,6 @@
 # Current State
 
-Last updated: 2026-06-11
+Last updated: 2026-06-12
 
 ## One-Line Summary
 
@@ -33,7 +33,7 @@ Rux is a public coding-agent run ledger that records real outcomes first, then u
 - Real provider launches now refuse dirty worktrees by default. Users must commit, stash, or revert existing changes first, or pass `--allow-dirty` when those changes are intentionally part of the provider context. Fake runs remain allowed in dirty trees for local smoke and ledger development.
 - `rux run --write-scope "path[,path...]"` records the intended write boundary for a provider run. If the provider changes files outside those exact files or directory prefixes, the run is recorded as `failed` with `status_reason: write_scope_violation`, and routing/eval/export surface the violation.
 - Provider stdout/stderr is mirrored to Rux stderr while the provider runs, while Rux stdout stays JSON for scripts.
-- When stdout is an interactive TTY, Rux prints concise human-readable command output by default. Piped or redirected output remains JSON, and `--json` forces JSON on supported command surfaces.
+- When stdout is an interactive TTY, Rux prints concise human-readable command output by default. Piped or redirected output remains JSON, and `--json` forces JSON on supported command surfaces. `plan`, `suggest`, `rank`, `doctor`, and `export` now have dedicated human summaries instead of the generic result wrapper.
 - Rux now prints its own provider/check progress to stderr: provider start, periodic still-running heartbeat, provider finish, check start, check finish, and final ledger record. This keeps quiet provider runs inspectable without contaminating JSON stdout.
 - Provider output is classified before a run can count as completed. Live-run status precedence is deterministic: `write_scope_violation` outranks `provider_plan_changed_files`, which outranks `check_failed`, which outranks `provider_needs_input`, which outranks `completed`.
 - Read surfaces now expose `effective_status`, `effective_status_reason`, and `classifier_version` next to the stored status fields. Existing ledger records are not rewritten; routing, outcome, `rank`, and `suggest` consume effective labels so old `provider_needs_input` false positives with changed files and passing checks can count as completed evidence.
@@ -68,6 +68,7 @@ Rux is a public coding-agent run ledger that records real outcomes first, then u
 - `rux release-check` is a read-only publish gate. It checks package scope, package file shape, privacy, docs, scripts, committed release state, provider-smoke evidence, at least one routing-eligible live provider task, and name readiness. Mutating post-run checks are recorded but do not satisfy task-evidence release readiness. Gates declare lifecycle: `one_time`, `release`, or `permanent`. `release-check --strict` exits non-zero while blockers remain, and npm `prepublishOnly` runs `npm run release:verify` so publish attempts use the strict gate.
 - Release cadence is documented in `docs/STANDARDS.md`: batch normal fixes into a weekly patch train, reserve emergency patches for dangerous execution behavior, data loss, broken installs, provider auth/security breakage, or unusable published packages, and bump package versions only when cutting a release.
 - Rux now uses a Swami-lite docs system: `docs/VISION.md` for the grand product arc, `docs/DECISIONS.md` for sticky decisions, `docs/STANDARDS.md` for behavior/release rules, and `npm run check:docs` to catch stale naming, local-only framing, missing docs, and release verification drift.
+- The README now reads as the public entry surface for Rux: it opens with the record-first loop, shows example terminal output, explains what Rux records and recommends, states what it does not do, and keeps the practical command set close to the top.
 - Post-goal Claude review is a lightweight ritual, not infrastructure. Use `prompts/post-goal-review.md` after achieving a goal, sanitize private context by default, and report model fallbacks explicitly.
 - Treat team support as explicit export/import and committed repo policy first, not RBAC or SaaS.
 - Support local CLI adapters first. Remote job adapters such as GitHub-hosted coding agents are later release-track concerns, after the local runner contract is trustworthy.

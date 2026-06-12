@@ -542,6 +542,69 @@ try {
     RUX_FORCE_TTY: "1"
   }).stdout);
   assert(forcedTtyJsonList.some((item) => item.id === summary.id), "ls --json should force structured output when the TTY seam is enabled");
+  const forcedTtyPlan = run("node", [
+    cliPath,
+    "plan",
+    "fix the failing smoke test",
+    "--cwd",
+    tempRoot,
+    "--check",
+    "node --version"
+  ], repoRoot, {
+    RUX_FORCE_TTY: "1",
+    PATH: `${tempBin}:${process.env.PATH ?? ""}`
+  }).stdout;
+  assert(forcedTtyPlan.includes("Rux plan"), "forced TTY plan should identify the plan surface");
+  assert(forcedTtyPlan.includes("Runner:"), "forced TTY plan should show the selected runner");
+  assert(forcedTtyPlan.includes("Roster:"), "forced TTY plan should show the selected roster");
+  assert(forcedTtyPlan.includes("Command"), "forced TTY plan should show the runnable command");
+  const forcedTtySuggest = run("node", [
+    cliPath,
+    "suggest",
+    "fix the failing smoke test",
+    "--cwd",
+    tempRoot
+  ], repoRoot, {
+    RUX_FORCE_TTY: "1"
+  }).stdout;
+  assert(forcedTtySuggest.includes("Rux suggest"), "forced TTY suggest should identify the suggest surface");
+  assert(forcedTtySuggest.includes("Recommendation:"), "forced TTY suggest should show the recommendation");
+  assert(forcedTtySuggest.includes("Evidence runs:") || forcedTtySuggest.includes("Ignored:"), "forced TTY suggest should show evidence context");
+  const forcedTtyRank = run("node", [
+    cliPath,
+    "rank",
+    "--cwd",
+    tempRoot
+  ], repoRoot, {
+    RUX_FORCE_TTY: "1"
+  }).stdout;
+  assert(forcedTtyRank.includes("Rux rank"), "forced TTY rank should identify the rank surface");
+  assert(forcedTtyRank.includes("Evidence:"), "forced TTY rank should summarize evidence");
+  const forcedTtyDoctor = run("node", [
+    cliPath,
+    "doctor",
+    "--cwd",
+    tempRoot
+  ], repoRoot, {
+    RUX_FORCE_TTY: "1",
+    PATH: `${tempBin}:${process.env.PATH ?? ""}`
+  }).stdout;
+  assert(forcedTtyDoctor.includes("Rux doctor"), "forced TTY doctor should identify the doctor surface");
+  assert(forcedTtyDoctor.includes("Node:"), "forced TTY doctor should show Node health");
+  assert(forcedTtyDoctor.includes("Runners:"), "forced TTY doctor should show runner availability");
+  const forcedTtyExport = run("node", [
+    cliPath,
+    "export",
+    "--cwd",
+    tempRoot,
+    "--limit",
+    "1"
+  ], repoRoot, {
+    RUX_FORCE_TTY: "1"
+  }).stdout;
+  assert(forcedTtyExport.includes("Rux export"), "forced TTY export should identify the export surface");
+  assert(forcedTtyExport.includes("Runs:"), "forced TTY export should summarize exported runs");
+  assert(forcedTtyExport.includes("Transcripts:"), "forced TTY export should show transcript inclusion state");
 
   const inlineMutatingCheckRun = JSON.parse(run("node", [
     cliPath,
