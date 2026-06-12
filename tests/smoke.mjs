@@ -1327,6 +1327,35 @@ try {
   const claudeTranscript = await readFile(join(tempRoot, claudeSummary.transcript_path), "utf8");
   assert(claudeTranscript.includes("--permission-mode plan"), "claude runner should use plan permission mode");
   assert(claudeTranscript.includes("mock claude structured response"), "claude transcript should capture parsed assistant text");
+
+  const claudeStreamRun = spawnSync("node", [
+    cliPath,
+    "run",
+    "stream guard",
+    "--runner",
+    "claude",
+    "--stream",
+    "--allow-dirty",
+    "--cwd",
+    tempRoot
+  ], {
+    encoding: "utf8",
+    env: { ...process.env, PATH: `${tempBin}:${process.env.PATH ?? ""}` }
+  });
+  assert(claudeStreamRun.status === 0, "mocked streaming claude runner should complete");
+  assert(claudeStreamRun.stderr.includes("rux: claude > mock claude streamed chunk"), "streaming run should render assistant text live on stderr");
+  assert(claudeStreamRun.stderr.includes("rux: claude done"), "streaming run should render the result event live on stderr");
+  const claudeStreamSummary = JSON.parse(claudeStreamRun.stdout);
+  assert(claudeStreamSummary.status === "ok", "mocked streaming claude run should be ok");
+  assert(claudeStreamSummary.adapter.argv.includes("stream-json"), "streaming claude adapter should request stream-json output");
+  assert(claudeStreamSummary.adapter.parsed_output.format === "claude-stream-json", "streaming claude adapter should parse stream-json output");
+  assert(claudeStreamSummary.adapter.parsed_output.parsed === true, "streaming claude adapter should avoid raw text fallback");
+  assert(claudeStreamSummary.model === "claude-stream-mock", "streaming claude run should capture observed model metadata");
+  assert(claudeStreamSummary.cost_hint.amount === 0.07, "streaming claude run should capture observed cost from the result event");
+  assert(claudeStreamSummary.replay.command.includes("--stream"), "streaming run replay should preserve the --stream flag");
+  const claudeStreamTranscript = await readFile(join(tempRoot, claudeStreamSummary.transcript_path), "utf8");
+  assert(claudeStreamTranscript.includes("mock claude streamed response"), "streaming claude transcript should capture the result assistant text");
+
   const claudeWriteRun = spawnSync("node", [
     cliPath,
     "run",
@@ -2394,6 +2423,12 @@ async function installMockClaude(binDir) {
     [
       "#!/bin/sh",
       "case \" $* \" in",
+      "  *\"--output-format stream-json\"*)",
+      "    printf '%s\\n' '{\"type\":\"system\",\"subtype\":\"init\",\"model\":\"claude-stream-mock\"}'",
+      "    printf '%s\\n' '{\"type\":\"assistant\",\"message\":{\"content\":[{\"type\":\"text\",\"text\":\"mock claude streamed chunk\"}]}}'",
+      "    printf '%s\\n' '{\"type\":\"result\",\"result\":\"mock claude streamed response\",\"model\":\"claude-stream-mock\",\"total_cost_usd\":0.07,\"duration_ms\":1200}'",
+      "    exit 0",
+      "    ;;",
       "  *\"--output-format json\"*)",
       "    printf '%s\\n' '{\"type\":\"result\",\"result\":\"mock claude structured response\",\"model\":\"claude-mock-json\",\"usage\":{\"input_tokens\":12,\"output_tokens\":4}}'",
       "    exit 0",

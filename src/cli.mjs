@@ -53,6 +53,7 @@ const knownOptionNames = new Set([
   "start",
   "status",
   "strict",
+  "stream",
   "task",
   "task-kind",
   "timeout-ms",
@@ -67,7 +68,8 @@ const booleanOptionNames = new Set([
   "json",
   "record",
   "start",
-  "strict"
+  "strict",
+  "stream"
 ]);
 
 const runnerDefinitions = {
@@ -169,7 +171,7 @@ function printHelp() {
 Usage:
   ${CLI_NAME} runners
   ${CLI_NAME} init [--cwd PATH] [--force]
-  ${CLI_NAME} run "<task>" [--runner fake|claude|codex|gemini] [--roster solo|pair|repair|plan-code-review] [--purpose task|probe] [--task-kind KIND] [--provider-mode plan|write] [--model NAME] [--effort LEVEL] [--cost-hint USD] [--cwd PATH] [--check "COMMAND"] [--timeout-ms N] [--write-scope PATH[,PATH...]] [--allow-dirty] [--json]
+  ${CLI_NAME} run "<task>" [--runner fake|claude|codex|gemini] [--roster solo|pair|repair|plan-code-review] [--purpose task|probe] [--task-kind KIND] [--provider-mode plan|write] [--model NAME] [--effort LEVEL] [--cost-hint USD] [--cwd PATH] [--check "COMMAND"] [--timeout-ms N] [--write-scope PATH[,PATH...]] [--stream] [--allow-dirty] [--json]
   ${CLI_NAME} record --start "<task>" --runner claude|codex|gemini [--task-kind KIND] [--cwd PATH] [--note "TEXT"] [--model NAME] [--effort LEVEL] [--cost-hint USD] [--json]
   ${CLI_NAME} record "<task>" --runner claude|codex|gemini [--task-kind KIND] [--cwd PATH] [--check "COMMAND"] [--verdict accepted|rejected|partial|unknown] [--note "TEXT"] [--model NAME] [--effort LEVEL] [--cost-hint USD] [--write-scope PATH[,PATH...]] [--json]
   ${CLI_NAME} provider-smoke --runner claude|codex|gemini [--model NAME] [--effort LEVEL] [--cwd PATH] [--timeout-ms N] [--allow-dirty]
@@ -2075,11 +2077,12 @@ async function executeRunner({ runner, task, cwd, options, role, purpose }) {
   throw new Error(`${runner} runner is detected but not implemented yet. Run "rux runners" to see supported local runners.`);
 }
 
-function runProviderProcess({ command, args, cwd, timeoutMs, providerMode }) {
+function runProviderProcess({ command, args, cwd, timeoutMs, providerMode, stream = false }) {
   const startedAt = new Date();
   const maxBufferBytes = 20 * 1024 * 1024;
   let stdout = "";
   let stderr = "";
+  let renderBuffer = "";
   let timedOut = false;
   let spawnError = null;
   let settled = false;
@@ -2110,6 +2113,10 @@ function runProviderProcess({ command, args, cwd, timeoutMs, providerMode }) {
       settled = true;
       clearTimeout(timer);
       clearInterval(progressTimer);
+      if (stream && renderBuffer.trim()) {
+        renderStreamLine(command, renderBuffer);
+        renderBuffer = "";
+      }
       const endedAt = new Date();
       writeRuxProgress(`${command} finished exit=${exitCode ?? "unknown"} timed_out=${timedOut} elapsed=${formatDuration(endedAt.getTime() - startedAt.getTime())}`);
       resolveProcess({
@@ -2135,7 +2142,19 @@ function runProviderProcess({ command, args, cwd, timeoutMs, providerMode }) {
         stderr += text;
       }
 
-      process.stderr.write(text);
+      if (stream && streamName === "stdout") {
+        // Stream-json emits newline-delimited JSON events. Render each complete
+        // line as a concise human-readable progress line instead of dumping raw JSON.
+        renderBuffer += text;
+        let newlineIndex;
+        while ((newlineIndex = renderBuffer.indexOf("\n")) >= 0) {
+          const line = renderBuffer.slice(0, newlineIndex);
+          renderBuffer = renderBuffer.slice(newlineIndex + 1);
+          renderStreamLine(command, line);
+        }
+      } else {
+        process.stderr.write(text);
+      }
 
       if (byteLength(stdout) + byteLength(stderr) > maxBufferBytes && !killedForBuffer) {
         killedForBuffer = true;
@@ -2153,6 +2172,59 @@ function runProviderProcess({ command, args, cwd, timeoutMs, providerMode }) {
       finish(typeof code === "number" ? code : null);
     });
   });
+}
+
+function renderStreamLine(command, line) {
+  const trimmed = line.trim();
+  if (!trimmed) return;
+  let event;
+  try {
+    event = JSON.parse(trimmed);
+  } catch {
+    writeRuxProgress(`${command} > ${truncateStreamText(trimmed)}`);
+    return;
+  }
+  const rendered = renderClaudeStreamEvent(event);
+  if (rendered) {
+    writeRuxProgress(`${command} ${rendered}`);
+  }
+}
+
+function renderClaudeStreamEvent(event) {
+  if (!event || typeof event !== "object") return null;
+  const type = String(event.type ?? "");
+  if (type === "system") {
+    const subtype = event.subtype ? String(event.subtype) : "init";
+    return `session ${subtype}${event.model ? ` model=${event.model}` : ""}`;
+  }
+  if (type === "assistant") {
+    const content = event.message?.content;
+    const parts = [];
+    if (Array.isArray(content)) {
+      for (const block of content) {
+        if (block?.type === "text" && typeof block.text === "string" && block.text.trim()) {
+          parts.push(`> ${truncateStreamText(block.text)}`);
+        } else if (block?.type === "tool_use" && block.name) {
+          parts.push(`tool:${block.name}`);
+        }
+      }
+    }
+    return parts.length ? parts.join(" ") : null;
+  }
+  if (type === "result") {
+    const bits = ["done"];
+    if (typeof event.duration_ms === "number") bits.push(`elapsed=${formatDuration(event.duration_ms)}`);
+    if (event.total_cost_usd !== undefined && event.total_cost_usd !== null) {
+      bits.push(`cost=$${event.total_cost_usd}`);
+    }
+    return bits.join(" ");
+  }
+  return null;
+}
+
+function truncateStreamText(value) {
+  const collapsed = String(value).replace(/\s+/g, " ").trim();
+  return collapsed.length > 160 ? `${collapsed.slice(0, 157)}...` : collapsed;
 }
 
 function providerExecutionMode(options, { role, purpose } = {}) {
@@ -2181,23 +2253,34 @@ async function executeClaudeRunner({ task, cwd, options, role, purpose }) {
 
   const providerMode = providerExecutionMode(options, { role, purpose });
   const permissionMode = providerMode === "write" ? "acceptEdits" : "plan";
-  const args = [
-    "--permission-mode",
-    permissionMode,
-    "--output-format",
-    "json",
-    "-p",
-    task
-  ];
+  const stream = options.stream === true;
+  const args = stream
+    ? [
+        "--permission-mode",
+        permissionMode,
+        "--verbose",
+        "--output-format",
+        "stream-json",
+        "-p",
+        task
+      ]
+    : [
+        "--permission-mode",
+        permissionMode,
+        "--output-format",
+        "json",
+        "-p",
+        task
+      ];
 
-  const result = await runProviderProcess({ command: "claude", args, cwd, timeoutMs, providerMode });
+  const result = await runProviderProcess({ command: "claude", args, cwd, timeoutMs, providerMode, stream });
   const timedOut = result.timedOut;
   const exitCode = result.exitCode;
   const status = timedOut ? "timeout" : exitCode === 0 ? "ok" : "failed";
   const stdout = result.stdout ?? "";
   const stderr = result.stderr ?? "";
   const error = result.error ?? "";
-  const output = parseClaudeOutput(stdout);
+  const output = stream ? parseClaudeStreamOutput(stdout) : parseClaudeOutput(stdout);
 
   return {
     status,
@@ -2568,6 +2651,45 @@ function metadataSources(metadata, observedMetadata = {}) {
 
 function parseClaudeOutput(stdout) {
   return parseJsonProviderOutput(stdout, "claude-json");
+}
+
+function parseClaudeStreamOutput(stdout) {
+  const format = "claude-stream-json";
+  const lines = String(stdout ?? "").split(/\r?\n/).filter((line) => line.trim());
+  if (lines.length === 0) {
+    return textFallbackExtract(stdout, format, "empty structured output");
+  }
+
+  const events = [];
+  for (const line of lines) {
+    try {
+      events.push(JSON.parse(line));
+    } catch {
+      return textFallbackExtract(stdout, format, `unparseable JSONL line: ${line.slice(0, 80)}`);
+    }
+  }
+
+  // The terminal `result` event carries the full assistant text; prefer it over
+  // re-joining the incremental assistant chunks to avoid duplicated content.
+  const resultEvent = events.find(
+    (event) => event && event.type === "result" && typeof event.result === "string" && event.result.trim()
+  );
+  const assistantText = resultEvent
+    ? resultEvent.result.trim()
+    : unique(events.flatMap(extractAssistantTexts)).join("\n\n").trim();
+  const observedMetadata = extractObservedMetadata(events);
+  return {
+    assistant_text: assistantText,
+    observed_metadata: observedMetadata,
+    extract: {
+      format,
+      parsed: true,
+      event_count: events.length,
+      event_types: unique(events.map((event) => String(event?.type ?? event?.event ?? "unknown"))),
+      assistant_text: trimOutput(assistantText),
+      metadata: observedMetadata
+    }
+  };
 }
 
 function parseGeminiOutput(stdout) {
@@ -3527,6 +3649,9 @@ function buildRunCommand({ task, runner, roster, options, model = null, effort =
   }
   if (options["task-kind"] !== undefined && options["task-kind"] !== true) {
     parts.push("--task-kind", String(options["task-kind"]));
+  }
+  if (options.stream === true) {
+    parts.push("--stream");
   }
   if (options["allow-dirty"] === true) {
     parts.push("--allow-dirty");
