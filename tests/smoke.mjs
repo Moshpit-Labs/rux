@@ -11,7 +11,11 @@ const cliPath = join(repoRoot, "src", "cli.mjs");
 const packageJson = JSON.parse(await readFile(join(repoRoot, "package.json"), "utf8"));
 const tempRoot = await mkdtemp(join(tmpdir(), "rux-smoke-"));
 const tempBin = join(tempRoot, "bin");
-const npmEnv = { NPM_CONFIG_CACHE: join(tempRoot, "npm-cache") };
+const npmEnv = {
+  NPM_CONFIG_CACHE: join(tempRoot, "npm-cache"),
+  NPM_CONFIG_DRY_RUN: "false",
+  npm_config_dry_run: "false"
+};
 
 try {
   run("git", ["init"], tempRoot);
