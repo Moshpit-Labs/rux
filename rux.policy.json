@@ -1,15 +1,36 @@
 {
-  "schema_version": 1,
+  "schema_version": 2,
   "preferred_runner_order": ["codex", "gemini", "claude"],
   "default_roster": "solo",
   "parallel_provider_cli_runs": false,
   "provider_auth": "inherit_cli_environment",
   "transcript_export_default": "omit",
   "self_modification": "proposal_only",
+  "token_governor": {
+    "mode": "advisory",
+    "max_tool_output_chars": 20000,
+    "store_full_tool_output": true,
+    "handoff_after_turns": 120,
+    "handoff_after_session_tokens": 40000000,
+    "handoff_after_major_milestone": true,
+    "subagents_require_budget": true,
+    "subagents_require_artifact": true,
+    "review_agents_require_named_scope": true,
+    "expensive_routes_require_reason": true,
+    "expensive_route_allowlist": ["architecture", "production-debug", "launch-risk", "security", "release"],
+    "default_effort": "medium",
+    "routine_effort": "low",
+    "notes": [
+      "Rux is the source of truth for agent token discipline.",
+      "Agents should summarize oversized command output, keep full logs outside model context, and create handoffs before long sessions become the operating default.",
+      "Use expensive models, high effort, and subagents only when the task class and expected artifact justify the extra context."
+    ]
+  },
   "notes": [
     "Provider CLIs use the user's installed auth and config.",
     "Do not fan out parallel runs over one subscription-backed CLI account by default.",
     "Export summaries omit transcript text unless explicitly requested.",
-    "Improvement loops may propose changes, but must not apply them silently."
+    "Improvement loops may propose changes, but must not apply them silently.",
+    "Token-governor policy is advisory. Rux-wrapped provider runs cap visible provider output; broader shell-output brokering and session lifecycle enforcement are future work."
   ]
 }

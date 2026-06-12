@@ -71,6 +71,7 @@ mustInclude("docs/DECISIONS.md", decisions, "RUX-011: Post-Goal Claude Review Is
 mustInclude("docs/DECISIONS.md", decisions, "RUX-012: Evidence Taxonomy Is Explicit, Not Inferred");
 mustInclude("docs/DECISIONS.md", decisions, "RUX-013: Release Evidence Preserves Attempts");
 mustInclude("docs/DECISIONS.md", decisions, "RUX-014: Public Pages Must Trail Ledger Proof");
+mustInclude("docs/DECISIONS.md", decisions, "RUX-015: Token Discipline Belongs In Rux Policy");
 
 const scripts = packageJson.scripts ?? {};
 if (!scripts["check:docs"] || !scripts["check:docs"].includes("scripts/check-docs.mjs")) {

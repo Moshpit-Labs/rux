@@ -170,6 +170,9 @@ try {
   assert(coldPlan.runner_source === "availability_fallback", "cold-start runner should be labeled as availability fallback");
   assert(coldPlan.policy.source === "default", "cold-start plan without policy file should use default policy");
   assert(coldPlan.recommendation.roster === "solo", "cold-start docs work should stay solo");
+  assert(coldPlan.policy.token_governor.mode === "advisory", "cold-start plan should expose token governor mode");
+  assert(coldPlan.policy.token_governor.max_tool_output_chars === 20000, "cold-start plan should expose tool output cap");
+  assert(coldPlan.policy.token_governor.handoff_after_turns === 120, "cold-start plan should expose handoff threshold");
   assert(coldPlan.recommendation.one_agent_not_enough === null, "solo plans should not invent a multi-agent rationale");
   assert(coldPlan.runner_by_role.implementer === "claude", "solo plan should resolve the implementer runner");
   assert(coldPlan.recommendation.roles.length === 1, "solo plan should preview one role");
@@ -180,6 +183,8 @@ try {
   assert(coldPolicy.exists === false, "policy should report missing policy file");
   assert(coldPolicy.source === "default", "policy should fall back to runtime defaults");
   assert(coldPolicy.policy.parallel_provider_cli_runs === false, "default policy should refuse parallel provider CLI runs");
+  assert(coldPolicy.policy.token_governor.mode === "advisory", "default policy should include token governor");
+  assert(coldPolicy.policy.token_governor.subagents_require_budget === true, "default policy should require subagent budgets");
   assert(!existsSync(join(tempRoot, ".rux")), "policy should remain read-only before the first run");
 
   const coldStatus = JSON.parse(run("node", [cliPath, "status", "--cwd", tempRoot]).stdout);
@@ -213,6 +218,7 @@ try {
   const initializedPolicy = JSON.parse(run("node", [cliPath, "policy", "--cwd", tempRoot]).stdout);
   assert(initializedPolicy.exists === true, "policy should see initialized policy file");
   assert(initializedPolicy.source === "file", "initialized policy should be file-backed");
+  assert(initializedPolicy.policy.token_governor.expensive_routes_require_reason === true, "initialized policy should preserve expensive route guard");
   const secondInitResult = JSON.parse(run("node", [cliPath, "init", "--cwd", tempRoot]).stdout);
   assert(secondInitResult.policy.written === false, "init should not overwrite existing policy by default");
   assert(secondInitResult.gitignore.written === false, "init should not duplicate gitignore rule");
@@ -1399,6 +1405,15 @@ try {
   assert(claudeEval.signals.adapter_stdout_bytes > 0, "eval should include adapter output size");
   assert(claudeEval.signals.adapter_stderr_signal === "none", "eval should include adapter stderr signal");
 
+  const tempPolicyPath = join(tempRoot, "rux.policy.json");
+  const tempPolicy = JSON.parse(await readFile(tempPolicyPath, "utf8"));
+  tempPolicy.token_governor = {
+    ...(tempPolicy.token_governor ?? {}),
+    mode: "advisory",
+    max_tool_output_chars: 10
+  };
+  await writeFile(tempPolicyPath, `${JSON.stringify(tempPolicy, null, 2)}\n`, "utf8");
+
   const codexRun = spawnSync("node", [cliPath, "run", "codex guard", "--runner", "codex", "--allow-dirty", "--cwd", tempRoot], {
     encoding: "utf8",
     env: { ...process.env, PATH: `${tempBin}:${process.env.PATH ?? ""}` }
@@ -1415,6 +1430,11 @@ try {
   assert(codexSummary.adapter.stderr_signal.level === "diagnostic", "mocked codex adapter should classify successful stderr as diagnostic");
   assert(codexSummary.adapter.parsed_output.format === "codex-jsonl", "mocked codex adapter should parse representative JSONL output");
   assert(codexSummary.adapter.parsed_output.event_types.includes("message"), "mocked codex adapter should expose JSONL event types");
+  assert(codexSummary.adapter.output_policy.max_tool_output_chars === 10, "mocked codex adapter should record token-governor output cap");
+  assert(codexSummary.adapter.output_policy.rendering_truncated === true, "mocked codex adapter should record truncated provider rendering");
+  assert(codexSummary.adapter.stdout_bytes > codexSummary.adapter.output_policy.max_tool_output_chars, "provider stdout should still be fully captured beyond rendered cap");
+  tempPolicy.token_governor.max_tool_output_chars = 20000;
+  await writeFile(tempPolicyPath, `${JSON.stringify(tempPolicy, null, 2)}\n`, "utf8");
   assert(codexSummary.model === "codex-mock-jsonl", "mocked codex JSONL should populate observed model metadata");
   assert(codexSummary.adapter.metadata_sources.model === "observed", "mocked codex JSONL should mark model metadata as observed");
   const codexEval = JSON.parse(run("node", [cliPath, "eval", codexSummary.id, "--cwd", tempRoot]).stdout);

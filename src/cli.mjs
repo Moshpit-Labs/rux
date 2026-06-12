@@ -338,6 +338,11 @@ function formatPlanHuman(result) {
     lines.push(`Why not one agent: ${recommendation.one_agent_not_enough}`);
   }
 
+  const governor = result.policy?.token_governor;
+  if (governor && governor.mode !== "off") {
+    lines.push(`Governor: ${governor.mode}; cap tool output at ${governor.max_tool_output_chars} chars; handoff after ${governor.handoff_after_turns} turns or ${governor.handoff_after_session_tokens} tokens.`);
+  }
+
   if (Array.isArray(recommendation.roles) && recommendation.roles.length > 0) {
     lines.push("", "Roles");
     lines.push(...recommendation.roles.map((role) => `- ${role.role}: ${role.runner} - ${role.purpose}`));
@@ -715,8 +720,32 @@ function defaultPolicy() {
     provider_auth: "inherit_cli_environment",
     transcript_export_default: "omit",
     self_modification: "proposal_only",
+    token_governor: defaultTokenGovernorPolicy(),
     notes: [
       "Default runtime policy used because no committed policy file exists."
+    ]
+  };
+}
+
+function defaultTokenGovernorPolicy() {
+  return {
+    mode: "advisory",
+    max_tool_output_chars: 20000,
+    store_full_tool_output: true,
+    handoff_after_turns: 120,
+    handoff_after_session_tokens: 40000000,
+    handoff_after_major_milestone: true,
+    subagents_require_budget: true,
+    subagents_require_artifact: true,
+    review_agents_require_named_scope: true,
+    expensive_routes_require_reason: true,
+    expensive_route_allowlist: ["architecture", "production-debug", "launch-risk", "security", "release"],
+    default_effort: "medium",
+    routine_effort: "low",
+    notes: [
+      "Rux is the source of truth for agent token discipline.",
+      "Agents should summarize oversized command output, keep full logs outside model context, and create handoffs before long sessions become the operating default.",
+      "Use expensive models, high effort, and subagents only when the task class and expected artifact justify the extra context."
     ]
   };
 }
@@ -745,8 +774,38 @@ function normalizePolicy(policy) {
     preferred_runner_order: preferredRunnerOrder.length > 0 ? preferredRunnerOrder : defaults.preferred_runner_order,
     default_roster: rosterDefinitions.has(policy.default_roster) ? policy.default_roster : defaults.default_roster,
     parallel_provider_cli_runs: Boolean(policy.parallel_provider_cli_runs),
+    token_governor: normalizeTokenGovernorPolicy(policy.token_governor, defaults.token_governor),
     notes: Array.isArray(policy.notes) ? policy.notes.map(String) : defaults.notes
   };
+}
+
+function normalizeTokenGovernorPolicy(policy, defaults = defaultTokenGovernorPolicy()) {
+  const source = policy && typeof policy === "object" ? policy : {};
+  return {
+    ...defaults,
+    ...source,
+    mode: ["off", "advisory", "enforced"].includes(source.mode) ? source.mode : defaults.mode,
+    max_tool_output_chars: positiveIntegerOrDefault(source.max_tool_output_chars, defaults.max_tool_output_chars),
+    store_full_tool_output: source.store_full_tool_output === undefined ? defaults.store_full_tool_output : Boolean(source.store_full_tool_output),
+    handoff_after_turns: positiveIntegerOrDefault(source.handoff_after_turns, defaults.handoff_after_turns),
+    handoff_after_session_tokens: positiveIntegerOrDefault(source.handoff_after_session_tokens, defaults.handoff_after_session_tokens),
+    handoff_after_major_milestone: source.handoff_after_major_milestone === undefined ? defaults.handoff_after_major_milestone : Boolean(source.handoff_after_major_milestone),
+    subagents_require_budget: source.subagents_require_budget === undefined ? defaults.subagents_require_budget : Boolean(source.subagents_require_budget),
+    subagents_require_artifact: source.subagents_require_artifact === undefined ? defaults.subagents_require_artifact : Boolean(source.subagents_require_artifact),
+    review_agents_require_named_scope: source.review_agents_require_named_scope === undefined ? defaults.review_agents_require_named_scope : Boolean(source.review_agents_require_named_scope),
+    expensive_routes_require_reason: source.expensive_routes_require_reason === undefined ? defaults.expensive_routes_require_reason : Boolean(source.expensive_routes_require_reason),
+    expensive_route_allowlist: Array.isArray(source.expensive_route_allowlist)
+      ? source.expensive_route_allowlist.map(String).filter(Boolean)
+      : defaults.expensive_route_allowlist,
+    default_effort: typeof source.default_effort === "string" && source.default_effort.trim() ? source.default_effort : defaults.default_effort,
+    routine_effort: typeof source.routine_effort === "string" && source.routine_effort.trim() ? source.routine_effort : defaults.routine_effort,
+    notes: Array.isArray(source.notes) ? source.notes.map(String) : defaults.notes
+  };
+}
+
+function positiveIntegerOrDefault(value, fallback) {
+  const number = Number(value);
+  return Number.isInteger(number) && number > 0 ? number : fallback;
 }
 
 async function initRepo(args) {
@@ -1129,7 +1188,8 @@ async function status(args) {
       parallel_provider_cli_runs: policy.policy.parallel_provider_cli_runs,
       provider_auth: policy.policy.provider_auth,
       transcript_export_default: policy.policy.transcript_export_default,
-      self_modification: policy.policy.self_modification
+      self_modification: policy.policy.self_modification,
+      token_governor: policy.policy.token_governor
     },
     ledger: {
       path: join(cwd, STORE_DIR),
@@ -1370,6 +1430,7 @@ async function runCommand(args) {
   }
 
   const cwd = resolveCwd(options);
+  const policy = await loadPolicy(cwd);
   const runner = normalizeRunner(String(options.runner ?? "fake"));
   const roster = normalizeRoster(String(options.roster ?? "solo"));
   const purpose = normalizeRunPurpose(options.purpose);
@@ -1381,7 +1442,7 @@ async function runCommand(args) {
   await ensureStore(cwd);
 
   if (roster !== "solo") {
-    const run = await executeRoster({ roster, task, cwd, options, runnerByRole, metadata, purpose });
+    const run = await executeRoster({ roster, task, cwd, options, runnerByRole, metadata, purpose, policy: policy.policy });
     const verdict = await maybeAttachRunVerdict({ cwd, run, options });
     emitResult(options, await summarizeRecordedRun({ cwd, run, verdict }));
     return;
@@ -1396,6 +1457,7 @@ async function runCommand(args) {
     checkCommand: options.check ? String(options.check) : null,
     purpose,
     metadata,
+    policy: policy.policy,
     replay: recordedReplayMetadata(buildRunCommand({
       task,
       runner,
@@ -1417,6 +1479,7 @@ async function runCommand(args) {
 async function providerSmoke(args) {
   const { options } = parseOptions(args);
   const cwd = resolveCwd(options);
+  const policy = await loadPolicy(cwd);
   if (!options.runner) {
     throw new Error("provider-smoke requires --runner claude, --runner codex, or --runner gemini");
   }
@@ -1448,6 +1511,7 @@ async function providerSmoke(args) {
     purpose: "provider_smoke",
     attempt,
     metadata,
+    policy: policy.policy,
     failOnChangedFiles: true,
     replay: recordedReplayMetadata(buildProviderSmokeCommand({
       runner,
@@ -1699,6 +1763,7 @@ async function captureRunAttempt({
   skipDirtyGuard = false,
   notes = [],
   metadata = {},
+  policy = defaultPolicy(),
   attempt = null,
   replay = null
 }) {
@@ -1715,7 +1780,7 @@ async function captureRunAttempt({
     });
   }
   const beforeRepo = gitSnapshot(cwd, beforeStatus);
-  const transcript = await executeRunner({ runner, task, cwd, options, role, purpose });
+  const transcript = await executeRunner({ runner, task, cwd, options, role, purpose, policy });
   const observedMetadata = transcript.observed_metadata ?? transcript.adapter?.observed_metadata ?? {};
   const runMetadata = mergeObservedMetadata(metadata, observedMetadata);
   const providerAfterStatus = gitStatusMap(cwd);
@@ -1829,7 +1894,7 @@ async function captureRunAttempt({
   return run;
 }
 
-async function executeRoster({ roster, task, cwd, options, runnerByRole, metadata, purpose = "task_run" }) {
+async function executeRoster({ roster, task, cwd, options, runnerByRole, metadata, purpose = "task_run", policy = defaultPolicy() }) {
   const parentStartedAt = new Date();
   const parentBeforeStatus = gitStatusMap(cwd);
   assertProviderWorktreeReady({
@@ -1864,6 +1929,7 @@ async function executeRoster({ roster, task, cwd, options, runnerByRole, metadat
       purpose,
       skipDirtyGuard: true,
       metadata,
+      policy,
       replay: childReplayMetadata(parentId, parentReplayCommand)
     }));
     children.push(await captureRunAttempt({
@@ -1878,6 +1944,7 @@ async function executeRoster({ roster, task, cwd, options, runnerByRole, metadat
       purpose,
       skipDirtyGuard: true,
       metadata,
+      policy,
       replay: childReplayMetadata(parentId, parentReplayCommand)
     }));
   } else if (roster === "repair") {
@@ -1893,6 +1960,7 @@ async function executeRoster({ roster, task, cwd, options, runnerByRole, metadat
       purpose,
       skipDirtyGuard: true,
       metadata,
+      policy,
       replay: childReplayMetadata(parentId, parentReplayCommand)
     });
     children.push(attempt);
@@ -1910,6 +1978,7 @@ async function executeRoster({ roster, task, cwd, options, runnerByRole, metadat
         purpose,
         skipDirtyGuard: true,
         metadata,
+        policy,
         replay: childReplayMetadata(parentId, parentReplayCommand)
       }));
     }
@@ -1926,6 +1995,7 @@ async function executeRoster({ roster, task, cwd, options, runnerByRole, metadat
       purpose,
       skipDirtyGuard: true,
       metadata,
+      policy,
       replay: childReplayMetadata(parentId, parentReplayCommand)
     }));
     children.push(await captureRunAttempt({
@@ -1940,6 +2010,7 @@ async function executeRoster({ roster, task, cwd, options, runnerByRole, metadat
       purpose,
       skipDirtyGuard: true,
       metadata,
+      policy,
       replay: childReplayMetadata(parentId, parentReplayCommand)
     }));
     children.push(await captureRunAttempt({
@@ -1954,6 +2025,7 @@ async function executeRoster({ roster, task, cwd, options, runnerByRole, metadat
       purpose,
       skipDirtyGuard: true,
       metadata,
+      policy,
       replay: childReplayMetadata(parentId, parentReplayCommand)
     }));
   } else {
@@ -2036,7 +2108,7 @@ async function executeRoster({ roster, task, cwd, options, runnerByRole, metadat
   return run;
 }
 
-async function executeRunner({ runner, task, cwd, options, role, purpose }) {
+async function executeRunner({ runner, task, cwd, options, role, purpose, policy = defaultPolicy() }) {
   if (runner === "fake") {
     return {
       status: "ok",
@@ -2063,26 +2135,31 @@ async function executeRunner({ runner, task, cwd, options, role, purpose }) {
   }
 
   if (runner === "claude") {
-    return executeClaudeRunner({ task, cwd, options, role, purpose });
+    return executeClaudeRunner({ task, cwd, options, role, purpose, policy });
   }
 
   if (runner === "codex") {
-    return executeCodexRunner({ task, cwd, options, role, purpose });
+    return executeCodexRunner({ task, cwd, options, role, purpose, policy });
   }
 
   if (runner === "gemini") {
-    return executeGeminiRunner({ task, cwd, options, role, purpose });
+    return executeGeminiRunner({ task, cwd, options, role, purpose, policy });
   }
 
   throw new Error(`${runner} runner is detected but not implemented yet. Run "rux runners" to see supported local runners.`);
 }
 
-function runProviderProcess({ command, args, cwd, timeoutMs, providerMode, stream = false }) {
+function runProviderProcess({ command, args, cwd, timeoutMs, providerMode, stream = false, tokenGovernor = defaultTokenGovernorPolicy() }) {
   const startedAt = new Date();
   const maxBufferBytes = 20 * 1024 * 1024;
+  const maxRenderedChars = tokenGovernor?.mode === "off"
+    ? null
+    : positiveIntegerOrDefault(tokenGovernor?.max_tool_output_chars, defaultTokenGovernorPolicy().max_tool_output_chars);
   let stdout = "";
   let stderr = "";
   let renderBuffer = "";
+  let renderedChars = 0;
+  let renderTruncated = false;
   let timedOut = false;
   let spawnError = null;
   let settled = false;
@@ -2126,6 +2203,13 @@ function runProviderProcess({ command, args, cwd, timeoutMs, providerMode, strea
         timedOut,
         stdout,
         stderr,
+        output_policy: {
+          mode: tokenGovernor?.mode ?? "advisory",
+          max_tool_output_chars: maxRenderedChars,
+          rendered_chars: renderedChars,
+          rendering_truncated: renderTruncated,
+          full_output_captured: true
+        },
         error: spawnError
           ? `${spawnError.name}: ${spawnError.message}`
           : killedForBuffer
@@ -2153,7 +2237,7 @@ function runProviderProcess({ command, args, cwd, timeoutMs, providerMode, strea
           renderStreamLine(command, line);
         }
       } else {
-        process.stderr.write(text);
+        writeProviderOutput(text);
       }
 
       if (byteLength(stdout) + byteLength(stderr) > maxBufferBytes && !killedForBuffer) {
@@ -2171,6 +2255,32 @@ function runProviderProcess({ command, args, cwd, timeoutMs, providerMode, strea
     child.on("close", (code) => {
       finish(typeof code === "number" ? code : null);
     });
+
+    function writeProviderOutput(text) {
+      if (!text) return;
+      if (!maxRenderedChars) {
+        process.stderr.write(text);
+        renderedChars += text.length;
+        return;
+      }
+      if (renderedChars >= maxRenderedChars) {
+        writeTruncationNotice();
+        return;
+      }
+      const remaining = maxRenderedChars - renderedChars;
+      const visible = text.length > remaining ? text.slice(0, remaining) : text;
+      process.stderr.write(visible);
+      renderedChars += visible.length;
+      if (visible.length < text.length) {
+        writeTruncationNotice();
+      }
+    }
+
+    function writeTruncationNotice() {
+      if (renderTruncated) return;
+      renderTruncated = true;
+      writeRuxProgress(`provider output rendering capped at ${maxRenderedChars} chars by token_governor; full output remains in the transcript`);
+    }
   });
 }
 
@@ -2245,7 +2355,7 @@ function providerExecutionMode(options, { role, purpose } = {}) {
   return mode;
 }
 
-async function executeClaudeRunner({ task, cwd, options, role, purpose }) {
+async function executeClaudeRunner({ task, cwd, options, role, purpose, policy = defaultPolicy() }) {
   const timeoutMs = Number(options["timeout-ms"] ?? 10 * 60 * 1000);
   if (!Number.isFinite(timeoutMs) || timeoutMs <= 0) {
     throw new Error("--timeout-ms must be a positive number");
@@ -2273,7 +2383,7 @@ async function executeClaudeRunner({ task, cwd, options, role, purpose }) {
         task
       ];
 
-  const result = await runProviderProcess({ command: "claude", args, cwd, timeoutMs, providerMode, stream });
+  const result = await runProviderProcess({ command: "claude", args, cwd, timeoutMs, providerMode, stream, tokenGovernor: policy.token_governor });
   const timedOut = result.timedOut;
   const exitCode = result.exitCode;
   const status = timedOut ? "timeout" : exitCode === 0 ? "ok" : "failed";
@@ -2296,7 +2406,8 @@ async function executeClaudeRunner({ task, cwd, options, role, purpose }) {
       stdout,
       stderr,
       error,
-      output
+      output,
+      outputPolicy: result.output_policy
     }),
     text: [
       `runner: claude`,
@@ -2324,7 +2435,7 @@ async function executeClaudeRunner({ task, cwd, options, role, purpose }) {
   };
 }
 
-async function executeCodexRunner({ task, cwd, options, role, purpose }) {
+async function executeCodexRunner({ task, cwd, options, role, purpose, policy = defaultPolicy() }) {
   const timeoutMs = Number(options["timeout-ms"] ?? 10 * 60 * 1000);
   if (!Number.isFinite(timeoutMs) || timeoutMs <= 0) {
     throw new Error("--timeout-ms must be a positive number");
@@ -2344,7 +2455,7 @@ async function executeCodexRunner({ task, cwd, options, role, purpose }) {
     task
   ];
 
-  const result = await runProviderProcess({ command: "codex", args, cwd, timeoutMs, providerMode });
+  const result = await runProviderProcess({ command: "codex", args, cwd, timeoutMs, providerMode, tokenGovernor: policy.token_governor });
   const timedOut = result.timedOut;
   const exitCode = result.exitCode;
   const status = timedOut ? "timeout" : exitCode === 0 ? "ok" : "failed";
@@ -2367,7 +2478,8 @@ async function executeCodexRunner({ task, cwd, options, role, purpose }) {
       stdout,
       stderr,
       error,
-      output
+      output,
+      outputPolicy: result.output_policy
     }),
     text: [
       `runner: codex`,
@@ -2395,7 +2507,7 @@ async function executeCodexRunner({ task, cwd, options, role, purpose }) {
   };
 }
 
-async function executeGeminiRunner({ task, cwd, options, role, purpose }) {
+async function executeGeminiRunner({ task, cwd, options, role, purpose, policy = defaultPolicy() }) {
   const timeoutMs = Number(options["timeout-ms"] ?? 10 * 60 * 1000);
   if (!Number.isFinite(timeoutMs) || timeoutMs <= 0) {
     throw new Error("--timeout-ms must be a positive number");
@@ -2413,7 +2525,7 @@ async function executeGeminiRunner({ task, cwd, options, role, purpose }) {
     task
   ];
 
-  const result = await runProviderProcess({ command: "gemini", args, cwd, timeoutMs, providerMode });
+  const result = await runProviderProcess({ command: "gemini", args, cwd, timeoutMs, providerMode, tokenGovernor: policy.token_governor });
   const timedOut = result.timedOut;
   const exitCode = result.exitCode;
   const status = timedOut ? "timeout" : exitCode === 0 ? "ok" : "failed";
@@ -2436,7 +2548,8 @@ async function executeGeminiRunner({ task, cwd, options, role, purpose }) {
       stdout,
       stderr,
       error,
-      output
+      output,
+      outputPolicy: result.output_policy
     }),
     text: [
       `runner: gemini`,
@@ -2543,7 +2656,7 @@ function importedStatusReason(status) {
   return "imported_unverified";
 }
 
-function buildAdapterInvocation({ runner, command, args, exitCode, timedOut, stdout, stderr, error, output = null }) {
+function buildAdapterInvocation({ runner, command, args, exitCode, timedOut, stdout, stderr, error, output = null, outputPolicy = null }) {
   return {
     runner,
     command,
@@ -2552,6 +2665,7 @@ function buildAdapterInvocation({ runner, command, args, exitCode, timedOut, std
     timed_out: Boolean(timedOut),
     stdout_bytes: byteLength(stdout),
     stderr_bytes: byteLength(stderr),
+    output_policy: outputPolicy,
     parsed_output: output?.extract ?? null,
     observed_metadata: output?.observed_metadata ?? {},
     stderr_signal: classifyAdapterStderr({ exitCode, timedOut, stderr, error }),
@@ -3094,7 +3208,8 @@ async function planRun(args) {
       source: policy.source,
       preferred_runner_order: policy.policy.preferred_runner_order,
       default_roster: policy.policy.default_roster,
-      parallel_provider_cli_runs: policy.policy.parallel_provider_cli_runs
+      parallel_provider_cli_runs: policy.policy.parallel_provider_cli_runs,
+      token_governor: policy.policy.token_governor
     },
     evidence: recommendation.evidence,
     repo: {

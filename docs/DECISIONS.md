@@ -114,3 +114,11 @@ This is the lightweight decision log for Rux. Add entries when a choice would ot
 - Reason: The sprint's core evidence work shipped; adding a page before wave-exit proof would create marketing surface area without improving the product loop.
 - Consequence: Landing pages are allowed later, but only as small static proof surfaces grounded in real `run -> show -> verdict -> outcome` output and current `suggest` maturity counts. No broad marketing site, dashboard, or inflated claims.
 - Revisit when: Wave-exit evidence produces at least two defensible, directional-or-better heuristics and the page can cite real local output.
+
+## RUX-015: Token Discipline Belongs In Rux Policy
+
+- Date: 2026-06-12
+- Decision: Rux owns the operating policy for agent token discipline through `rux.policy.json` and its `token_governor` block.
+- Reason: Local `.claude` and `.codex` session analysis showed that the largest waste pattern is repeated context and oversized tool output, not verbose final answers. A reminder in every repo will not hold over time; agents need one policy source to read before choosing routes, effort, subagents, and output volume.
+- Consequence: Global Claude/Codex instructions and project `AGENTS.md` files should point at Rux policy instead of duplicating thresholds. `rux policy`, `rux status`, and `rux plan` expose the policy. `rux run` caps visible provider output while retaining full transcripts. The current mode is still advisory until Rux grows live-session interruption and broader command-output brokering.
+- Revisit when: Rux can observe live session usage, broker tool output, or automatically start handoff/resume flows.

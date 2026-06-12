@@ -2,10 +2,10 @@
 
 ## Shape
 
-Rux has five primitives.
+Rux has six primitives.
 
 ```
-Task -> Roster -> Runner -> Run -> Ledger
+Task -> Policy -> Roster -> Runner -> Run -> Ledger
 ```
 
 ## Primitives
@@ -36,6 +36,21 @@ Deferred:
 - `fanout`: multiple independent attempts, then pick or merge.
 - `committee`: multiple reviewers.
 - long-running autonomous workflows.
+
+### Policy
+
+Policy is the local operating contract for agent work in a repo.
+
+`rux.policy.json` defines runner defaults, roster defaults, provider safety posture, transcript export posture, self-improvement posture, and token-governor rules. The token governor is the first Rux-owned control plane for reducing wasted context: cap tool output in chat, keep full logs outside model context, create handoffs before sessions become too large, and require a budget reason plus expected artifact for expensive models, high effort, subagents, or review agents.
+
+v0.2 exposes this policy through `rux policy`, `rux status`, and `rux plan`. The mode is advisory: agents should follow it, and `rux run` caps visible provider output while keeping full output in the transcript. Rux does not yet interrupt live provider sessions or enforce output brokering across every terminal command.
+
+Later enforcement should happen in layers:
+
+- output broker: extend the current provider-output cap into general command/log brokering with stored full logs and bounded summaries,
+- session governor: recommend or force handoff before long-lived context becomes default,
+- route governor: require named reasons for expensive model/effort/subagent routes,
+- review governor: require named scope before review agents run.
 
 ### Runner
 

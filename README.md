@@ -8,6 +8,8 @@ It helps a developer or team answer one practical question:
 
 It is not a model gateway. It does not proxy API calls, hide provider auth, or replace Claude Code, Codex, Gemini CLI, Cursor, Zed, VS Code, or other tools. It wraps the tools people already use, records what happened, and uses that evidence to recommend better runs over time.
 
+Rux also carries the local operating policy for agent spend discipline. The committed `rux.policy.json` file includes a `token_governor` block that tells agents when to cap tool output, when to create handoffs, and when expensive models, high effort, subagents, or review agents need a named reason and artifact.
+
 ## Five-Minute Quickstart
 
 ```sh
@@ -94,6 +96,7 @@ That memory starts with capture. If the record is weak, routing is theater.
 
 ```sh
 rux runners
+rux policy
 rux plan "fix the failing auth test"
 rux run "review the navigation code" --runner gemini
 rux run "update the navigation code" --runner gemini --provider-mode write --check "npm run typecheck"
@@ -105,6 +108,8 @@ rux report "Gemini surfaced a question but the terminal flow was unclear" --kind
 Provider output and Rux progress are mirrored to stderr while the provider runs, so questions, start/finish state, checks, and quiet long-running work are visible in the terminal without corrupting script output. The default provider mode is `plan`; use `--provider-mode write` when you want the wrapped provider to edit files. Real provider runs refuse dirty worktrees by default; commit, stash, or revert existing changes first, or pass `--allow-dirty` only when those changes are intentionally part of the provider context. Use `--write-scope` to declare the files or directories a provider is allowed to change; Rux records out-of-scope edits as failed runs.
 
 Use `rux record` when the current agent session already did the work and you do not want to spawn a nested Claude/Codex/Gemini process just to satisfy the ledger. Manual records can help local recommendations when they have checks or verdicts, but they are down-weighted, labeled as manual evidence, and do not replace real provider-smoke or adapter-run evidence in the release gate. `--write-scope` applies to manual records too.
+
+Use `rux policy` before substantial agent work when you need the local operating contract. The current token-governor policy is advisory: agents should follow it, and Rux-wrapped provider runs cap visible provider output while keeping full output in the transcript. Rux does not yet interrupt live provider sessions or broker arbitrary shell output outside `rux run`.
 
 Start here:
 

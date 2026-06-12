@@ -4,7 +4,7 @@ Last updated: 2026-06-12
 
 ## One-Line Summary
 
-Rux is a public coding-agent run ledger that records real outcomes first, then uses that evidence to recommend agent rosters. The current npm release is `@moshpits/rux@0.2.1`, and the release posture is still test first: local verification before every publish.
+Rux is a public coding-agent run ledger that records real outcomes first, then uses that evidence to recommend agent rosters. The current npm release is `@moshpits/rux@0.2.2`, and the release posture is still test first: local verification before every publish.
 
 ## Decisions
 
@@ -13,7 +13,7 @@ Rux is a public coding-agent run ledger that records real outcomes first, then u
 - Do not use Vane as the release name; it conflicts with the popular [ItzCrazyKns/Vane](https://github.com/ItzCrazyKns/Vane) AI answering-engine project.
 - Keep runtime naming centralized in `src/identity.mjs`.
 - NPM org created: `moshpits` (`https://www.npmjs.com/org/moshpits`). Public package metadata lives under `@moshpits/rux`. The unscoped `rux` npm package is already occupied by an old, unrelated React/observable package; use the scoped package plus `rux` bin.
-- `@moshpits/rux@0.2.1` is published on npm with the `latest` dist-tag. It adds opt-in `--stream` mode to the Claude adapter (`claude --output-format stream-json`) so live provider progress renders on stderr instead of only Rux heartbeats.
+- `@moshpits/rux@0.2.2` is the token-governor release. It keeps the `0.2.1` opt-in Claude `--stream` mode and adds advisory `token_governor` policy plus visible provider-output capping for Rux-wrapped provider runs while preserving full transcript output.
 - Package privacy has been deliberately removed for public release after local smoke, real provider smoke, and first routing-eligible provider task evidence passed.
 - Keep the npm package lean. The package allowlist includes runtime source and the default policy file; internal docs, tests, and agent instructions stay repo-only.
 - Local smoke now verifies the npm tarball contents, installs the packed tarball into a temporary prefix, and runs the installed `rux` bin.
@@ -62,6 +62,7 @@ Rux is a public coding-agent run ledger that records real outcomes first, then u
 - `rux status` and `rux release-check` expose an `identity` block that names the current product, CLI, package, policy file, store directory, and rename surfaces. This keeps any future pre-release rename small.
 - `rux export` is the first team-review surface. It is read-only, emits shareable JSON summaries, omits transcript text by default, and includes transcripts only with `--include-transcripts`.
 - `rux.policy.json` is the committed team policy file. `rux policy` reads it, `rux status` surfaces it, `rux plan` uses its cold-start runner order/default roster, and `release-check` requires it before publishing.
+- `rux.policy.json` now includes an advisory `token_governor` block. It centralizes agent token discipline for Moshpit work: cap tool output in chat, keep full logs outside model context, create handoffs before long sessions continue, and require a budget reason plus expected artifact for expensive models, high effort, subagents, or review agents. `rux policy`, `rux status`, and `rux plan` expose the block; `rux run` caps visible provider output while keeping full output in transcripts. Active live-session interruption and arbitrary shell-output brokering are still future work.
 - `rux propose` now writes local markdown improvement proposals under `.rux/proposals/` and appends proposal events to the ledger. Proposals cite run IDs, distinguish adapter-smoke evidence from task-quality evidence, include release-check blockers grouped by lifecycle, and never apply changes.
 - `rux report "<summary>"` records local feedback under `.rux/reports/` and appends report events to the ledger. Feedback can be bugs, confusing UX, adapter issues, docs gaps, routing/orchestration observations, install problems, ideas, successes, or other notes. Reports can optionally link a run ID, command, source repo, and note; they do not open external issues or change policy.
 - `rux doctor` is a read-only local readiness check for Node, git, ledger state, and runner CLI availability.
@@ -122,4 +123,4 @@ Local Moshpit learnings:
 
 ## Next Action
 
-The `0.2.1` package is public and Wave 2 is exited. The current large goal is the pre-registered proof quarter (`docs/PROOF.md`, 2026-06-12 → 2026-09-12): instrument every real routing decision — recommendation, choice, outcome — until the ledger proves or honestly refutes that `rux suggest` changes decisions for the better. The decision discipline is propagated to all Moshpit repos via their `AGENTS.md` (canonical block in this repo's `AGENTS.md`) plus user-level Claude/Codex/Gemini instruction files. Build work this quarter is limited to what the protocol needs: decision/adherence events, the scorecard view, and quota-blocking friction fixes.
+The `0.2.2` package carries the first token-governor enforcement slice, and Wave 2 is exited. The current large goal is the pre-registered proof quarter (`docs/PROOF.md`, 2026-06-12 -> 2026-09-12): instrument every real routing decision — recommendation, choice, outcome — until the ledger proves or honestly refutes that `rux suggest` changes decisions for the better. The decision discipline is propagated to all Moshpit repos via their `AGENTS.md` (canonical block in this repo's `AGENTS.md`) plus user-level Claude/Codex/Gemini instruction files. Build work this quarter is limited to what the protocol needs: decision/adherence events, the scorecard view, deeper token-governor enforcement, and quota-blocking friction fixes.
